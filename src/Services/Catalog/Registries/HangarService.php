@@ -4,21 +4,26 @@ declare(strict_types=1);
 
 namespace McToolkit\Services\Catalog\Registries;
 
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use McToolkit\Support\HttpJsonCache;
 
 /**
  * Hangar registry adapter (https://hangar.papermc.io/api/v1). Owner: A3.
  *
- * Facts:
- *  - Requires a Bearer token: config('minecraft-toolkit.hangar_key') / env HANGAR_KEY.
- *    `search()` returns null when no key is configured (source marked skipped, not an error).
- *  - GET /projects?limit=25&offset=(page-1)*25&sort=-stars&q=... -> {pagination:{...}, result:[{...}]}
- *  - Platforms are only authoritatively listed per-project; search rows are parsed for the
- *    known platform containers and mapped to loader chips ('paper','velocity','waterfall').
+ * Facts (verified against the live API):
+ *  - Read endpoints are public — no key or token is needed (Hangar's own auth is a
+ *    JWT exchanged via /authenticate, never a raw Bearer key, so none is sent).
+ *  - GET /projects?limit&offset&sort=-stars&query=…&platform=PAPER
+ *      -> {pagination:{count (TOTAL), limit, offset}, result:[project]}
+ *    project: {name, namespace:{owner, slug}, description, avatarUrl, lastUpdated,
+ *              stats:{downloads, stars, …}, supportedPlatforms:{PAPER:["1.20.6", …]}}
+ *  - GET /projects/{slug}/versions?limit&offset — the SLUG alone; "Owner%2FSlug" is a 400.
+ *    version: {name, createdAt, channel:{name, flags?}, downloads:{PAPER:{fileInfo:{name,
+ *              sizeBytes, sha256Hash}|null, externalUrl, downloadUrl|null}},
+ *              platformDependencies:{PAPER:["1.20.6", …]}}
+ *  - Platforms are PAPER, VELOCITY and WATERFALL (Folia ships as PAPER builds).
  *
- * Return shape used by ContentSearchService: ['items' => list<item>, 'pages' => ?int] or null.
+ * Return shape used by ContentSearchService: ['items' => list<item>, 'pages' => ?int].
  */
 final class HangarService
 {
@@ -31,30 +36,35 @@ final class HangarService
         'PAPER' => 'paper',
         'VELOCITY' => 'velocity',
         'WATERFALL' => 'waterfall',
-        'BUNGEECORD' => 'bungeecord',
-        'FOLIA' => 'folia',
     ];
 
     public function __construct(private readonly int $listCacheSeconds = 300) {}
 
-    /** Resolve the Bearer key; empty string means "not configured". */
-    public function apiKey(): string
+    /** Search pages honour config('minecraft-toolkit.cache_ttl.searches'); the constructor value is the fallback. */
+    private function searchTtl(): int
     {
-        $key = config('minecraft-toolkit.hangar_key');
-
-        return is_string($key) && $key !== '' ? $key : (string) env('HANGAR_KEY');
+        return max(0, (int) config('minecraft-toolkit.cache_ttl.searches', $this->listCacheSeconds));
     }
 
     /**
-     * @param  string  $loader  loader hint ('', 'paper', 'velocity', ...) — best effort server filter
-     * @return array{items:list<array<string, mixed>>, pages:?int}|null null when no API key configured
+     * Hangar platform matching one loader token ('' when Hangar has no such platform).
      */
-    public function search(string $q, string $loader = '', int $page = 1): ?array
+    public static function platformFor(string $loader): string
     {
-        if ($this->apiKey() === '') {
-            return null;
-        }
+        return match (strtolower(trim($loader))) {
+            'paper', 'purpur', 'folia', 'spigot', 'bukkit', 'pufferfish', 'leaves' => 'PAPER',
+            'velocity' => 'VELOCITY',
+            'waterfall', 'bungeecord' => 'WATERFALL',
+            default => '',
+        };
+    }
 
+    /**
+     * @param  string  $loader  loader hint ('', 'paper', 'velocity', ...) — narrows by platform when Hangar knows it
+     * @return array{items:list<array<string, mixed>>, pages:?int}
+     */
+    public function search(string $q, string $loader = '', int $page = 1): array
+    {
         $page = max(1, $page);
         $query = [
             'limit' => self::PAGE_SIZE,
@@ -63,70 +73,70 @@ final class HangarService
         ];
 
         if (trim($q) !== '') {
-            $query['q'] = trim($q);
+            $query['query'] = trim($q);
         }
 
-        // Best-effort platform narrowing. If Hangar ignores unknown params this stays harmless;
-        // results are re-filtered client-side anyway via the compat chip logic.
-        if (trim($loader) !== '') {
-            $query['platform'] = Str::upper($loader);
+        // Only real Hangar platforms are sent; an unknown enum value would fail the request.
+        $platform = self::platformFor($loader);
+
+        if ($platform !== '') {
+            $query['platform'] = $platform;
         }
 
-        $payload = HttpJsonCache::get(self::API.'/projects', $this->listCacheSeconds, $query, [
-            'Authorization' => 'Bearer '.$this->apiKey(),
-        ]);
+        $payload = HttpJsonCache::get(self::API.'/projects', $this->searchTtl(), $query);
 
         if (!is_array($payload)) {
             return ['items' => [], 'pages' => null];
         }
 
-        /** @var list<array<string, mixed>> $rows */
         $rows = is_array($payload['result'] ?? null) ? $payload['result'] : [];
-
-        $pages = null;
         $pagination = is_array($payload['pagination'] ?? null) ? $payload['pagination'] : [];
-        $count = $pagination['count'] ?? null;
+        $total = is_numeric($pagination['count'] ?? null) ? (int) $pagination['count'] : null;
 
-        if ((is_int($count) && $count > 0) || (is_numeric($count) && (int) $count > 0)) {
-            // With a full page of results we cannot know the true total from one request:
-            // report at least the current page and let the UI show "more available".
-            $knownPages = is_int($pagination['offset'] ?? null)
-                ? (int) floor(($pagination['offset'] + $count) / self::PAGE_SIZE)
-                : $page;
+        $items = [];
 
-            $fullPage = count($rows) >= self::PAGE_SIZE;
-
-            $pages = max(1, min(400, $fullPage ? max($knownPages + 1, $page) : $knownPages));
+        foreach ($rows as $row) {
+            if (is_array($row)) {
+                $items[] = $this->normalize($row);
+            }
         }
 
         return [
-            'items' => array_values(array_map(fn (array $row) => $this->normalize($row), $rows)),
-            'pages' => $pages,
+            'items' => $items,
+            // `count` is the TOTAL number of matches, not the size of this page.
+            'pages' => $total !== null && $total > 0
+                ? max(1, min(400, (int) ceil($total / self::PAGE_SIZE)))
+                : null,
         ];
     }
 
     /**
-     * All published versions of one project (installer entry point).
+     * Newest published versions of one project (installer + update scanner entry point).
      *
      * @return list<array<string, mixed>>
      */
-    public function versions(string $ownerSlug): array
+    public function versions(string $slug): array
     {
-        if ($this->apiKey() === '') {
+        $slug = trim($slug);
+
+        // Legacy ids were stored as "Owner/Slug"; the versions route takes the slug alone.
+        if (str_contains($slug, '/')) {
+            $slug = (string) Str::afterLast($slug, '/');
+        }
+
+        if ($slug === '') {
             return [];
         }
 
         $payload = HttpJsonCache::get(
-            self::API.'/projects/'.rawurlencode($ownerSlug).'/versions?limit=100&offset=0',
+            self::API.'/projects/'.rawurlencode($slug).'/versions',
             120,
-            [],
-            ['Authorization' => 'Bearer '.$this->apiKey()],
+            ['limit' => self::PAGE_SIZE, 'offset' => 0],
         );
 
-        /** @var list<array<string, mixed>> $rows */
-        $rows = is_array($payload['result'] ?? null) ? $payload['result'] : [];
+        $rows = is_array($payload) && is_array($payload['result'] ?? null) ? $payload['result'] : [];
 
-        return $rows;
+        return array_values(array_filter($rows, fn ($row) => is_array($row)));
     }
 
     /**
@@ -137,9 +147,9 @@ final class HangarService
      */
     private function normalize(array $row): array
     {
-        $owner = is_array($row['namespace'] ?? null) ? $row['namespace'] : [];
-        $name = is_string($owner['slug'] ?? null) ? $owner['slug'] : '';
-        $user = is_string($owner['owner'] ?? null) ? $owner['owner'] : '';
+        $namespace = is_array($row['namespace'] ?? null) ? $row['namespace'] : [];
+        $slug = is_string($namespace['slug'] ?? null) ? $namespace['slug'] : '';
+        $owner = is_string($namespace['owner'] ?? null) ? $namespace['owner'] : '';
 
         $stats = is_array($row['stats'] ?? null) ? $row['stats'] : [];
 
@@ -147,86 +157,49 @@ final class HangarService
             ? Str::limit(trim(strip_tags($row['description'])), 300)
             : '';
 
-        $platforms = $this->extractPlatforms($row);
+        $loaders = [];
+        $gameVersions = [];
+        $platforms = is_array($row['supportedPlatforms'] ?? null) ? $row['supportedPlatforms'] : [];
 
-        $iconUrl = null;
-        foreach ([['avatars', '150x150'], ['avatars', '64x64'], ['avatar_url'], []] as $path) {
-            $node = $row;
-            foreach ($path as $part) {
-                $node = is_array($node[$part] ?? null) ? $node[$part] : [];
+        foreach ($platforms as $platform => $versions) {
+            $upper = strtoupper((string) $platform);
+
+            if (isset(self::PLATFORM_MAP[$upper])) {
+                $loaders[self::PLATFORM_MAP[$upper]] = true;
             }
-            if (isset($node['url']) && is_string($node['url']) && $node['url'] !== '') {
-                $iconUrl = $node['url'];
-                break;
+
+            // Server-side game versions only matter for the PAPER family here.
+            if ($upper === 'PAPER' && is_array($versions)) {
+                foreach ($versions as $version) {
+                    if (is_string($version) && $version !== '') {
+                        $gameVersions[$version] = true;
+                    }
+                }
             }
         }
 
-        $updated = match (true) {
-            is_string($row['last_updated'] ?? null) => $row['last_updated'],
-            is_string($row['lastUpdated'] ?? null) => $row['lastUpdated'],
-            default => null,
-        };
+        $iconUrl = is_string($row['avatarUrl'] ?? null) && $row['avatarUrl'] !== '' ? $row['avatarUrl'] : null;
+        $updated = is_string($row['lastUpdated'] ?? null) ? $row['lastUpdated'] : null;
 
         $downloads = $stats['downloads'] ?? 0;
         $likes = $stats['stars'] ?? 0;
 
         return [
             'source' => 'hangar',
-            'id' => ($user !== '' && $name !== '') ? "{$user}/{$name}" : $name,
-            'slug' => $name,
-            'title' => (string) ($row['name'] ?? ''),
-            'author' => $user,
+            // The slug is unique on Hangar and is what the versions route takes.
+            'id' => $slug,
+            'slug' => $slug,
+            'title' => (string) ($row['name'] ?? $slug),
+            'author' => $owner,
             'description' => $description,
-            'downloads' => is_int($downloads) ? $downloads : (int) $downloads,
-            'likes' => is_int($likes) ? $likes : (int) $likes,
+            'downloads' => is_numeric($downloads) ? (int) $downloads : 0,
+            'likes' => is_numeric($likes) ? (int) $likes : 0,
             'updated' => $updated,
             'icon_url' => $iconUrl,
-            'page_url' => ($user !== '' && $name !== '') ? "https://hangar.papermc.io/{$user}/{$name}" : null,
-            'loaders' => $platforms ?: ['paper'],
-            // Hangar does not expose game_versions in search rows; chips stay server-side only.
-            'game_versions' => [],
+            'page_url' => ($owner !== '' && $slug !== '') ? "https://hangar.papermc.io/{$owner}/{$slug}" : null,
+            'loaders' => array_keys($loaders) ?: ['paper'],
+            'game_versions' => array_keys($gameVersions),
             'project_type' => 'plugin',
         ];
-    }
-
-    /**
-     * Search rows have no guaranteed platform container; probe common locations and map
-     * to loader chips. Falls back to paper (Hangar's dominant ecosystem).
-     *
-     * @param  array<string, mixed>  $row
-     * @return list<string>
-     */
-    private function extractPlatforms(array $row): array
-    {
-        $candidates = [
-            $row['approvedPlatforms'] ?? null,
-            $row['settings']['platforms'] ?? null,
-            $row['platforms'] ?? null,
-            $row['category'] ?? null,
-        ];
-
-        $loaders = [];
-
-        foreach ($candidates as $candidate) {
-            if (is_string($candidate)) {
-                $upper = Str::upper($candidate);
-
-                if (isset(self::PLATFORM_MAP[$upper])) {
-                    $loaders[self::PLATFORM_MAP[$upper]] = true;
-                }
-
-                continue;
-            }
-
-            foreach (is_array($candidate) ? array_keys($candidate) : [] as $platform) {
-                $upper = Str::upper((string) $platform);
-
-                if (isset(self::PLATFORM_MAP[$upper])) {
-                    $loaders[self::PLATFORM_MAP[$upper]] = true;
-                }
-            }
-        }
-
-        return array_values(array_unique(array_keys($loaders)));
     }
 }

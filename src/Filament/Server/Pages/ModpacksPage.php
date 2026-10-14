@@ -12,7 +12,8 @@ use Filament\Pages\Page;
 use McToolkit\Filament\Server\Pages\Concerns\InteractsWithContent;
 
 /**
- * Modpacks — one-shot Modrinth `.mrpack` installer (loader + mods + configs).
+ * Modpacks — one-shot Modrinth `.mrpack` installer (mods + configs; the loader itself
+ * is installed from the Versions page).
  *
  * Icon: TablerIcon::Package ('tabler-package', verified app/Enums/TablerIcon.php:4324).
  *
@@ -22,11 +23,9 @@ use McToolkit\Filament\Server\Pages\Concerns\InteractsWithContent;
  *    reusing pages.versions.install.stopped_note — the installer keeps its own hard
  *    gate, so the notice is guidance, not enforcement duplicated.
  *  - No loader-mismatch BLOCKER here by design: installing a modpack onto a vanilla
- *    box is the legitimate conversion flow. When the detection disagrees with what
- *    the user intends to do the install simply proceeds; failures come back through
- *    friendly DomainException texts and guide users toward Versions in words
- *    (loader-mismatch redirect notice rides the shared callout below when the box is
- *    bukkit-family, quoting the modpacks subtitle tail semantics).
+ *    box is the legitimate conversion flow. The pack's own loader requirement is
+ *    compared with the detected software after the install and shown as a warning
+ *    (pages.modpacks.requires) when they differ.
  */
 final class ModpacksPage extends Page
 {
@@ -41,19 +40,23 @@ final class ModpacksPage extends Page
 
     protected string $view = 'minecraft-toolkit::server.modpacks';
 
+
+    /** Namespaced URL: /server/{uuid_short}/mc-toolkit/modpacks (README "Feature pages"). */
+
+    protected static ?string $slug = 'mc-toolkit/modpacks';
+
     /** Livewire event emitted by the shared detection-banner's re-detect control. */
     protected $listeners = ['mc-toolkit.redetect' => 'redetect'];
 
+    /**
+     * 'use' + 'content' on a server outside any conflict state. Filament re-runs this on
+     * every Livewire request of the page (CanAuthorizeAccess::hydrateCanAuthorizeAccess).
+     */
     public static function canAccess(): bool
     {
         return parent::canAccess()
             && (bool) config('minecraft-toolkit.pages.enabled.modpacks', true)
-            && user()?->can('minecraft-toolkit.use', Filament::getTenant());
-    }
-
-    protected function authorizeAccess(): void
-    {
-        abort_unless(user()?->can('minecraft-toolkit.content', Filament::getTenant()), 403);
+            && static::canAccessContentCatalog();
     }
 
     public function getTitle(): string
@@ -77,7 +80,7 @@ final class ModpacksPage extends Page
             Action::make('refresh')
                 ->label(trans('minecraft-toolkit::common.buttons.refresh'))
                 ->icon(TablerIcon::Refresh)
-                ->action(fn () => $this->refresh()),
+                ->action(fn () => $this->refreshContent()),
         ];
     }
 

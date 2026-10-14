@@ -23,7 +23,7 @@ the panel's native plugin system and Filament design system.
 Paste this URL into *Admin → Plugins → **Import from URL***:
 
 ```
-https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.3.zip
+https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.4.zip
 ```
 
 The panel verifies the SHA-256 from [update.json](update.json) and drops the plugin into
@@ -134,7 +134,7 @@ Server owners are always allowed; root admins bypass permission checks globally.
 | [mcjars.app](https://mcjars.app) | versions/builds catalog | no |
 | [Modrinth](https://modrinth.com) | plugins, mods, modpacks | no |
 | [Spiget.org](https://spiget.org) | SpigotMC plugins | no |
-| [Hangar (hangar.papermc.io)](https://hangar.papermc.io)\* | Paper plugins | yes (`HANGAR_KEY`) |
+| [Hangar (hangar.papermc.io)](https://hangar.papermc.io) | Paper plugins | no |
 | [CurseForge](https://console.curseforge.com)\* | plugins/mods extras | yes (`CURSEFORGE_KEY`) |
 
 \* Stars mark admin-provided keys configured under Admin → Plugins → Settings (or `.env`). Without
@@ -146,11 +146,10 @@ Settings are persisted to the panel `.env` (values written by the built-in setti
 
 ```
 MC_TOOLKIT_CURSEFORGE_KEY=...    # optional CurseForge API key
-MC_TOOLKIT_HANGAR_KEY=...        # optional Hangar personal token
-MC_TOOLKIT_ENABLED_PAGES=        # comma-separated page slugs; blank = all nine enabled
+MC_TOOLKIT_ENABLED_PAGES=        # comma-separated page slugs; blank/all = all nine, none = no page
 ```
 
-The bare names (`CURSEFORGE_KEY`, `HANGAR_KEY`) also work when pre-defined by other tooling.
+The bare name `CURSEFORGE_KEY` also works when pre-defined by other tooling.
 Cache lifetimes, registry toggles and limits are tuned in `config/minecraft-toolkit.php`.
 
 ## Limitations (honest scope of v1)
@@ -204,7 +203,7 @@ Full recovery recipe for this exact incident:
 php artisan queue:restart          # fresh autoloader/opcache for install workers
 php artisan optimize:clear
 docker compose restart panel       # official image ships opcache with validate_timestamps=0
-php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.2
+php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.4
 ```
 
 If it still reads *Errored*, press the row's **Delete** action, then Import from URL again
@@ -231,3 +230,55 @@ the option keys as numeric indexes `0..8` while the form was filled with page sl
 (`versions`, `plugins`, …). Every save attempt — regardless of which boxes were checked — then
 failed the built-in `in:` validation. v1.0.3 keys options by slug again and also tolerates
 index-shaped values submitted by the earlier UI when persisting.
+
+### Pages look unstyled (no spacing, no grid)
+
+The panel compiles its own Tailwind stylesheet and skips git-ignored folders, which includes
+every plugin. Since v1.0.4 the toolkit ships its own Tailwind entry
+(`resources/css/main.css`) that the panel builds while installing or updating the plugin
+(`yarn install && yarn build` on the panel host). If that build could not run — for example no
+Node/Yarn on the host — run it once by hand from the panel root:
+
+```bash
+yarn install && yarn build
+```
+
+Until then the pages work, they only fall back to the styles the panel happens to ship.
+
+## Changelog
+
+### v1.0.4
+
+Bug-fix release; nothing new on purpose.
+
+- **Pages crashed on render.** The detection banner and the sparkline used component names Blade
+  cannot resolve (`minecraft-toolkit::components.*`), the banner rendered itself recursively,
+  broken Blade comments swallowed half of the Players and Worlds views, the Worlds view had a
+  `use` statement inside a component slot, the Properties form evaluated a closure with no record,
+  the Versions page assigned `null` to a string property and called an undefined `canBackup()`,
+  the Modpacks page referenced `Filament` without importing it (500 on every server page), the
+  Players page passed a `Stringable` to `Notification::body()`, and the map script had a syntax error.
+- **Catalogs never answered.** Every HTTP call used `Http::retries()`, which does not exist.
+  Modrinth loader facets were AND-ed and search hits were all marked incompatible, CurseForge used
+  the resource-pack class for plugins and ignored the search text, Hangar was rewritten against its
+  real (key-less) API, and Spiget fields/paging headers were wrong.
+- **Installs.** Wings pulls now run in the foreground with an explicit file name, so nothing
+  touches a half-downloaded file; updates replace the old jar; Refresh no longer forgets tracked
+  plugins; modpacks are staged, validated against the `.mrpack` spec and merged with their
+  overrides; the Spiget redirect walk on the panel host (blind SSRF) is gone. The Versions page
+  downloads into staging first, stops the server and waits until it is really offline, and only
+  then swaps jars (named after the egg's `SERVER_JARFILE`).
+- **Properties.** Booleans showed as ON and were written back as `true`; the baseline was lost
+  between requests, so saving one group could zero hidden values; the parser now round-trips
+  Java's escapes, keeps the trailing newline stable and survives duplicate keys.
+- **Worlds and map.** 1.18+ chunks, int arrays in `level.dat`, Nether/End region folders, world
+  import (staging, never over a live world), downloads through the panel's own node-token flow
+  instead of buffering the zip in PHP, and reset/import refuse a running server.
+- **Security.** Every page checks its domain permission and the server's conflict state on each
+  request (only `use` was checked before), mutating actions re-check `manage`, `wire:click`
+  arguments are JS-encoded, console commands reject line breaks and invalid player names, world
+  download/reset only accept real world folders, the plugin routes require a session login.
+- **Database.** `server_id` is now `INT UNSIGNED` like `servers.id`; MySQL/MariaDB refused the
+  previous BIGINT foreign key, so the plugin could not be installed there at all.
+- **Settings.** Unticking every page now really hides them all (`none`); the Hangar token field
+  is gone because Hangar needs no key.

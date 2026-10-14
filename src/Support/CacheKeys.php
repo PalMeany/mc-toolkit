@@ -13,9 +13,9 @@ use App\Models\Server;
  * (uuid_short when a Server model is in hand, raw scalar otherwise).
  *
  * TTLs mirror the config defaults defined in config/minecraft-toolkit.php under the
- * `cache.*` tree (seconds). Services should always read the runtime value:
+ * `cache_ttl.*` tree (seconds). Services should always read the runtime value:
  *
- *     $ttl = (int) config('minecraft-toolkit.cache.detection_ttl', CacheKeys::DETECTION_TTL_SECONDS);
+ *     $ttl = (int) config('minecraft-toolkit.cache_ttl.detect', CacheKeys::DETECTION_TTL_SECONDS);
  */
 final class CacheKeys
 {

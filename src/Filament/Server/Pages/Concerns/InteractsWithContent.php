@@ -7,6 +7,7 @@ namespace McToolkit\Filament\Server\Pages\Concerns;
 use App\Enums\ContainerStatus;
 use App\Models\Server;
 use Filament\Facades\Filament;
+use Filament\Notifications\Notification;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use McToolkit\Filament\Server\Pages\VersionsPage;
@@ -16,7 +17,6 @@ use McToolkit\Services\Catalog\ContentSearchService;
 use McToolkit\Services\Content\UpdateScanner;
 use McToolkit\Services\DetectionService;
 use McToolkit\Support\Activity;
-use Filament\Notifications\Notification;
 use Throwable;
 
 /**
@@ -30,20 +30,20 @@ use Throwable;
  *   - contentKind():        'plugins'|'mods'|'modpacks'  (ContentSearchService kind id)
  *   - installerKind():      'plugin'|'mod'|'modpack'     (InstalledContent / installer kind id)
  *   - langSection():        'plugins'|'mods'|'modpacks'  (pages.* namespace slice)
- *   - blockedNotice():      ?array{message:string, versionsUrl:?string|null} | null
+ *   - blockedNotice():      ?array{title:?string, message:string, versions_url:?string}
  *
- * Sorting honesty (documented limitation): every registry adapter fetches its own
- * default index upstream (Modrinth relevance, CurseForge popularity, Hangar stars,
- * Spiget update-date on empty queries) and its frozen signature exposes no sort
- * parameter, so "Newest" and "Downloads" RE-SORT the merged multi-source result set
- * locally instead of remapping upstream indexes. The SpigotMC slice is closest to a
- * true date order because its empty-query listing arrives sorted by updateDate.
+ * Sorting: every registry answers in its own relevance order and ContentSearchService
+ * merges them round-robin, so "Relevance" keeps that blend while "Newest" and
+ * "Downloads" re-sort the merged page locally (upstream indexes are not remapped).
  *
- * Authorization (contract matrix): this whole domain reads through
- * 'minecraft-toolkit.content' (authorizeAccess) on top of page 'use'
- * (canAccess, defined per page class); install/update additionally require
- * 'minecraft-toolkit.manage'. No content mutation is destructive ⇒ 'administer'
- * is never demanded here (worlds ops own that rule).
+ * Authorization (contract matrix): page access needs 'minecraft-toolkit.use' AND
+ * 'minecraft-toolkit.content' on a server that is not in a conflict state
+ * ({@see self::canAccessContentCatalog()}, re-checked by Filament on every Livewire
+ * request); install/update/forget additionally require 'minecraft-toolkit.manage'.
+ * No content mutation is destructive ⇒ 'administer' is never demanded here.
+ *
+ * Wire safety: actions are called with ids only (Js::from-encoded in the views) and
+ * every title, registry or project id is resolved server-side again.
  */
 trait InteractsWithContent
 {
@@ -63,22 +63,18 @@ trait InteractsWithContent
     /** Restrict results to one registry chip (null = all enabled sources). */
     public ?string $source = null;
 
-    /** Relevance | newest | downloads — see class docblock sorting honesty. */
+    /** Relevance | newest | downloads — see class docblock. */
     public string $sortKey = 'relevance';
 
     /** "Compatible with my server" filter flag. */
     public bool $compatOnly = false;
 
-    /** Busy markers (hex keys) rendered into per-card :disabled bindings. */
-    public array $installingIds = [];
+    /** Per-request memos; Livewire never persists private state between requests. */
+    private ?array $memoizedBrowse = null;
 
-    /** Tracked file names currently running an update. */
-    public array $updatingNames = [];
+    private ?array $memoizedInstalled = null;
 
-    /** Per-request memo flags; invalidated whenever an input or data layer changes. */
-    private bool $browseDirty = true;
-
-    private bool $installedDirty = true;
+    private ?array $memoizedDetection = null;
 
     /* ------------------------------------------------------------------ */
     /*  Per-page identity                                                  */
@@ -113,12 +109,40 @@ trait InteractsWithContent
     /*  Server + permission plumbing                                       */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * Shared canAccess() body of the three catalog pages (the page adds its own
+     * parent::canAccess() + enabled-page switch). Doubles as the per-request gate:
+     * Filament re-runs canAccess() while hydrating every Livewire call.
+     */
+    protected static function canAccessContentCatalog(): bool
+    {
+        $tenant = Filament::getTenant();
+        $user = user();
+
+        return $tenant instanceof Server
+            && $user !== null
+            && !$tenant->isInConflictState()
+            && $user->can('minecraft-toolkit.use', $tenant)
+            && $user->can('minecraft-toolkit.content', $tenant);
+    }
+
     protected function contentServer(): Server
     {
         /** @var Server $server */
         $server = Filament::getTenant();
 
         return $server;
+    }
+
+    /** Read access to the catalog (page-level 'use' + 'content'). */
+    public function userCanBrowse(): bool
+    {
+        $user = user();
+        $server = $this->contentServer();
+
+        return $user !== null
+            && $user->can('minecraft-toolkit.use', $server)
+            && $user->can('minecraft-toolkit.content', $server);
     }
 
     /**
@@ -129,12 +153,20 @@ trait InteractsWithContent
      */
     public function userCanMutate(): bool
     {
-        $server = $this->contentServer();
         $user = user();
 
-        return filled($user)
-            && (bool) $user->can('minecraft-toolkit.content', $server)
-            && (bool) $user->can('minecraft-toolkit.manage', $server);
+        return $this->userCanBrowse()
+            && $user !== null
+            && $user->can('minecraft-toolkit.manage', $this->contentServer());
+    }
+
+    /**
+     * Whether Install CTAs make sense here: the Mods page refuses while a Bukkit-family
+     * server is detected (its blocker callout explains why). Enforced server-side too.
+     */
+    public function installsAllowed(): bool
+    {
+        return $this->contentKind() !== 'mods' || $this->blockedNotice() === null;
     }
 
     /* ------------------------------------------------------------------ */
@@ -142,17 +174,20 @@ trait InteractsWithContent
     /* ------------------------------------------------------------------ */
 
     /**
-     * DetectionService payload (cached upstream for 15 minutes; force=off here).
+     * DetectionService payload (cached upstream for 15 minutes; memoized per request).
      *
      * @return array<string, mixed>
      */
     public function contentDetection(): array
     {
+        if ($this->memoizedDetection !== null) {
+            return $this->memoizedDetection;
+        }
+
         try {
-            return app(DetectionService::class)->detect($this->contentServer());
+            return $this->memoizedDetection = app(DetectionService::class)->detect($this->contentServer());
         } catch (Throwable) {
-            // Node unreachable — banner maps to gateway_down copy itself via the
-            // generic shape below (matches DetectionService's uncached failure shape).
+            // Node unreachable — same generic shape as DetectionService's uncached failure.
             return [
                 'software' => 'unknown',
                 'loader' => 'vanilla',
@@ -167,9 +202,7 @@ trait InteractsWithContent
 
     /**
      * Loader tokens shown inside the compat-filter label, derived from the
-     * DetectionService compat families:
-     *   bukkit={paper,spigot,bukkit,purpur,leaves,pufferfish,folia,mohist,arclight,sponge}
-     *   fabric={fabric,quilt}   forge={forge,neoforge}   proxies={velocity,waterfall,bungee*}.
+     * DetectionService compat families.
      *
      * @return list<string>
      */
@@ -178,7 +211,7 @@ trait InteractsWithContent
         $detected = $this->contentDetection();
 
         return match ((string) ($detected['loader'] ?? 'vanilla')) {
-            'bukkit' => ['paper', 'spigot', 'bukkit', 'purpur', 'leaves', 'pufferfish', 'folia', 'mohist', 'arclight', 'sponge'],
+            'bukkit' => ['paper', 'spigot', 'bukkit', 'purpur', 'folia'],
             'fabric' => ['fabric', 'quilt'],
             'forge' => ['forge', 'neoforge'],
             'velocity' => ['velocity', 'waterfall', 'bungeecord'],
@@ -215,23 +248,25 @@ trait InteractsWithContent
      */
     public function sourceLabel(string $source): string
     {
-        $key = trans("minecraft-toolkit::pages.{$this->langSection()}.sources.{$source}");
-        $fallback = trans("minecraft-toolkit::pages.plugins.sources.{$source}");
+        // Spiget rows are tracked as 'spigotmc'; the label lives under the chip key.
+        $source = strtolower(trim($source)) === 'spigotmc' ? 'spigot' : strtolower(trim($source));
 
-        return is_string($key) && str_starts_with($key, 'minecraft-toolkit::')
-            ? (is_string($fallback) && ! str_starts_with($fallback, 'minecraft-toolkit::')
-                ? $fallback
-                : ucfirst($source))
-            : $key;
+        foreach (["minecraft-toolkit::pages.{$this->langSection()}.sources.{$source}", "minecraft-toolkit::pages.plugins.sources.{$source}"] as $key) {
+            $label = trans($key);
+
+            if (is_string($label) && $label !== $key) {
+                return $label;
+            }
+        }
+
+        return ucfirst($source);
     }
 
     /**
      * Human text for one skip reason coming back from ContentSearchService.
      *
      * Mapping contract: rate_limited has a real errors.* entry; no_key/request_error
-     * have NO exact translation in the frozen lang tree yet — they render constant
-     * English and are listed in handoff notes as lang-gaps
-     * (candidates: pages.content.skip.no_key / pages.content.skip.request_error).
+     * have NO exact translation in the frozen lang tree yet — they render constant English.
      */
     public function skipReasonText(string $reason): string
     {
@@ -248,7 +283,7 @@ trait InteractsWithContent
 
     /**
      * Sort dropdown rows. Labels are constant English because the frozen lang tree
-     * carries no sort words yet (lang-gap note; candidates: pages.content.sort.*).
+     * carries no sort words yet (lang-gap note).
      *
      * @return array<array{value: string, label: string}>
      */
@@ -268,8 +303,8 @@ trait InteractsWithContent
     /**
      * One memoized merged-search pass powering the Browse grid.
      *
-     * Every item gains: 'installed' (tracker presence hybrid),
-     * 'key' (morph-stable hash), and stays untouched otherwise.
+     * Every item gains: 'installed' (exact registry|project_id match against the
+     * tracker), 'key' (morph-stable hash) and 'updated_human'.
      *
      * @return array{
      *     items: list<array<string, mixed>>,
@@ -280,48 +315,44 @@ trait InteractsWithContent
      */
     public function browsePayload(): array
     {
-        if (! $this->browseDirty && is_array($this->memoizedBrowse)) {
-            return $this->memoizedBrowse;
-        }
-
-        $this->memoizedBrowse = $this->runBrowseQuery();
-        $this->browseDirty = false;
-
-        return $this->memoizedBrowse;
+        return $this->memoizedBrowse ??= $this->runBrowseQuery();
     }
-
-    private ?array $memoizedBrowse = null;
 
     /**
      * @return array{items: list<array<string, mixed>>, pages: ?int, sources_used: list<string>, sources_skipped: array<string, string>}
      */
     private function runBrowseQuery(): array
     {
-        $knownFiles = $this->trackedFileIndex();
+        $trackedProjects = $this->trackedProjectIndex();
         $items = [];
-
-        $search = app(ContentSearchService::class);
 
         $compat = null;
 
         if ($this->compatOnly) {
             $loader = (string) ($this->contentDetection()['loader'] ?? '');
-            $token = match (true) {
-                $loader === 'bukkit' => 'paper',
-                $loader === 'fabric' => 'fabric',
-                $loader === 'forge' => 'forge',
-                $loader === 'velocity' => 'velocity',
-                default => '',
-            };
 
             $compat = [
-                'loader' => $token,
+                'loader' => match ($loader) {
+                    'bukkit' => 'paper',
+                    'fabric' => 'fabric',
+                    'forge' => 'forge',
+                    'velocity' => 'velocity',
+                    default => '',
+                },
                 'mc_version' => $this->compatMcVersion() ?? '',
             ];
         }
 
+        $source = $this->source !== null && in_array($this->source, $this->allowedSources(), true) ? $this->source : null;
+
         try {
-            $payload = $search->search($this->contentKind(), $this->source, $this->query, max(1, $this->browsePage), $compat);
+            $payload = app(ContentSearchService::class)->search(
+                $this->contentKind(),
+                $source,
+                mb_substr(trim($this->query), 0, 100),
+                max(1, $this->browsePage),
+                $compat,
+            );
         } catch (Throwable) {
             // Adapters already isolate their own transport failures; reaching here means
             // an unexpected shape — degrade into the empty state rather than break render.
@@ -329,45 +360,27 @@ trait InteractsWithContent
         }
 
         foreach ($payload['items'] as $item) {
-            if (! is_array($item)) {
+            if (!is_array($item)) {
                 continue;
             }
 
-            // "Compatible with my server" checkbox: sources whose facets already
-            // narrowed upstream only mark items explicitly (SpigotMC has no facet
-            // support, so its rows arrive untagged) — drop hard-incompatible items
-            // here so the filter holds true on every registry.
+            // "Compatible with my server": sources whose facets already narrowed upstream
+            // only mark items explicitly — drop hard-incompatible items so the filter holds
+            // on every registry.
             if ($this->compatOnly && ($item['compatible'] ?? true) === false) {
                 continue;
             }
 
-            $item['key'] = hash('crc32b', ($item['source'] ?? '').'|'.($item['id'] ?? '').'|'.($item['title'] ?? ''));
+            $projectKey = UpdateScanner::keyFor((string) ($item['source'] ?? ''), (string) ($item['id'] ?? ''));
 
-            // Installed-flag HYBRID (contract wording): presence decided from tracker rows
-            // OR from real directory naming overlap. Exact basename equality OR substring
-            // containment of the project slug/id inside any tracked artifact name.
-            $needle = mb_strtolower(trim((string) (($item['slug'] ?? '') !== '' ? $item['slug'] : ($item['id'] ?? ''))));
-            $isInstalled = false;
-
-            if ($needle !== '' && mb_strlen($needle) >= 3) {
-                foreach (array_keys($knownFiles) as $fileName) {
-                    if ($fileName === $needle || str_contains($fileName, $needle)) {
-                        $isInstalled = true;
-
-                        break;
-                    }
-                }
-            }
-
-            $item['installed'] = $isInstalled;
+            $item['key'] = hash('crc32b', $projectKey);
+            $item['installed'] = isset($trackedProjects[$projectKey]);
+            $item['updated_human'] = $this->shortDate($item['updated'] ?? null);
 
             $items[] = $item;
         }
 
         $sorted = match ($this->sortKey) {
-            // Upstream feeds arrive relevance/popularity-ish ordered; re-sorts are LOCAL
-            // (see trait docblock honesty note). Prefix-sort hack ties downloads and keeps
-            // blended stability via array index stamp before the comparator.
             'downloads' => $this->stableSort($items, fn (array $a, array $b): int => ((int) ($b['downloads'] ?? 0)) <=> ((int) ($a['downloads'] ?? 0))),
             'newest' => $this->stableSort($items, function (array $a, array $b): int {
                 $ta = $this->timestampOf($a['updated'] ?? null);
@@ -387,8 +400,8 @@ trait InteractsWithContent
     }
 
     /**
-     * Downloads/newest ordering stamps every element with its blend position so the
-     * comparator never flips equal keys between renders (Livewire morphing loves us for it).
+     * Stamps every element with its blend position so the comparator never flips equal
+     * keys between renders (Livewire morphing loves us for it).
      *
      * @param  list<array<string, mixed>>  $items
      * @return list<array<string, mixed>>
@@ -413,7 +426,7 @@ trait InteractsWithContent
             return (int) $raw;
         }
 
-        if (! is_string($raw) || trim($raw) === '') {
+        if (!is_string($raw) || trim($raw) === '') {
             return null;
         }
 
@@ -423,24 +436,28 @@ trait InteractsWithContent
     }
 
     /**
-     * Lowercase basenames of every tracked row for this kind (hybrid presence oracle).
+     * `registry|project_id` keys of every standalone project tracked for this kind
+     * (pack files carry the PACK's id and are left out).
      *
      * @return array<string, true>
      */
-    private function trackedFileIndex(): array
+    private function trackedProjectIndex(): array
     {
         $out = [];
 
-        foreach ($this->installer()->installed($this->contentServer(), $this->installerKind())['tracked'] as $row) {
-            $base = mb_strtolower(basename(str_replace('\\', '/', (string) ($row->file_name ?? ''))));
+        try {
+            /** @var Collection<int, InstalledContent> $rows */
+            $rows = InstalledContent::query()
+                ->forServer($this->contentServer())
+                ->where('kind', $this->installerKind())
+                ->get();
+        } catch (Throwable) {
+            return [];
+        }
 
-            // The hybrid token-match needs the extension-free stem too ("EssentialsX-2.2.jar"
-            // vs slug "essentialsx"), so stems ride alongside full names.
-            $stem = mb_strtolower(preg_replace('/\.(jar|zip|mrpack)$/i', '', $base) ?? $base);
-
-            if ($base !== '' && $base !== '.') {
-                $out[$base] = true;
-                $out[$stem] = true;
+        foreach ($rows as $row) {
+            if (!$row->isPackChild()) {
+                $out[UpdateScanner::keyFor($row->registry, (string) $row->project_id)] = true;
             }
         }
 
@@ -456,9 +473,7 @@ trait InteractsWithContent
      */
     public function installedCount(): int
     {
-        $payload = $this->installedPayload();
-
-        return count($payload['primary']);
+        return count($this->installedPayload()['primary']);
     }
 
     /**
@@ -472,17 +487,8 @@ trait InteractsWithContent
      */
     public function installedPayload(): array
     {
-        if (! $this->installedDirty && is_array($this->memoizedInstalled)) {
-            return $this->memoizedInstalled;
-        }
-
-        $this->memoizedInstalled = $this->buildInstalledPayload();
-        $this->installedDirty = false;
-
-        return $this->memoizedInstalled;
+        return $this->memoizedInstalled ??= $this->buildInstalledPayload();
     }
-
-    private ?array $memoizedInstalled = null;
 
     /**
      * @return array{primary: list<array<string, mixed>>, foreign: list<array{name: string, human_size: string}>}
@@ -500,34 +506,37 @@ trait InteractsWithContent
         $primary = [];
 
         foreach ($listing['tracked'] as $row) {
-            if (! $row instanceof InstalledContent) {
+            if (!$row instanceof InstalledContent) {
                 continue;
             }
 
-            $scan = $scanMap[strtolower(($row->registry ?? '').'|'.($row->project_id ?? ''))] ?? null;
+            $isPackChild = $row->isPackChild();
+
+            $scan = $scanMap[UpdateScanner::keyFor($row->registry, (string) $row->project_id)] ?? null;
             $latestTs = is_array($scan) ? ($scan['latest_ts'] ?? null) : null;
             $baselineTs = $row->updated_at instanceof Carbon ? $row->updated_at->getTimestamp() : null;
 
-            $available = is_int($latestTs) && is_int($baselineTs) && $latestTs > $baselineTs;
+            // Pack files share the pack's probe; only their umbrella row offers the update.
+            $available = !$isPackChild
+                && (bool) $row->tracked_by_toolkit
+                && is_int($latestTs) && is_int($baselineTs) && $latestTs > $baselineTs;
 
-            $deps = is_array($row->dependencies) ? $row->dependencies : [];
-            $title = is_string($deps['title'] ?? null) ? $deps['title'] : (is_string($deps['pack'] ?? null) ? $deps['pack'] : '');
-
-            $isPackChild = is_string($deps['pack'] ?? null);
+            // Pack files are listed by their own jar name (the "+pack" chip names the origin).
+            $title = $isPackChild ? '' : $row->displayTitle();
 
             $entry = [
-                'row' => $row,
+                'row_id' => (int) $row->getKey(),
                 'file_name' => (string) $row->file_name,
                 'display_name' => $title !== '' ? $title : basename(str_replace('\\', '/', (string) $row->file_name)),
                 'version' => $row->version,
                 'registry' => (string) ($row->registry ?? ''),
                 'registry_label' => $this->sourceLabel((string) ($row->registry ?? '')),
                 'updated_at_human' => $row->updated_at instanceof Carbon ? $row->updated_at->translatedFormat('M j, Y') : null,
-                'update_available' => $available && (bool) $row->tracked_by_toolkit,
+                'update_available' => $available,
                 'update_time' => $available ? Carbon::createFromTimestampUTC($latestTs)->translatedFormat('M j, Y H:i') : null,
                 'is_pack_child' => $isPackChild,
-                'installable' => ! $isPackChild, // child rows reinstall WITH their pack umbrella only
-                'busy' => in_array(md5((string) $row->file_name), $this->updatingNames, true),
+                'installable' => !$isPackChild, // child rows reinstall WITH their pack umbrella only
+                'requires' => $this->packRequirementNote($row),
             ];
 
             $dedupeKey = strtolower($entry['registry'].'|'.basename(strtolower($entry['file_name'])).'|'.(int) $isPackChild);
@@ -544,7 +553,7 @@ trait InteractsWithContent
         $foreign = [];
 
         foreach ($listing['foreign'] as $entry) {
-            if (! is_array($entry)) {
+            if (!is_array($entry)) {
                 continue;
             }
 
@@ -559,7 +568,7 @@ trait InteractsWithContent
 
     /**
      * Project-level update scan map (transient adapter probes, cached by UpdateScanner):
-     * registry|project_id → ['latest_ts' => ?int, 'latest_version' => ?string].
+     * UpdateScanner::keyFor() → ['latest_ts' => ?int, 'latest_version' => ?string].
      *
      * @return array<string, array{latest_ts: ?int, latest_version: ?string}>
      */
@@ -572,19 +581,56 @@ trait InteractsWithContent
         }
     }
 
+    /**
+     * "Needs Fabric 0.15.11 for Minecraft 1.20.1" style note for a modpack umbrella row whose
+     * requirements do not match the detected software; null otherwise.
+     */
+    private function packRequirementNote(InstalledContent $row): ?string
+    {
+        if ($row->kind !== InstalledContent::KIND_MODPACK) {
+            return null;
+        }
+
+        $deps = is_array($row->dependencies) ? $row->dependencies : [];
+        $requires = $deps['summary']['requires'] ?? null;
+
+        if (!is_array($requires) || ($requires['matches_server'] ?? true) !== false) {
+            return null;
+        }
+
+        $loader = is_string($requires['loader'] ?? null) ? ucfirst($requires['loader']) : 'Vanilla';
+
+        if (is_string($requires['loader_version'] ?? null) && $requires['loader_version'] !== '') {
+            $loader .= ' '.$requires['loader_version'];
+        }
+
+        $note = trans('minecraft-toolkit::pages.modpacks.requires', [
+            'loader' => $loader,
+            'version' => is_string($requires['minecraft'] ?? null) ? $requires['minecraft'] : '?',
+        ]);
+
+        return is_string($note) ? $note : null;
+    }
+
     /* ------------------------------------------------------------------ */
     /*  Actions                                                            */
     /* ------------------------------------------------------------------ */
 
-    /** Livewire event caught by the shared detection-banner component. */
+    /** Livewire event caught from the shared detection-banner component. */
     public function redetect(): void
     {
+        if (!$this->userCanBrowse()) {
+            $this->denyNotification();
+
+            return;
+        }
+
         $server = $this->contentServer();
 
         try {
             app(DetectionService::class)->detect($server, true);
 
-            Activity::event('mc-toolkit:detection.refresh')->log();
+            Activity::event('mc-toolkit:detection.refresh')->subject($server)->log();
         } catch (Throwable) {
             Notification::make()
                 ->title(trans('minecraft-toolkit::banner.failures.gateway_down'))
@@ -600,7 +646,7 @@ trait InteractsWithContent
 
         Notification::make()
             ->title(trans('minecraft-toolkit::banner.detection.title_note'))
-            ->body(sprintf('%s %s', ucfirst($this->contentDetection()['software'] ?? ''), $this->compatMcVersion() ?? ''))
+            ->body(trim(sprintf('%s %s', ucfirst((string) ($this->contentDetection()['software'] ?? '')), $this->compatMcVersion() ?? '')))
             ->success()
             ->send();
     }
@@ -608,22 +654,19 @@ trait InteractsWithContent
     public function switchTab(string $tab): void
     {
         $this->tab = $tab === 'installed' ? 'installed' : 'browse';
-
-        if ($this->tab === 'installed') {
-            $this->installedDirty = true;
-        }
+        $this->bustCaches();
     }
 
     public function runSearch(): void
     {
         $this->browsePage = 1;
-        $this->browseDirty = true;
+        $this->bustCaches();
     }
 
     public function previousPage(): void
     {
         $this->browsePage = max(1, $this->browsePage - 1);
-        $this->browseDirty = true;
+        $this->bustCaches();
     }
 
     public function nextPage(): void
@@ -631,7 +674,7 @@ trait InteractsWithContent
         $maxPage = $this->browsePayload()['pages'];
 
         $this->browsePage = $maxPage !== null ? min(max(1, $maxPage), $this->browsePage + 1) : $this->browsePage + 1;
-        $this->browseDirty = true;
+        $this->bustCaches();
     }
 
     public function setSource(?string $source): void
@@ -640,62 +683,86 @@ trait InteractsWithContent
         $this->source = in_array($candidate, $this->allowedSources(), true) ? $candidate : null;
 
         $this->browsePage = 1;
-        $this->browseDirty = true;
+        $this->bustCaches();
     }
 
     public function toggleCompat(): void
     {
-        $this->compatOnly = ! $this->compatOnly;
+        $this->compatOnly = !$this->compatOnly;
 
         $this->browsePage = 1;
-        $this->browseDirty = true;
-    }
-
-    /** Header Refresh: reconcile stale tracked rows, then recompute everything silently. */
-    public function refresh(): void
-    {
-        $server = $this->contentServer();
-
-        try {
-            app(ContentInstallerService::class)->forgetMissing($server);
-        } catch (Throwable) {
-            // Node hiccup must never turn Refresh into a toast storm — silent per R18 discipline.
-        }
-
-        $this->bustCaches(true);
+        $this->bustCaches();
     }
 
     /**
-     * Install one Browse-grid card ("Install" CTA on un-tracked projects).
+     * Header Refresh: re-probe updates and recompute; managers also reconcile tracked
+     * rows whose files vanished (that prunes database rows, hence the manage gate).
+     *
+     * Named refreshContent() so Filament's own BasePage::refresh() (#[On('refresh-page')])
+     * keeps its meaning.
      */
-    public function install(string $source, string $projectId, ?string $title = null): void
+    public function refreshContent(): void
     {
-        $server = $this->contentServer();
-
-        if (! $this->userCanMutate()) {
+        if (!$this->userCanBrowse()) {
             $this->denyNotification();
 
             return;
         }
 
-        $key = hash('crc32b', $source.'|'.$projectId.'|'.($title ?? ''));
+        $server = $this->contentServer();
 
-        $this->installingIds[] = $key;
+        if ($this->userCanMutate()) {
+            try {
+                $this->installer()->forgetMissing($server);
+            } catch (Throwable) {
+                // Node hiccup must never turn Refresh into a toast storm — silent per R18 discipline.
+            }
+        }
+
+        $this->forgetUpdateScan();
+        $this->bustCaches();
+    }
+
+    /**
+     * Install one Browse-grid card. Only ids travel over the wire; the title is looked up
+     * again from the (cached) catalog page, never trusted from the client.
+     */
+    public function install(string $source, string $projectId): void
+    {
+        if (!$this->userCanMutate() || !$this->installsAllowed()) {
+            $this->denyNotification();
+
+            return;
+        }
+
+        $source = strtolower(trim($source));
+        $projectId = trim($projectId);
+        $chip = $source === 'spigotmc' ? 'spigot' : $source;
+
+        if ($projectId === '' || !in_array($chip, $this->allowedSources(), true)) {
+            $this->denyNotification();
+
+            return;
+        }
+
+        $server = $this->contentServer();
 
         try {
-            $row = app(ContentInstallerService::class)->installProject($server, $this->installerKind(), [
+            $row = $this->installer()->installProject($server, $this->installerKind(), [
                 'source' => $source,
                 'id' => $projectId,
-                'title' => (string) ($title ?? ''),
+                'title' => $this->catalogTitle($source, $projectId),
             ], $this->versionMeta());
 
             Notification::make()
                 ->title(trans('minecraft-toolkit::common.buttons.install'))
-                ->body($row->file_name)
+                ->body($row->displayTitle() !== '' ? $row->displayTitle() : $row->file_name)
                 ->success()
                 ->send();
 
-            $this->switchTab('installed');
+            $this->warnAboutPackRequirements($row);
+
+            $this->tab = 'installed';
         } catch (Throwable $exception) {
             Notification::make()
                 ->title(trans('minecraft-toolkit::errors.statuses.download_failed'))
@@ -703,50 +770,54 @@ trait InteractsWithContent
                 ->danger()
                 ->send();
         } finally {
-            $this->installingIds = array_values(array_diff($this->installingIds, [$key]));
-            $this->bustCaches(true);
+            $this->forgetUpdateScan();
+            $this->bustCaches();
         }
     }
 
     /**
-     * Quietly reinstall the SAME project backing one tracked row — overwrites the
-     * same-named artifact in place (contract: update = re-run installer). Emits the
-     * contract-defined mc-toolkit:content.update activity event.
+     * Reinstall the newest matching build of the project behind one tracked row. The row
+     * is looked up by id on THIS server and kind; registry, project id and title come from
+     * the database, never from the client. A changed file name retires the old file.
      */
-    public function updateTracked(string $fileName, string $registry, string $projectId, ?string $title = null): void
+    public function updateTracked(int $rowId): void
     {
-        $server = $this->contentServer();
-
-        if (! $this->userCanMutate()) {
+        if (!$this->userCanMutate()) {
             $this->denyNotification();
 
             return;
         }
 
-        $nameKey = md5($fileName);
+        $server = $this->contentServer();
 
-        $this->updatingNames[] = $nameKey;
+        $row = InstalledContent::query()
+            ->forServer($server)
+            ->where('kind', $this->installerKind())
+            ->whereKey($rowId)
+            ->first();
 
-        $safeRegistry = strtolower(trim($registry)) === 'spigot' ? 'spigotmc' : $registry;
+        if (!$row instanceof InstalledContent || $row->isPackChild() || !$row->tracked_by_toolkit) {
+            $this->denyNotification();
+
+            return;
+        }
+
+        $title = $row->displayTitle() !== '' ? $row->displayTitle() : basename((string) $row->file_name);
 
         try {
-            app(ContentInstallerService::class)->installProject($server, $this->installerKind(), [
-                'source' => $safeRegistry,
-                'id' => $projectId,
-                'title' => (string) ($title ?? basename($fileName)),
-            ], $this->versionMeta());
-
-            Activity::event('mc-toolkit:content.update')
-                ->property('title', (string) ($title ?? basename($fileName)))
-                ->property('source', $safeRegistry)
-                ->subject($server)
-                ->log();
+            $updated = $this->installer()->installProject($server, $this->installerKind(), [
+                'source' => (string) $row->registry,
+                'id' => (string) $row->project_id,
+                'title' => $title,
+            ], $this->versionMeta(), isUpdate: true);
 
             Notification::make()
                 ->title(trans('minecraft-toolkit::common.buttons.update'))
-                ->body($title ?? $fileName)
+                ->body($title.($updated->version !== null ? ' — '.$updated->version : ''))
                 ->success()
                 ->send();
+
+            $this->warnAboutPackRequirements($updated);
         } catch (Throwable $exception) {
             Notification::make()
                 ->title(trans('minecraft-toolkit::common.buttons.update'))
@@ -754,36 +825,56 @@ trait InteractsWithContent
                 ->danger()
                 ->send();
         } finally {
-            $this->updatingNames = array_values(array_diff($this->updatingNames, [$nameKey]));
-            $this->bustCaches(true);
+            $this->forgetUpdateScan();
+            $this->bustCaches();
         }
     }
 
     /**
-     * Loader/game-version hints for installer resolution.
-     * software tokens ARE valid registry category tags (paper/spigot/fabric/quilt/
-     * forge/neoforge/folia/purpur/velocity…); vanilla/unknown/foreign shapes fall back to ''.
+     * Loader/game-version hints for installer resolution: the detected software token
+     * (purpur, quilt, velocity, …) plus its loader family; the installer maps those to
+     * every loader tag that server can actually run.
      *
-     * @return array{loader: string, mc_version: string}
+     * @return array{software: string, loader: string, mc_version: string}
      */
     private function versionMeta(): array
     {
         $detected = $this->contentDetection();
-        $software = strtolower((string) ($detected['software'] ?? 'unknown'));
-        $loaderFamily = (string) ($detected['loader'] ?? 'vanilla');
-
-        $registryUsable = match ($loaderFamily) {
-            'bukkit' => $software !== 'vanilla' && $software !== 'unknown' ? $software : 'paper',
-            'fabric' => $software !== 'vanilla' && $software !== 'unknown' ? $software : 'fabric',
-            'forge' => $software !== 'vanilla' && $software !== 'unknown' ? $software : 'forge',
-            'velocity' => $software !== 'vanilla' && $software !== 'unknown' ? $software : 'velocity',
-            default => '',
-        };
 
         return [
-            'loader' => $registryUsable,
+            'software' => strtolower((string) ($detected['software'] ?? 'unknown')),
+            'loader' => strtolower((string) ($detected['loader'] ?? 'vanilla')),
             'mc_version' => $this->compatMcVersion() ?? '',
         ];
+    }
+
+    /** Title of a catalog item on the current browse page, '' when it is not there. */
+    private function catalogTitle(string $source, string $projectId): string
+    {
+        $wanted = UpdateScanner::keyFor($source, $projectId);
+
+        foreach ($this->browsePayload()['items'] as $item) {
+            if (UpdateScanner::keyFor((string) ($item['source'] ?? ''), (string) ($item['id'] ?? '')) === $wanted) {
+                return trim((string) ($item['title'] ?? ''));
+            }
+        }
+
+        return '';
+    }
+
+    /** Modpack installs onto the wrong software still succeed — say what the pack needs. */
+    private function warnAboutPackRequirements(InstalledContent $row): void
+    {
+        $note = $this->packRequirementNote($row);
+
+        if ($note !== null) {
+            Notification::make()
+                ->title(trans('minecraft-toolkit::pages.modpacks.title'))
+                ->body($note)
+                ->warning()
+                ->persistent()
+                ->send();
+        }
     }
 
     /** Friendly perm-denied toast keeping abort() out of action paths. */
@@ -800,31 +891,50 @@ trait InteractsWithContent
         return app(ContentInstallerService::class);
     }
 
-    /** Clear both render memos (optionally with staleness recompute downstream). */
-    protected function bustCaches(bool $rerun = false): void
+    private function forgetUpdateScan(): void
     {
-        $this->browseDirty = true;
-        $this->installedDirty = true;
-        $this->memoizedBrowse = null;
-        $this->memoizedInstalled = null;
-
-        if ($rerun) {
-            $this->browsePayload();
-            $this->installedPayload();
+        try {
+            app(UpdateScanner::class)->forget($this->contentServer());
+        } catch (Throwable) {
+            // Cache hiccup: the snapshot simply expires on its own.
         }
     }
 
-    /** Reflect livewire property edits back into the dirty flags + bounds. */
+    /** Clear the per-request memos so the next read recomputes. */
+    protected function bustCaches(): void
+    {
+        $this->memoizedBrowse = null;
+        $this->memoizedInstalled = null;
+        $this->memoizedDetection = null;
+    }
+
+    /** Sanitize client-writable properties and restart paging when the result set changes. */
     public function updated(string $property): void
     {
-        if (in_array($property, ['query', 'source', 'sortKey', 'compatOnly', 'tab'], true)) {
-            $this->browsePage = max(1, $this->browsePage);
-            $this->browseDirty = true;
+        if ($property === 'tab') {
+            $this->tab = $this->tab === 'installed' ? 'installed' : 'browse';
         }
 
-        if ($property === 'tab' || $property === 'query' || $property === 'source') {
-            $this->installedDirty = true;
+        if ($property === 'sortKey' && !in_array($this->sortKey, array_column($this->sortOptions(), 'value'), true)) {
+            $this->sortKey = 'relevance';
         }
+
+        if ($property === 'source' && $this->source !== null && !in_array($this->source, $this->allowedSources(), true)) {
+            $this->source = null;
+        }
+
+        if ($property === 'query') {
+            $this->query = mb_substr($this->query, 0, 100);
+        }
+
+        // A new search, source or filter is a new result set: page 5 of the old one is meaningless.
+        if (in_array($property, ['query', 'source', 'compatOnly'], true)) {
+            $this->browsePage = 1;
+        }
+
+        $this->browsePage = max(1, $this->browsePage);
+
+        $this->bustCaches();
     }
 
     /* ------------------------------------------------------------------ */
@@ -834,7 +944,7 @@ trait InteractsWithContent
     /** Cross-link to Versions for blocked-state guidance (guarded, our own class space). */
     public function versionsUrl(): ?string
     {
-        if (! class_exists(VersionsPage::class)) {
+        if (!class_exists(VersionsPage::class)) {
             return null;
         }
 
@@ -860,11 +970,18 @@ trait InteractsWithContent
         $power = max(0, min(count($units) - 1, $power));
 
         $scaled = $bytes / (1024 ** $power);
+        $decimals = $scaled >= 10 || $power === 0 ? 0 : 1;
+        $formatted = number_format($scaled, $decimals);
 
-        return rtrim(rtrim(number_format($scaled, $scaled >= 10 || $power === 0 ? 0 : 1), '0'), '.').' '.$units[$power];
+        // Only a fractional part may lose trailing zeros ("2.0" → "2"); "10" or "250" must stay.
+        if ($decimals > 0) {
+            $formatted = rtrim(rtrim($formatted, '0'), '.');
+        }
+
+        return $formatted.' '.$units[$power];
     }
 
-    /** Compact locale-safe date chip ("Updated Oct 14") for cards; null-safe. */
+    /** Compact locale-safe date chip ("Oct 14, 2026") for cards; null-safe. */
     public function shortDate(mixed $raw): ?string
     {
         $ts = $this->timestampOf($raw);
@@ -875,16 +992,11 @@ trait InteractsWithContent
     /** Detection source-of-truth count that feeds the Installed badge consistently. */
     public function trackedTotalAllKinds(): int
     {
-        $server = $this->contentServer();
-
         try {
-            /** @var Collection<int, InstalledContent> $rows */
-            $rows = InstalledContent::query()->forServer($server)->get();
+            return InstalledContent::query()->forServer($this->contentServer())->count();
         } catch (Throwable) {
             return 0;
         }
-
-        return $rows->count();
     }
 
     /** Status gate recheck for install-time modpack prerequisites preview callouts. */
@@ -893,7 +1005,7 @@ trait InteractsWithContent
         try {
             $live = $this->contentServer()->retrieveStatus();
 
-            return ! in_array($live, [ContainerStatus::Offline, ContainerStatus::Exited, ContainerStatus::Created], true);
+            return !in_array($live, [ContainerStatus::Offline, ContainerStatus::Exited, ContainerStatus::Created], true);
         } catch (Throwable) {
             return false;
         }

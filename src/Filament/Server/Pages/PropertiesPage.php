@@ -22,6 +22,8 @@ use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\ValidationException;
+use Livewire\Attributes\Locked;
 use Livewire\Attributes\On;
 use McToolkit\Services\DetectionService;
 use McToolkit\Services\Properties\PropertiesParser;
@@ -38,6 +40,10 @@ use Throwable;
  *
  * Panel-owned keys (server-port / server-ip) render as disabled inputs labeled
  * "Set by the panel"; {@see PropertiesParser} never rewrites them.
+ *
+ * State notes: Livewire only keeps PUBLIC properties between requests, so everything a
+ * later request needs (the baseline the form was filled from, the load outcome) is a
+ * public #[Locked] property — never protected.
  */
 final class PropertiesPage extends Page
 {
@@ -52,6 +58,11 @@ final class PropertiesPage extends Page
 
     protected string $view = 'minecraft-toolkit::server.properties';
 
+
+    /** Namespaced URL: /server/{uuid_short}/mc-toolkit/properties (README "Feature pages"). */
+
+    protected static ?string $slug = 'mc-toolkit/properties';
+
     /** Form state container (statePath 'data' mirrors core ServerFormPage conventions). */
     public ?array $data = [];
 
@@ -59,6 +70,7 @@ final class PropertiesPage extends Page
     public ?string $search = null;
 
     /** Coarse per-group dirty flags set through field afterStateUpdated hooks. */
+    #[Locked]
     public array $dirty = [
         'general' => false,
         'players' => false,
@@ -67,22 +79,28 @@ final class PropertiesPage extends Page
         'advanced' => false,
     ];
 
-    /** DetectionService payload powering the pinned detection banner + loader callout. */
+    /** DetectionService payload powering the pinned detection banner. */
+    #[Locked]
     public ?array $detection = null;
 
-    /** True when the detected loader is NOT bukkit-family (banner.failures.not_minecraft callout). */
-    public bool $showLoaderWarning = false;
+    /** Callout shown under the banner (proxy / unknown software / node down), null = none. */
+    #[Locked]
+    public ?string $loaderWarning = null;
 
     /** Rendered when the live search matches nothing anywhere on the page. */
+    #[Locked]
     public bool $noResults = false;
 
-    /** Parsed HTML preview of the current MOTD (internally escaped). */
+    /** Parsed HTML preview of the current MOTD (internally escaped; rendered raw, hence locked). */
+    #[Locked]
     public string $motdHtml = '';
 
     /** Character counter of the stripped MOTD text (0/N against the 50 soft limit). */
+    #[Locked]
     public int $motdCount = 0;
 
     /** True when the stripped MOTD length exceeds the 50-character soft limit. */
+    #[Locked]
     public bool $overLimit = false;
 
     /**
@@ -91,9 +109,12 @@ final class PropertiesPage extends Page
      *
      * @var array<string,string>
      */
-    protected array $baseline = [];
+    #[Locked]
+    public array $baseline = [];
 
-    protected bool $propertiesExist = false;
+    /** server.properties could not be read: saving stays disabled until a refresh succeeds. */
+    #[Locked]
+    public bool $loadFailed = false;
 
     // ---------------------------------------------------------------------
     // Spec table — group => ordered property metadata entries
@@ -127,7 +148,7 @@ final class PropertiesPage extends Page
             ['key' => 'online-mode', 'type' => 'toggle', 'label' => 'Online mode', 'help' => 'Verify accounts against Mojang.'],
         ],
         'world' => [
-            ['key' => 'level-name', 'type' => 'text', 'label' => 'Level name', 'help' => 'Folder name of the default world.'],
+            ['key' => 'level-name', 'type' => 'text', 'label' => 'Level name', 'help' => 'Folder name of the default world.', 'required' => true],
             ['key' => 'level-seed', 'type' => 'text', 'label' => 'Level seed', 'help' => 'Seed used when a new world is generated.'],
             ['key' => 'allow-nether', 'type' => 'toggle', 'label' => 'Allow nether', 'help' => 'Let players travel to the Nether.'],
             ['key' => 'view-distance', 'type' => 'number', 'label' => 'View distance', 'help' => 'Chunks sent around each player.', 'min' => 3, 'max' => 32],
@@ -159,6 +180,9 @@ final class PropertiesPage extends Page
     ];
 
     private const NUMBER_KEYS = ['max-players', 'spawn-protection', 'view-distance', 'simulation-distance'];
+
+    /** Managed keys that have an (always disabled) input on the page. */
+    private const MANAGED_FIELDS = ['server-port', 'server-ip'];
 
     /** Vanilla defaults filling absent keys so the draft stays complete before first write. */
     private const DEFAULTS = [
@@ -195,14 +219,15 @@ final class PropertiesPage extends Page
 
     private const MOTD_SOFT_LIMIT = 50;
 
+    /** DOM id of the MOTD textarea the toolbar's Alpine handlers target. */
+    private const MOTD_FIELD_ID = 'mct-motd';
+
     // ---------------------------------------------------------------------
     // Lifecycle
     // ---------------------------------------------------------------------
 
     public function mount(): void
     {
-        $this->authorizeAccess();
-
         $this->loadProperties();
     }
 
@@ -214,20 +239,44 @@ final class PropertiesPage extends Page
         return $server;
     }
 
+    /**
+     * Checked on mount AND on every later Livewire request (CanAuthorizeAccess hydrate
+     * hook), so a page opened before a suspension or a permission change stops working.
+     */
     public static function canAccess(): bool
     {
+        if (! parent::canAccess()) {
+            return false;
+        }
+
         // Admin "Enabled pages" toggle (same guard every other toolkit page applies).
         if (! (bool) config('minecraft-toolkit.pages.enabled.properties', true)) {
             return false;
         }
 
-        return parent::canAccess()
-            && user()?->can('minecraft-toolkit.use', Filament::getTenant());
+        $server = Filament::getTenant();
+
+        if (! $server instanceof Server || $server->isInConflictState()) {
+            return false;
+        }
+
+        $user = user();
+
+        return $user !== null
+            && $user->can('minecraft-toolkit.use', $server)
+            && $user->can('minecraft-toolkit.properties', $server);
     }
 
-    protected function authorizeAccess(): void
+    /** Whether the current user may write server.properties right now. */
+    private function canManage(): bool
     {
-        abort_unless(user()?->can('minecraft-toolkit.properties', Filament::getTenant()), 403);
+        $server = $this->getRecord();
+        $user = user();
+
+        return $user !== null
+            && ! $server->isInConflictState()
+            && $user->can('minecraft-toolkit.properties', $server)
+            && $user->can('minecraft-toolkit.manage', $server);
     }
 
     public function getTitle(): string
@@ -272,22 +321,30 @@ final class PropertiesPage extends Page
         $server = $this->getRecord();
 
         try {
-            app(DetectionService::class)->detect($server, force: true);
+            $detected = app(DetectionService::class)->detect($server, force: true);
         } catch (Throwable) {
-            // detect() already falls back to its unknown shape without caching failures.
+            $detected = null;
         }
 
-        $detected = app(DetectionService::class)->detect($server);
+        $this->applyDetection($detected);
 
-        $this->detection = $detected;
-        $this->showLoaderWarning = strval($detected['loader'] ?? 'vanilla') !== 'bukkit';
+        if (! is_array($detected) || ($detected['reachable'] ?? true) === false) {
+            Notification::make()
+                ->title(trans('minecraft-toolkit::banner.failures.gateway_down'))
+                ->danger()
+                ->send();
+
+            return;
+        }
 
         Activity::event('mc-toolkit:detection.refresh')
             ->log();
 
+        $software = ucfirst((string) ($detected['software'] ?? 'unknown'));
+
         Notification::make()
             ->title(trans('minecraft-toolkit::banner.detection.title_note'))
-            ->body(trans('minecraft-toolkit::activity.mc-toolkit.detection.refresh'))
+            ->body(filled($detected['version'] ?? null) ? $software.' — '.$detected['version'] : $software)
             ->success()
             ->send();
     }
@@ -325,8 +382,11 @@ final class PropertiesPage extends Page
 
         $this->noResults = $needle !== '' && $sections === [];
 
+        // The record makes `Server $server` closures resolvable for every component and
+        // action of this schema (same as core's ServerFormPage::form()).
         return $schema
             ->statePath('data')
+            ->model($this->getRecord())
             ->components($sections);
     }
 
@@ -346,15 +406,18 @@ final class PropertiesPage extends Page
 
             if ($motdMatches) {
                 $matched = true;
-            }
-
-            if ($needle === '' || $motdMatches) {
                 $fields[] = $this->motdToolbar();
                 $fields[] = $this->motdField();
             }
         }
 
         foreach (self::SPECS[$groupKey] ?? [] as $spec) {
+            // The MOTD has its dedicated toolbar + textarea above; a second generic input
+            // bound to the same state path would duplicate it.
+            if (strval($spec['type']) === 'textarea') {
+                continue;
+            }
+
             $haystack = mb_strtolower(
                 strval($spec['key']) . ' ' . strval($spec['label']) . ' ' . strval($spec['help']),
             );
@@ -468,12 +531,13 @@ final class PropertiesPage extends Page
     private function motdField(): Textarea
     {
         return Textarea::make('motd')
+            ->id(self::MOTD_FIELD_ID)
             ->label('MOTD')
             ->autosize()
             ->rows(3)
             ->live()
             ->afterStateUpdated(function ($state): void {
-                $this->applyMotdPreview((string) ($state ?? ''));
+                $this->applyMotdPreview(is_string($state) ? $state : '');
                 $this->markDirty('general');
             });
     }
@@ -500,16 +564,17 @@ final class PropertiesPage extends Page
     }
 
     /**
-     * One-liner Alpine handler: wraps the current selection of the big-form MOTD
-     * textarea (`wire:model="data.motd"`) with §<code> … §r, then replays the input
-     * event so Livewire syncs immediately. No global helpers required.
+     * One-liner Alpine handler: wraps the current selection of the MOTD textarea (found
+     * by its fixed DOM id — the live binding renders `wire:model.live`, so attribute
+     * matching is brittle) with §<code> … §r, then replays the input event so Alpine's
+     * entangled state pushes the change to Livewire immediately.
      */
     private static function motdJs(string $code): string
     {
         $openCode = "'\\u00a7" . $code . "'";
         $closeCode = "'\\u00a7r'";
 
-        return "(() => { var t=[].slice.call(document.querySelectorAll('textarea')).filter(function(el){return String(el.getAttribute('wire:model')||'').endsWith('.motd');})[0];"
+        return "(() => { var t=document.getElementById('" . self::MOTD_FIELD_ID . "');"
             . ' if(!t){return;}'
             . ' var s=t.selectionStart||0,e=t.selectionEnd||0,v=t.value,c=' . $openCode . ';'
             . ' v=(s===e)?(v.slice(0,s)+c+v.slice(s)):(v.slice(0,s)+c+v.slice(s,e)+' . $closeCode . '+v.slice(e));'
@@ -524,7 +589,9 @@ final class PropertiesPage extends Page
             ->label(trans('minecraft-toolkit::common.buttons.save'))
             ->color('gray')
             ->icon(\App\Enums\TablerIcon::DeviceFloppy)
-            ->disabled(fn (Server $server) => ! user()?->can('minecraft-toolkit.properties', $server) || ! user()?->can('minecraft-toolkit.manage', $server))
+            // Filament re-evaluates this when the action is mounted, so it gates the
+            // request server-side too; saveGroup() checks again for direct calls.
+            ->disabled(fn (): bool => $this->loadFailed || ! $this->canManage())
             ->action(fn () => $this->saveGroup($groupKey));
     }
 
@@ -544,29 +611,30 @@ final class PropertiesPage extends Page
         $server = $this->getRecord();
 
         try {
-            $this->detection = app(DetectionService::class)->detect($server);
+            $detected = app(DetectionService::class)->detect($server);
         } catch (Throwable) {
-            $this->detection = null;
+            $detected = null;
         }
 
-        $loaderFamily = is_array($this->detection)
-            ? strval($this->detection['loader'] ?? 'vanilla')
-            : 'vanilla';
+        $this->applyDetection($detected);
 
-        $this->showLoaderWarning = $loaderFamily !== 'bukkit';
+        $this->loadFailed = false;
 
         try {
             $parsed = app(PropertiesParser::class)->read($server);
-        } catch (ConnectionException) {
+        } catch (Throwable $e) {
+            if (! $e instanceof ConnectionException) {
+                report($e);
+            }
+
             Notification::make()
-                ->title(trans('minecraft-toolkit::banner.failures.gateway_down'))
+                ->title(trans('minecraft-toolkit::pages.properties.load_failed'))
                 ->danger()
                 ->send();
 
             $parsed = ['exists' => false, 'values' => [], 'comments_preserved' => []];
+            $this->loadFailed = true;
         }
-
-        $this->propertiesExist = (bool) $parsed['exists'];
 
         $effective = self::DEFAULTS;
 
@@ -585,11 +653,28 @@ final class PropertiesPage extends Page
 
         $this->baseline = $canonical;
 
-        $this->form->fill($canonical);
+        $this->form->fill($this->formState($canonical));
 
         $this->resetDirtyFlags();
 
         $this->applyMotdPreview(strval($canonical['motd'] ?? ''));
+    }
+
+    /**
+     * Banner payload + the callout under it. server.properties applies to every game
+     * server (vanilla, Paper, Fabric, Forge…); only proxies ignore it, and an
+     * unrecognised or unreachable server gets its own message.
+     */
+    private function applyDetection(?array $detected): void
+    {
+        $this->detection = $detected;
+
+        $this->loaderWarning = match (true) {
+            ! is_array($detected), ($detected['reachable'] ?? true) === false => trans('minecraft-toolkit::banner.failures.gateway_down'),
+            ($detected['loader'] ?? null) === 'velocity' => trans('minecraft-toolkit::banner.failures.proxy_no_properties'),
+            ($detected['software'] ?? 'unknown') === 'unknown' => trans('minecraft-toolkit::banner.failures.not_minecraft'),
+            default => null,
+        };
     }
 
     private function resetDirtyFlags(): void
@@ -605,8 +690,8 @@ final class PropertiesPage extends Page
 
     /**
      * Canonical draft coercion: booleans collapse to lowercase strings, numbers to
-     * plain integers, select values accept legacy numeric aliases; everything else
-     * trims into plain strings.
+     * plain integers, select values accept legacy numeric aliases; the MOTD keeps its
+     * leading spaces (used for centering), everything else trims into plain strings.
      *
      * @param  array<string,mixed>  $incoming
      * @return array<string,string>
@@ -621,22 +706,26 @@ final class PropertiesPage extends Page
                 : (self::DEFAULTS[$key] ?? '');
 
             if (in_array($key, self::BOOLEAN_KEYS, true)) {
-                $flag = is_bool($raw)
-                    ? $raw
-                    : in_array(mb_strtolower(trim((string) $raw)), ['true', '1', 'yes', 'on'], true);
-
-                $out[$key] = $flag ? 'true' : 'false';
+                $out[$key] = self::toBool($raw) ? 'true' : 'false';
 
                 continue;
             }
+
+            $text = is_scalar($raw) ? strval($raw) : '';
 
             if (in_array($key, self::NUMBER_KEYS, true)) {
-                $out[$key] = strval(intval($raw));
+                $out[$key] = strval(intval(trim($text)));
 
                 continue;
             }
 
-            $text = trim(strval($raw));
+            if ($key === 'motd') {
+                $out[$key] = rtrim(str_replace("\r", '', $text));
+
+                continue;
+            }
+
+            $text = trim($text);
 
             if (isset(self::LEGACY_SELECT_ALIASES[$key])) {
                 $text = strval(self::LEGACY_SELECT_ALIASES[$key][$text] ?? $text);
@@ -648,87 +737,128 @@ final class PropertiesPage extends Page
         return $out;
     }
 
+    /**
+     * Livewire/Filament form state for a canonical value set: toggles need REAL
+     * booleans — Filament's BooleanStateCast turns the string "false" into true.
+     *
+     * @param  array<string,string>  $canonical
+     * @return array<string,mixed>
+     */
+    private function formState(array $canonical): array
+    {
+        $state = [];
+
+        foreach (array_keys(self::DEFAULTS) as $key) {
+            $value = $canonical[$key] ?? self::DEFAULTS[$key];
+
+            $state[$key] = in_array($key, self::BOOLEAN_KEYS, true) ? $value === 'true' : $value;
+        }
+
+        foreach (self::MANAGED_FIELDS as $managed) {
+            $state[$managed] = $canonical[$managed] ?? '';
+        }
+
+        return $state;
+    }
+
+    private static function toBool(mixed $raw): bool
+    {
+        if (is_bool($raw)) {
+            return $raw;
+        }
+
+        if (is_int($raw)) {
+            return $raw === 1;
+        }
+
+        return is_string($raw)
+            && in_array(mb_strtolower(trim($raw)), ['true', '1', 'yes', 'on'], true);
+    }
+
     // ---------------------------------------------------------------------
     // Saving — per-group subset validation, minimal diff write-back
     // ---------------------------------------------------------------------
 
     public function saveGroup(string $groupKey): void
     {
+        if (! $this->canManage()) {
+            Notification::make()
+                ->title(trans($this->getRecord()->isInConflictState()
+                    ? 'minecraft-toolkit::errors.statuses.server_unavailable'
+                    : 'minecraft-toolkit::errors.statuses.permission_denied'))
+                ->danger()
+                ->send();
+
+            return;
+        }
+
+        if (! array_key_exists($groupKey, self::SPECS)) {
+            return;
+        }
+
+        if ($this->loadFailed) {
+            Notification::make()
+                ->title(trans('minecraft-toolkit::pages.properties.load_failed'))
+                ->danger()
+                ->send();
+
+            return;
+        }
+
         $server = $this->getRecord();
-
-        if (
-            ! user()?->can('minecraft-toolkit.properties', $server)
-            || ! user()?->can('minecraft-toolkit.manage', $server)
-        ) {
-            Notification::make()
-                ->title(trans('minecraft-toolkit::errors.statuses.permission_denied'))
-                ->danger()
-                ->send();
-
-            return;
-        }
-
-        $keys = array_map(
-            static fn (array $spec): string => strval($spec['key']),
-            self::SPECS[$groupKey] ?? [],
-        );
-
-        try {
-            $state = $this->form->getState();
-        } catch (Throwable $e) {
-            report($e);
-
-            Notification::make()
-                ->title(trans('minecraft-toolkit::banner.failures.gateway_down'))
-                ->body($e->getMessage())
-                ->danger()
-                ->send();
-
-            return;
-        }
+        $state = is_array($this->data) ? $this->data : [];
 
         $subset = [];
         $rules = [];
+        $attributes = [];
 
-        foreach ($keys as $key) {
+        foreach (self::SPECS[$groupKey] as $spec) {
+            $key = strval($spec['key']);
+
             if (in_array($key, PropertiesParser::MANAGED_KEYS, true)) {
                 continue;
             }
 
-            // Keys hidden by the live search are absent from Schema::getState()
-            // (only rendered components aggregate state); fall back to the baseline
-            // value instead of an empty string so untouched keys never diff as a
-            // coerced 0 / false write into server.properties.
-            $subset[$key] = array_key_exists($key, $state)
-                ? $state[$key]
-                : strval($this->baseline[$key] ?? '');
+            // Livewire's `data` still holds every key, also the ones the live search or
+            // the chip filter currently hides — validate and save exactly those.
+            $value = array_key_exists($key, $state) ? $state[$key] : ($this->baseline[$key] ?? null);
 
             if (in_array($key, self::BOOLEAN_KEYS, true)) {
                 // Native booleans so the `boolean` Validator rule applies deterministically.
-                $subset[$key] = is_bool($subset[$key])
-                    ? $subset[$key]
-                    : in_array(mb_strtolower(trim((string) $subset[$key])), ['true', '1', 'yes', 'on'], true);
+                $value = self::toBool($value);
+            } elseif (! is_scalar($value)) {
+                $value = null;
             }
 
+            $subset[$key] = $value;
             $rules[$key] = $this->rulesFor($key);
+            $attributes[$key] = strval($spec['label']);
         }
 
-        $validator = Validator::make($subset, $rules);
+        // Only this group is validated: invalid fields elsewhere never block it.
+        $validator = Validator::make($subset, $rules, [], $attributes);
 
         if ($validator->fails()) {
             Notification::make()
                 ->title(trans('minecraft-toolkit::pages.properties.group.' . $groupKey))
-                ->body(implode(', ', $validator->errors()->all()))
+                ->body(implode(' ', $validator->errors()->all()))
                 ->danger()
                 ->send();
 
-            return;
+            // Field-level errors under the matching inputs (Livewire fills the error bag).
+            $messages = [];
+
+            foreach ($validator->errors()->messages() as $key => $keyMessages) {
+                $messages['data.' . $key] = $keyMessages;
+            }
+
+            throw ValidationException::withMessages($messages);
         }
 
         $canonical = $this->canonicalize(array_merge($this->baseline, $subset));
 
         $changed = [];
-        foreach ($subset as $key => $ignoredValue) {
+        foreach (array_keys($subset) as $key) {
             $candidate = strval($canonical[$key] ?? '');
             $original = strval($this->baseline[$key] ?? '');
 
@@ -752,20 +882,11 @@ final class PropertiesPage extends Page
                 ->send();
 
             return;
-        } catch (\RuntimeException $e) {
+        } catch (Throwable $e) {
             report($e);
 
             Notification::make()
-                ->title(trans('minecraft-toolkit::errors.statuses.permission_denied'))
-                ->danger()
-                ->send();
-
-            return;
-        } catch (\LogicException|Throwable $e) {
-            report($e);
-
-            Notification::make()
-                ->title(trans('minecraft-toolkit::banner.failures.gateway_down'))
+                ->title(trans('minecraft-toolkit::pages.properties.save_failed'))
                 ->danger()
                 ->send();
 
@@ -778,11 +899,25 @@ final class PropertiesPage extends Page
 
         $this->baseline = array_merge($this->baseline, $changed);
 
-        $this->form->fill($this->baseline);
+        // Re-sync ONLY this group's inputs to the canonical values just written; unsaved
+        // edits in other groups stay untouched.
+        $formState = $this->formState($this->baseline);
 
-        $this->resetDirtyFlags();
+        if (! is_array($this->data)) {
+            $this->data = [];
+        }
 
-        $this->applyMotdPreview(strval($this->baseline['motd'] ?? ''));
+        foreach (array_keys($subset) as $key) {
+            $this->data[$key] = $formState[$key];
+        }
+
+        $this->resetErrorBag(array_map(static fn (string $key): string => 'data.' . $key, array_keys($subset)));
+
+        $this->dirty[$groupKey] = false;
+
+        if (array_key_exists('motd', $changed)) {
+            $this->applyMotdPreview($this->baseline['motd']);
+        }
 
         Notification::make()
             ->title(trans('minecraft-toolkit::pages.properties.group.' . $groupKey))
@@ -803,13 +938,17 @@ final class PropertiesPage extends Page
         $spec = $this->specOf($key);
 
         return match (strval($spec['type'])) {
+            // `required` matters: an emptied number would otherwise slip past `integer`
+            // and be written as intval('') = 0.
             'number' => [
+                'required',
                 'integer',
                 sprintf('between:%s,%s', strval($spec['min'] ?? -2147483648), strval($spec['max'] ?? 2147483647)),
             ],
-            'select' => ['in:' . implode(',', array_keys(is_array($spec['options'] ?? null) ? $spec['options'] : []))],
+            'select' => ['required', 'in:' . implode(',', array_keys(is_array($spec['options'] ?? null) ? $spec['options'] : []))],
             'toggle' => ['boolean'],
-            'text' => ['string', 'max:255'],
+            'text' => [($spec['required'] ?? false) ? 'required' : 'nullable', 'string', 'max:255'],
+            'textarea' => ['nullable', 'string', 'max:1024'],
             'managed' => [],
             default => [],
         };
@@ -844,6 +983,9 @@ final class PropertiesPage extends Page
     /**
      * Legacy-code parser producing safe inline-styled spans. Every text run escapes
      * through htmlspecialchars first, so the returned markup is XSS-safe raw HTML.
+     *
+     * Like the game: codes are case-insensitive, a color code clears bold/italic/
+     * underline/strikethrough, §r resets everything, §k (obfuscated) is ignored.
      */
     private function renderMotd(string $motd): string
     {
@@ -855,27 +997,28 @@ final class PropertiesPage extends Page
         $color = null;
         $styles = [];
 
-        // Split runs at every §; the byte right after it is the effect code.
+        // Split runs at every §; the character right after it is the effect code.
         $runs = preg_split('/(\x{00A7}.)/u', $motd, -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY) ?: [];
 
         foreach ($runs as $run) {
             $chunk = $run;
 
             if (mb_strlen($chunk) >= 2 && mb_substr($chunk, 0, 1) === '§') {
-                $code = mb_substr($chunk, 1, 1);
+                $code = mb_strtolower(mb_substr($chunk, 1, 1));
                 $chunk = mb_substr($chunk, 2);
 
-                $color = self::MOTD_PALETTE[$code] ?? $color;
-
-                if ($code === 'r') {
+                if (isset(self::MOTD_PALETTE[$code])) {
+                    $color = self::MOTD_PALETTE[$code];
+                    $styles = [];
+                } elseif ($code === 'r') {
                     $color = null;
                     $styles = [];
                 } else {
                     match ($code) {
                         'l' => $styles['font-weight'] = '700',
                         'o' => $styles['font-style'] = 'italic',
-                        'n' => $styles['text-decoration'][] = 'underline',
-                        'm' => $styles['text-decoration'][] = 'line-through',
+                        'n' => $styles['text-decoration']['underline'] = 'underline',
+                        'm' => $styles['text-decoration']['line-through'] = 'line-through',
                         default => null,
                     };
                 }

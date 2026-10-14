@@ -18,6 +18,7 @@ use Filament\Schemas\Components\Section;
 use Filament\Schemas\Components\StateCasts\BooleanStateCast;
 use Filament\Schemas\Schema;
 use Illuminate\Support\Facades\Schema as DatabaseSchema;
+use Illuminate\Validation\ValidationException;
 use McToolkit\McToolkitPlugin;
 use McToolkit\Models\InstalledContent;
 
@@ -51,6 +52,9 @@ final class McAdminSettingsPage extends Page
     protected static ?int $navigationSort = 95;
 
     protected string $view = 'minecraft-toolkit::admin.settings';
+
+
+    protected static ?string $slug = 'mc-toolkit/settings';
 
     /** Form state container (statePath 'data' mirrors core Settings.php conventions). */
     public ?array $data = [];
@@ -120,19 +124,16 @@ final class McAdminSettingsPage extends Page
             ->statePath('data')
             ->components([
                 Section::make(trans('minecraft-toolkit::permissions.minecraft-toolkit_title'))
-                    ->description('Optional catalog credentials. Sources without a key are skipped gracefully.')
-                    ->columns(2)
+                    ->description('Optional catalog credentials. Sources without a key are skipped gracefully; Hangar needs none.')
                     ->schema([
+                        // Keys are single visible-ASCII tokens; the regex keeps a crafted
+                        // payload with line breaks / spaces out of the line-based .env writer.
                         TextInput::make('MC_TOOLKIT_CURSEFORGE_KEY')
                             ->label('CurseForge API key')
                             ->password()
                             ->revealable()
+                            ->regex('/^[\x21-\x7E]+$/D')
                             ->helperText('Unlocks the CurseForge source on the Plugins and Mods pages.'),
-                        TextInput::make('MC_TOOLKIT_HANGAR_KEY')
-                            ->label('Hangar API token')
-                            ->password()
-                            ->revealable()
-                            ->helperText('Personal access token for hangar.papermc.io.'),
                     ]),
 
                 Section::make('Enabled pages')
@@ -172,7 +173,8 @@ final class McAdminSettingsPage extends Page
 
     /**
      * Resolved enabled-page map using the plugin's own semantics:
-     * blank / missing / literal "all" = every page enabled.
+     * blank / missing / a literal "all" token = every page enabled; otherwise only
+     * the exactly-listed slugs ("none" lists no slug, so every page is off).
      *
      * Mirrors McToolkitPlugin::enabledPages() + config/minecraft-toolkit.php
      * (exact comma-token split; stray tokens from other tooling are ignored).
@@ -181,27 +183,34 @@ final class McAdminSettingsPage extends Page
      */
     private function enabledPagesMap(): array
     {
-        $raw = mb_strtolower(trim((string) env('MC_TOOLKIT_ENABLED_PAGES', '')));
+        $enabled = $this->enabledSlugs((string) env('MC_TOOLKIT_ENABLED_PAGES', ''));
         $all = [];
 
-        if ($raw === '' || str_contains($raw, 'all')) {
-            foreach ($this->pageSlugs() as $slug) {
-                $all[$slug] = true;
-            }
-
-            return $all;
-        }
-
-        $listed = array_map(
-            fn (string $token): string => mb_strtolower(trim($token)),
-            explode(',', $raw),
-        );
-
         foreach ($this->pageSlugs() as $slug) {
-            $all[$slug] = in_array($slug, $listed, true);
+            $all[$slug] = in_array($slug, $enabled, true);
         }
 
         return $all;
+    }
+
+    /**
+     * Enabled slugs (canonical order) for one MC_TOOLKIT_ENABLED_PAGES value — the
+     * single parser behind both the toggle defaults and the save-time diff.
+     *
+     * @return list<string>
+     */
+    private function enabledSlugs(string $raw): array
+    {
+        $tokens = array_map(
+            fn (string $token): string => mb_strtolower(trim($token)),
+            explode(',', trim($raw)),
+        );
+
+        if (trim($raw) === '' || in_array('all', $tokens, true)) {
+            return $this->pageSlugs();
+        }
+
+        return array_values(array_intersect($this->pageSlugs(), $tokens));
     }
 
     // ---------------------------------------------------------------------
@@ -254,6 +263,9 @@ final class McAdminSettingsPage extends Page
                 ->body($this->savedSummary($values))
                 ->success()
                 ->send();
+        } catch (ValidationException $exception) {
+            // Let Filament render the field errors (e.g. a key with spaces) inline.
+            throw $exception;
         } catch (Exception $exception) {
             Notification::make()
                 ->title('Saving failed')
@@ -271,9 +283,10 @@ final class McAdminSettingsPage extends Page
      * McToolkitPlugin::saveSettings(), A1).
      *
      * Page toggles: composed into MC_TOOLKIT_ENABLED_PAGES (comma-separated
-     * enabled slugs, canonical order). Blank also means "all nine enabled"
+     * enabled slugs, canonical order). Blank means "all nine enabled"
      * (README §Settings), so when everything is checked the written value is an
-     * explicit full list — unambiguous either way.
+     * explicit full list, and when NOTHING is checked the literal `none` is
+     * written — a blank value would switch every page back on.
      *
      * @param  array<mixed>  $data
      * @return array<string, string>
@@ -285,7 +298,6 @@ final class McAdminSettingsPage extends Page
         // ---- Catalog keys ----------------------------------------------------
         $keyFields = [
             'MC_TOOLKIT_CURSEFORGE_KEY' => 'CURSEFORGE_KEY',
-            'MC_TOOLKIT_HANGAR_KEY' => 'HANGAR_KEY',
         ];
 
         foreach ($keyFields as $field => $bare) {
@@ -309,10 +321,12 @@ final class McAdminSettingsPage extends Page
                 $checked[] = $slug;
             }
         }
-        $desired = implode(',', $checked);
+        // Same contract as McToolkitPlugin::saveSettings(): an empty selection is the
+        // explicit word "none", because the config reader treats a blank value as "all".
+        $desired = $checked === [] ? 'none' : implode(',', $checked);
         $raw = trim((string) env('MC_TOOLKIT_ENABLED_PAGES', ''));
 
-        if (!$this->sameEnabledSet($desired, $raw)) {
+        if (!$this->sameEnabledSet($checked, $raw)) {
             $values['MC_TOOLKIT_ENABLED_PAGES'] = $desired;
         }
 
@@ -320,29 +334,14 @@ final class McAdminSettingsPage extends Page
     }
 
     /**
-     * Compare desired vs current enabled-slug sets by exact tokens (blank /
-     * literal "all" on the stored side count as "every page").
+     * Compare the ticked slugs against the currently stored value, both resolved
+     * through enabledSlugs() (exact tokens; blank / "all" = every page, "none" = none).
+     *
+     * @param  list<string>  $checked  ticked slugs in canonical order
      */
-    private function sameEnabledSet(string $desired, string $raw): bool
+    private function sameEnabledSet(array $checked, string $raw): bool
     {
-        $tokens = static function (string $s): array {
-            $parts = array_map(
-                fn (string $t): string => mb_strtolower(trim($t)),
-                explode(',', $s),
-            );
-
-            return array_values(array_unique(array_filter($parts, fn (string $t): bool => $t !== '')));
-        };
-
-        $want = $tokens($desired);
-
-        if ($raw === '' || str_contains(mb_strtolower($raw), 'all')) {
-            return count($want) === count($this->pageSlugs());
-        }
-
-        $have = array_values(array_intersect($tokens($raw), $this->pageSlugs()));
-
-        return $want === $have;
+        return $checked === $this->enabledSlugs($raw);
     }
 
     /** Short success summary listing which env entries were rewritten. */

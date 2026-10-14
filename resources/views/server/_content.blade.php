@@ -40,35 +40,18 @@
      *   - plugins: STAYS enabled even when detection is weak — pre-placing jars
      *     before a software swap is legitimate (documented decision),
      *   - modpacks: always offered; stop/safety failures return through friendly errors.
+     * The same rule is enforced again server-side by InteractsWithContent::install().
      */
-    $installsEnabled = match ($kind) {
-        'mods' => $blocked === null,
-        'modpacks' => true,
-        default => true,
-    };
+    $installsEnabled = $this->installsAllowed();
+    $canMutate = $this->userCanMutate();
 
-    $browse = $this->browsePayload();
-
-    /** Upper bound honored from merged meta; loose when several registries contributed. */
-    $pagesTotal = is_int($browse['pages']) && $browse['pages'] > 0 ? $browse['pages'] : null;
-    $hasMorePages = $pagesTotal !== null ? $this->browsePage < $pagesTotal : count($browse['items']) >= 25;
-    $canGoBack = $this->browsePage > 1;
-
-    $allowedSourceKeys = $this->allowedSources();
-    $sourcesUsed = array_values(array_intersect($allowedSourceKeys, $browse['sources_used']));
-    $sourcesSkipped = [];
-
-    foreach ($allowedSourceKeys as $sourceKey) {
-        if (! in_array($sourceKey, $sourcesUsed, true)) {
-            $sourcesSkipped[$sourceKey] = $browse['sources_skipped'][$sourceKey] ?? null;
-        }
-    }
-
-    /** wire argument escaper — keeps hangar Owner/Slug ids quote-safe inside JS calls. */
-    $jsArg = static fn (string $value): string => addcslashes($value, "\\'");
-
-    /** Installation busy key mirrors InteractsWithContent::install(). */
-    $busyKeyOf = static fn (array $item): string => hash('crc32b', ($item['source'] ?? '').'|'.($item['id'] ?? '').'|'.($item['title'] ?? ''));
+    /**
+     * Wire-call argument encoder. Js::from() JSON-encodes with every quote, angle bracket
+     * and ampersand hex-escaped, so registry-supplied values can neither break the JS
+     * string nor the surrounding HTML attribute (attribute bags print values raw).
+     * Only ids ever travel this way — titles are resolved server-side.
+     */
+    $jsArg = static fn (string|int $value): string => \Illuminate\Support\Js::from($value)->toHtml();
 
     $chipBase = 'inline-flex items-center justify-center gap-x-1 rounded-md px-2 py-0.5 '
         .'text-xs font-medium ring-1 ring-inset';
@@ -91,7 +74,7 @@
 {{-- --------------------------------------------------------------- --}}
 {{-- 1. Detection banner — pinned top of every toolkit page          --}}
 {{-- --------------------------------------------------------------- --}}
-<x-dynamic-component :component="'minecraft-toolkit::components.detection-banner'" :software="$detected" />
+<x-dynamic-component :component="'minecraft-toolkit::detection-banner'" :software="$detected" />
 
 {{-- --------------------------------------------------------------- --}}
 {{-- 2. Loader-mismatch / unsupported callout                        --}}
@@ -168,7 +151,7 @@
         <div class="rounded-xl bg-white shadow-sm ring-1 ring-gray-950/5 divide-y divide-gray-200 dark:bg-gray-900 dark:ring-white/10 dark:divide-white/10">
             @forelse ($installedRows as $rowRow)
                 <div class="relative flex flex-wrap items-center gap-x-3 gap-y-1.5 p-4 first:rounded-t-xl last:rounded-b-xl"
-                     wire:key="tracked-{{ md5($rowRow['file_name']) }}">
+                     wire:key="tracked-{{ $rowRow['row_id'] }}">
                     <div class="min-w-0 flex-1">
                         <p class="truncate text-sm font-semibold text-gray-950 dark:text-white"
                            title="{{ $rowRow['display_name'] }}{{ $rowRow['update_available'] ? ' — '.($rowRow['update_time'] ?? '') : '' }}">
@@ -194,17 +177,17 @@
                                 <span class="text-xs text-gray-500 dark:text-gray-400">{{ $rowRow['updated_at_human'] }}</span>
                             @endif
                         </div>
+
+                        @if (filled($rowRow['requires']))
+                            <p class="mt-1 text-xs text-warning-600 dark:text-warning-400">{{ $rowRow['requires'] }}</p>
+                        @endif
                     </div>
 
-                    @if ($rowRow['installable'] && $this->userCanMutate())
+                    @if ($rowRow['installable'] && $canMutate)
                         @php
-                            $updateTarget = sprintf(
-                                "updateTracked('%s', '%s', '%s', '%s')",
-                                $jsArg((string) $rowRow['file_name']),
-                                $jsArg($rowRow['registry']),
-                                $jsArg((string) ($rowRow['row']->project_id ?? '')),
-                                $jsArg($rowRow['display_name']),
-                            );
+                            // Only the row id travels: registry, project and title are read back
+                            // from the database by InteractsWithContent::updateTracked().
+                            $updateTarget = 'updateTracked('.(int) $rowRow['row_id'].')';
                         @endphp
 
                         <x-filament::button
@@ -214,8 +197,6 @@
                             wire:target="{{ $updateTarget }}"
                             wire:loading.attr="disabled">
                             {{ trans('minecraft-toolkit::common.buttons.update') }}
-
-                            <x-filament::loading-indicator wire:loading wire:target="{{ $updateTarget }}" class="h-4 w-4 shrink-0" />
                         </x-filament::button>
 
                         {{-- Busy veil covering the whole row while its update runs -------- --}}
@@ -262,6 +243,26 @@
     {{-- ============================================================ --}}
     {{-- BROWSE TAB                                                   --}}
     {{-- ============================================================ --}}
+
+    @php
+        // Only the Browse tab queries the registries.
+        $browse = $this->browsePayload();
+
+        /** Upper bound honored from merged meta; loose when several registries contributed. */
+        $pagesTotal = is_int($browse['pages']) && $browse['pages'] > 0 ? $browse['pages'] : null;
+        $hasMorePages = $pagesTotal !== null ? $this->browsePage < $pagesTotal : count($browse['items']) >= 25;
+        $canGoBack = $this->browsePage > 1;
+
+        $allowedSourceKeys = $this->allowedSources();
+        $sourcesUsed = array_values(array_intersect($allowedSourceKeys, $browse['sources_used']));
+        $sourcesSkipped = [];
+
+        foreach ($allowedSourceKeys as $sourceKey) {
+            if (! in_array($sourceKey, $sourcesUsed, true) && isset($browse['sources_skipped'][$sourceKey])) {
+                $sourcesSkipped[$sourceKey] = $browse['sources_skipped'][$sourceKey];
+            }
+        }
+    @endphp
 
     {{-- Toolbar ------------------------------------------------------ --}}
     <div class="flex flex-wrap items-end gap-x-3 gap-y-3">
@@ -314,7 +315,7 @@
                         class="{{ $chipClass }}"
                         title="{{ $skipReason !== null ? $this->skipReasonText($skipReason) : $this->sourceLabel($sourceKey) }}"
                         @unless ($skipReason !== null)
-                            wire:click="setSource({{ $isSelected ? 'null' : "'".$jsArg($sourceKey)."'" }})"
+                            wire:click="setSource({{ $isSelected ? 'null' : $jsArg($sourceKey) }})"
                         @endunless>
                     {{ $this->sourceLabel($sourceKey) }}
                 </button>
@@ -350,23 +351,19 @@
                 @php
                     $cardKey = $resultItem['key'];
                     $cardInstalled = (bool) ($resultItem['installed'] ?? false);
-                    $cardBusyHash = $busyKeyOf($resultItem);
-                    $actionLabel = ($resultItem['title'] ?? '') !== '' ? (string) $resultItem['title'] : 'project';
-                    $actionArgs = sprintf(
-                        "install('%s', '%s', '%s')",
-                        $jsArg((string) ($resultItem['source'] ?? '')),
-                        $jsArg((string) ($resultItem['id'] ?? '')),
-                        $jsArg($actionLabel),
-                    );
 
-                    // Attribute bag lands on the content-card DEFAULT CTA (its contract),
-                    // carrying the Livewire directives + busy-key disabled binding.
+                    // Ids only, Js::from-encoded: the bag below prints its values RAW (no HTML
+                    // escaping), so nothing registry-controlled may reach it unencoded.
+                    $actionArgs = 'install('
+                        .$jsArg((string) ($resultItem['source'] ?? '')).', '
+                        .$jsArg((string) ($resultItem['id'] ?? '')).')';
+
+                    // Attribute bag lands on the content-card DEFAULT CTA (its contract).
                     $ctaBag = new \Illuminate\View\ComponentAttributeBag([
                         'wire:key' => 'mct-cta-'.$cardKey,
                         'wire:click' => $actionArgs,
                         'wire:target' => $actionArgs,
                         'wire:loading.attr' => 'disabled',
-                        ':disabled' => "\$wire.installingIds.includes('{$cardBusyHash}')",
                     ]);
                 @endphp
 
@@ -375,7 +372,7 @@
                     @include('minecraft-toolkit::components.content-card', [
                         'item' => $resultItem,
                         'installed' => $cardInstalled,
-                        'withAction' => $installsEnabled && $this->userCanMutate(),
+                        'withAction' => $installsEnabled && $canMutate,
                         'attributes' => $ctaBag,
                     ])
 

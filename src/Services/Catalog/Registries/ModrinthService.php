@@ -14,6 +14,10 @@ use McToolkit\Support\HttpJsonCache;
  * each inner list is an OR group, the outer list is AND. Only 2xx JSON is
  * handled; transport/HTTP errors bubble so the aggregator can mark the source.
  *
+ * Search hits carry NO `loaders` key: v2 folds loader tags into `categories`
+ * (e.g. ['bukkit','fabric','optimization','paper']), so loaders are recovered by
+ * intersecting `categories` with the known loader tag list below.
+ *
  * Return shape (used by ContentSearchService):
  *   ['items' => list<normalized-item>, 'pages' => ?int]
  */
@@ -23,18 +27,25 @@ final class ModrinthService
 
     private const PAGE_SIZE = 25;
 
-    /** Search result rows ship these exact fields; unknown extra fields are ignored. */
-    private const FIELDS = [
-        'project_id', 'slug', 'author', 'title', 'description', 'categories', 'display_categories',
-        'versions', 'downloads', 'follows', 'date_created', 'date_modified', 'icon_url',
-        'project_type', 'loaders',
+    /** Modrinth loader tags (GET /v2/tag/loader) that can appear inside a hit's `categories`. */
+    private const LOADER_TAGS = [
+        'bukkit', 'spigot', 'paper', 'purpur', 'folia', 'sponge',
+        'bungeecord', 'waterfall', 'velocity',
+        'fabric', 'quilt', 'forge', 'neoforge', 'liteloader', 'modloader', 'rift',
+        'datapack',
     ];
 
     public function __construct(private readonly int $listCacheSeconds = 300) {}
 
+    /** Search pages honour config('minecraft-toolkit.cache_ttl.searches'); the constructor value is the fallback. */
+    private function searchTtl(): int
+    {
+        return max(0, (int) config('minecraft-toolkit.cache_ttl.searches', $this->listCacheSeconds));
+    }
+
     /**
      * @param  string  $projectType  modrinth project type: plugin|mod|modpack
-     * @param  array<int, list<string>>  $facets  extra OR groups appended after the base facets
+     * @param  array<int, list<string>>  $facets  extra facet groups (each inner list ORs, groups AND)
      * @return array{items:list<array<string, mixed>>, pages:?int}
      */
     public function search(string $projectType, string $query = '', int $page = 1, array $facets = []): array
@@ -42,7 +53,7 @@ final class ModrinthService
         $baseFacets = [["project_type:{$projectType}"]];
         $facetParam = json_encode([...$baseFacets, ...array_values($facets)], JSON_UNESCAPED_SLASHES);
 
-        $payload = HttpJsonCache::get(self::API.'/search', $this->listCacheSeconds, [
+        $payload = HttpJsonCache::get(self::API.'/search', $this->searchTtl(), [
             'limit' => self::PAGE_SIZE,
             'offset' => max(0, ($page - 1) * self::PAGE_SIZE),
             'index' => 'relevance',
@@ -54,13 +65,21 @@ final class ModrinthService
             return ['items' => [], 'pages' => null];
         }
 
-        /** @var list<array<string, mixed>> $rows */
+        /** @var list<mixed> $rows */
         $rows = is_array($payload['hits'] ?? null) ? $payload['hits'] : [];
         /** @var int|null $totalHits */
         $totalHits = is_int($payload['total_hits'] ?? null) ? $payload['total_hits'] : null;
 
+        $items = [];
+
+        foreach ($rows as $row) {
+            if (is_array($row)) {
+                $items[] = $this->normalize($row);
+            }
+        }
+
         return [
-            'items' => array_values(array_map(fn (array $row) => $this->normalize($row), $rows)),
+            'items' => $items,
             // `total_hits` also counts older projects; cap at a sane bound for pagination UIs.
             'pages' => is_null($totalHits) ? null : max(1, min(400, (int) ceil($totalHits / self::PAGE_SIZE))),
         ];
@@ -69,10 +88,9 @@ final class ModrinthService
     /**
      * Fetch ALL versions of one modrinth project (newest first upstream) — used by the installer.
      *
-     * Optional `$query` carries upstream filter params, e.g.
-     *   ['loaders' => '["paper"]', 'game_versions' => '["1.21.3"]']
+     * Optional `$query` carries upstream filter params as JSON arrays, e.g.
+     *   ['loaders' => '["paper","spigot"]', 'game_versions' => '["1.21.3"]']
      *
-     * @param  string  $projectIdOrSlug
      * @return list<array<string, mixed>>
      */
     public function versions(string $projectIdOrSlug, array $query = []): array
@@ -91,6 +109,18 @@ final class ModrinthService
     }
 
     /**
+     * One project's metadata (title / slug lookups for dependency rows).
+     *
+     * @return array<string, mixed>|null
+     */
+    public function project(string $projectIdOrSlug): ?array
+    {
+        $payload = HttpJsonCache::get(self::API.'/project/'.rawurlencode($projectIdOrSlug), 600);
+
+        return is_array($payload) ? $payload : null;
+    }
+
+    /**
      * Map one raw search row to the contract item shape.
      *
      * @param  array<string, mixed>  $row
@@ -101,10 +131,12 @@ final class ModrinthService
         $type = strtolower(trim((string) ($row['project_type'] ?? '')));
         $type = in_array($type, ['plugin', 'mod', 'modpack'], true) ? $type : 'other';
 
-        $loaders = array_values(array_filter(
-            is_array($row['loaders'] ?? null) ? $row['loaders'] : [],
-            fn ($l) => is_string($l) && $l !== '',
-        ));
+        $categories = array_map(
+            'strtolower',
+            array_filter(is_array($row['categories'] ?? null) ? $row['categories'] : [], fn ($c) => is_string($c) && $c !== ''),
+        );
+        $loaders = array_values(array_intersect(self::LOADER_TAGS, $categories));
+
         $gameVersions = array_values(array_filter(
             is_array($row['versions'] ?? null) ? $row['versions'] : [],
             fn ($v) => is_string($v) && $v !== '',
@@ -132,9 +164,9 @@ final class ModrinthService
             'downloads' => is_int($row['downloads'] ?? null) ? $row['downloads'] : (int) ($row['downloads'] ?? 0),
             'likes' => is_int($row['follows'] ?? null) ? $row['follows'] : (int) ($row['follows'] ?? 0),
             'updated' => is_string($row['date_modified'] ?? null) ? $row['date_modified'] : null,
-            'icon_url' => is_string($row['icon_url'] ?? null) ? $row['icon_url'] : null,
+            'icon_url' => is_string($row['icon_url'] ?? null) && $row['icon_url'] !== '' ? $row['icon_url'] : null,
             'page_url' => $pageUrl,
-            'loaders' => array_map('strtolower', $loaders),
+            'loaders' => $loaders,
             'game_versions' => $gameVersions,
             'project_type' => $type,
         ];

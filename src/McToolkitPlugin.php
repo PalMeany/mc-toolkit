@@ -12,6 +12,8 @@ use Filament\Forms\Components\TextInput;
 use Filament\Panel;
 use Filament\Schemas\Components\Component;
 use Filament\Schemas\Components\Section;
+use Filament\View\PanelsRenderHook;
+use Illuminate\Foundation\Vite;
 use Illuminate\Support\Arr;
 
 /**
@@ -43,6 +45,9 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
         'performance',
     ];
 
+    /** Vite entry (relative to the panel root) holding the plugin's compiled utilities. */
+    private const STYLESHEET = 'plugins/minecraft-toolkit/resources/css/main.css';
+
     public function getId(): string
     {
         return 'minecraft-toolkit';
@@ -58,6 +63,26 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
 
         if (is_dir($pagesDirectory)) {
             $panel->discoverPages($pagesDirectory, "McToolkit\\Filament\\{$id}\\Pages");
+        }
+
+        $panel->renderHook(PanelsRenderHook::STYLES_AFTER, fn (): string => self::stylesheetTag());
+    }
+
+    /**
+     * <link> for resources/css/main.css, the Tailwind build of this plugin's own utility
+     * classes (see the note at the top of that file for why the panel's stylesheet lacks them).
+     *
+     * The panel builds plugin assets while installing or updating a plugin; until such a build
+     * ran — or when it failed, which the panel only logs — the Vite manifest has no entry for
+     * this file and Vite throws. The pages then render with whatever the panel's CSS covers
+     * instead of failing outright.
+     */
+    private static function stylesheetTag(): string
+    {
+        try {
+            return app(Vite::class)([self::STYLESHEET])->toHtml();
+        } catch (\Throwable) {
+            return '';
         }
     }
 
@@ -76,7 +101,6 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
     {
         return [
             'MC_TOOLKIT_CURSEFORGE_KEY' => (string) (env('MC_TOOLKIT_CURSEFORGE_KEY') ?? env('CURSEFORGE_KEY', '')),
-            'MC_TOOLKIT_HANGAR_KEY' => (string) (env('MC_TOOLKIT_HANGAR_KEY') ?? env('HANGAR_KEY', '')),
             'MC_TOOLKIT_ENABLED_PAGES' => $this->enabledPages(),
         ];
     }
@@ -86,24 +110,16 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
     {
         return [
             Section::make(trans('minecraft-toolkit::permissions.minecraft-toolkit_title'))
-                ->description('Optional catalog keys. Sources without a key are skipped gracefully.')
-                ->columns(2)
+                ->description('Optional catalog keys. Sources without a key are skipped gracefully; Hangar needs none.')
                 ->schema([
                     TextInput::make('MC_TOOLKIT_CURSEFORGE_KEY')
                         ->label('CurseForge API key')
                         ->password()
                         ->revealable()
-                        ->columnSpan(1)
+                        // One visible-ASCII token: keeps line breaks out of the .env writer.
+                        ->regex('/^[\x21-\x7E]+$/D')
                         ->default((string) (env('MC_TOOLKIT_CURSEFORGE_KEY') ?? env('CURSEFORGE_KEY', '')))
                         ->helperText('Unlocks the CurseForge source on the Plugins and Mods pages.'),
-
-                    TextInput::make('MC_TOOLKIT_HANGAR_KEY')
-                        ->label('Hangar API token')
-                        ->password()
-                        ->revealable()
-                        ->columnSpan(1)
-                        ->default((string) (env('MC_TOOLKIT_HANGAR_KEY') ?? env('HANGAR_KEY', '')))
-                        ->helperText('Personal access token for hangar.papermc.io.'),
                 ]),
 
             Section::make('Enabled pages')
@@ -146,11 +162,6 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
             $values['MC_TOOLKIT_CURSEFORGE_KEY'] = $curseforgeKey;
         }
 
-        $hangarKey = trim(Arr::get($data, 'MC_TOOLKIT_HANGAR_KEY', '') ?? '');
-        if ($hangarKey !== '') {
-            $values['MC_TOOLKIT_HANGAR_KEY'] = $hangarKey;
-        }
-
         // Always write the explicit enabled-list so config('...pages.enabled') has a
         // single unambiguous source once this form has been used at least once.
         $selected = Arr::wrap(Arr::get($data, 'MC_TOOLKIT_ENABLED_PAGES', []));
@@ -170,24 +181,26 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
 
         $ordered = array_values(array_intersect(self::PAGES, $selected));
 
-        $values['MC_TOOLKIT_ENABLED_PAGES'] = implode(',', $ordered);
+        // A blank value means "every page" to the config reader, so an empty selection
+        // needs its own explicit word or unticking everything would switch all pages on.
+        $values['MC_TOOLKIT_ENABLED_PAGES'] = $ordered === [] ? 'none' : implode(',', $ordered);
 
         $this->writeToEnvironment($values);
     }
 
-    /** @return string[] slugs currently enabled per MC_TOOLKIT_ENABLED_PAGES (blank/unset/all = every slug) */
+    /** @return string[] slugs currently enabled per MC_TOOLKIT_ENABLED_PAGES (blank/unset/all = every slug, none = no slug) */
     private function enabledPages(): array
     {
         $raw = trim((string) env('MC_TOOLKIT_ENABLED_PAGES', ''));
-
-        if ($raw === '' || str_contains($raw, 'all')) {
-            return self::PAGES;
-        }
 
         $listed = array_map(
             fn (string $slug): string => mb_strtolower(trim($slug)),
             explode(',', $raw),
         );
+
+        if ($raw === '' || in_array('all', $listed, true)) {
+            return self::PAGES;
+        }
 
         return array_values(array_intersect(self::PAGES, $listed));
     }

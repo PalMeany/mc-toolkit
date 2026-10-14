@@ -26,9 +26,16 @@ return [
             'backup_first' => 'Create a backup first',
             'start_after' => 'Start the server when it is done',
             'stopped_note' => 'The server is stopped during the installation.',
+            'already_running' => 'Another installation is still running on this server.',
+            'stop_timeout' => 'The server did not stop in time, so nothing was changed.',
+            'backup_failed' => 'The backup could not be created, so nothing was changed.',
+            'swap_failed' => 'The new server files could not be put in place.',
+            'left_stopped' => 'The server was left stopped — check its files before starting it again.',
         ],
 
         'backup_unavailable' => 'This server cannot create backups.',
+
+        'show_more' => 'Show more versions',
     ],
 
     'plugins' => [
@@ -71,7 +78,11 @@ return [
 
     'modpacks' => [
         'title' => 'Modpacks',
-        'subheading' => 'Install a complete modpack on the server: its loader, its mods and its configs.',
+        'subheading' => 'Install a complete modpack on the server: its mods and its configs. Its loader is installed from the Versions page.',
+
+        // Shown after an install (and on the pack row) when the detected software differs.
+        // :loader -> e.g. "Fabric 0.15.11", :version -> e.g. "1.20.1"
+        'requires' => 'This modpack runs on :loader for Minecraft :version — install that software from the Versions page before starting the server.',
     ],
 
     'properties' => [
@@ -88,6 +99,9 @@ return [
 
         // Shown (disabled) next to panel-owned keys such as server-port / server-ip.
         'managed_by_panel' => 'Set by the panel',
+
+        'load_failed' => 'server.properties could not be read, so saving is disabled. Refresh the page to try again.',
+        'save_failed' => 'server.properties could not be saved. Nothing was changed.',
     ],
 
     'players' => [
@@ -114,6 +128,18 @@ return [
         'states' => [
             'tier2_missing' => 'Live inventory, health and positions need a companion bridge on your Minecraft server. Everything else on this page works without one.',
         ],
+
+        // Stand-alone whitelist field, usable without selecting a player first.
+        'whitelist_add' => [
+            'label' => 'Add a player to the whitelist',
+            'placeholder' => 'Player name',
+            'button' => 'Add to whitelist',
+        ],
+
+        'errors' => [
+            'invalid_name' => 'Player names are 1-16 letters, digits or underscores (Bedrock players may start with a dot), so this one was not sent to the console.',
+            'invalid_item' => 'Use lowercase letters, digits, underscores or colons for the item id.',
+        ],
     ],
 
     'worlds' => [
@@ -122,6 +148,15 @@ return [
 
         'import_link' => 'Import a world',
         'maps_browse' => 'Download maps',
+
+        'import_url' => 'Archive URL (.zip, .tar.gz…)',
+        'import_target' => 'Name of the imported world (optional)',
+        // :world -> folder name the world was imported as
+        'import_done' => 'The world was imported as :world. Choose "Play on" to make it the active world.',
+        'import_name_invalid' => 'World names may only use letters, digits, spaces, dots, dashes and underscores.',
+        'import_no_world' => 'The archive does not contain a Minecraft world (no level.dat or region folder was found).',
+        'unknown_world' => 'This world folder was not found on the server any more. Refresh the page and try again.',
+        'reset_note' => 'These folders are deleted for good. The server has to be stopped first.',
 
         'rows' => [
             'part_of_default' => 'Part of the default world: downloaded, reset and deleted with it.',
@@ -145,11 +180,19 @@ return [
         'follow_on' => 'Following a player',
         'follow_off' => 'Stop following',
 
-        // :count -> MapTileService::MAX_REGIONS_PER_SCAN (only the first N regions
-        // of a huge world get rasterized before the scan stops).
-        'regions_truncated' => 'Huge world: only the first :count regions of this world are drawn.',
+        // :count -> MapTileService::MAX_REGIONS_PER_SCAN (the regions nearest to spawn
+        // are drawn first; the rest of a huge world is left out).
+        'regions_truncated' => 'Huge world: only the :count regions nearest to spawn are drawn.',
 
         'redraw' => 'Redraw',
+
+        'delete_marker' => 'Remove marker',
+
+        'dimensions' => [
+            'overworld' => 'Overworld',
+            'nether' => 'Nether',
+            'end' => 'End',
+        ],
     ],
 
     'performance' => [
@@ -168,7 +211,9 @@ return [
         'worlds_header' => 'Worlds breakdown',
 
         'bridge' => [
-            'unavailable' => 'Per-world entity and chunk counts need the companion bridge — live TPS, MSPT, CPU and memory still work below.',
+            'heading' => 'Companion bridge not found',
+            'unavailable' => 'TPS, MSPT and the per-world entity and chunk counts need the companion bridge — CPU, memory and uptime come from the node and keep working below.',
+            'hint' => 'These figures are read from .toolkit/performance.json, which only the companion bridge writes, and this server has no such file.',
         ],
     ],
 ];

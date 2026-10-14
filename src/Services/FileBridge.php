@@ -284,16 +284,40 @@ final class FileBridge
 
     /**
      * Ask wings to fetch a remote URL onto the server.
-     * The daemon answers asynchronously with a status object (core ignores the body,
-     * FileController.php:308-312); we surface whatever JSON came back.
      *
-     * @return array<string, mixed>
+     * By default the request runs in the FOREGROUND: wings only answers once the file is
+     * fully on disk (and answers with an error when the download failed), returning the
+     * file's stat row. Without it wings downloads in the background and replies at once,
+     * so anything that touches the file right after the pull races a partial download.
+     * The same reasoning drives the explicit file name — otherwise wings derives one from
+     * the URL (e.g. "download" for Spiget), which callers cannot predict.
+     *
+     * The daemon holds a foreground request open for the whole download, so the client
+     * timeout is raised well past the panel's default used for small file operations.
+     * Wings refuses more than three simultaneous pulls per server.
+     *
+     * @return array<string, mixed> wings' stat row of the written file (foreground) or its
+     *                              `{identifier}` acknowledgement (background)
      *
      * @throws ConnectionException
+     * @throws \Illuminate\Http\Client\RequestException when wings rejects or fails the download
      */
-    public function pull(Server $server, string $url, string $directory = '/'): array
+    public function pull(Server $server, string $url, string $directory = '/', ?string $fileName = null, bool $foreground = true, int $timeout = 900): array
     {
-        $response = $this->scope($server)->pull($url, $directory ?: '/');
+        $attributes = [
+            'url' => $url,
+            'root' => $directory !== '' ? $directory : '/',
+            'foreground' => $foreground,
+        ];
+
+        if ($fileName !== null && $fileName !== '') {
+            $attributes['file_name'] = $fileName;
+        }
+
+        $response = $this->scope($server)
+            ->getHttpClient()
+            ->timeout(max((int) config('panel.guzzle.timeout', 15), $timeout))
+            ->post("/api/servers/{$server->uuid}/files/pull", $attributes);
 
         $payload = $response->json();
 

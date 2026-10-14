@@ -51,6 +51,19 @@ final class ServerListPing
     private const VARINT_MAX_BYTES = 5;
 
     /**
+     * Largest packet we accept (the protocol's own 3-byte VarInt length ceiling).
+     * A status response — favicon included — stays far below it; anything bigger is a
+     * garbage/hostile peer, and fread() pre-allocates its length argument.
+     */
+    private const MAX_PACKET_BYTES = 2_097_151;
+
+    /** Upper bound for one fread() call; longer payloads are collected in a loop. */
+    private const READ_CHUNK_BYTES = 8192;
+
+    /** Smallest per-read socket timeout (µs) so a nearly spent budget is not "0 = instant". */
+    private const MIN_READ_TIMEOUT_MICROS = 1000;
+
+    /**
      * Legacy formatting codes removed from MOTD text before returning.
      * Both the raw UTF-8 § byte and its § JSON escape land here after decode.
      */
@@ -60,9 +73,11 @@ final class ServerListPing
      * Ping a reachable game server once.
      *
      * @param  Allocation|string  $host  either the server's primary {@see Allocation}
-     *                                   (its `ip` + `port` columns are used) or a host
-     *                                   literal `1.2.3.4`, `host.name`, `host:25565`,
-     *                                   `[2001:db8::1]:25565`.
+     *                                   (target picked like the official player-counter
+     *                                   plugin: IP alias, else bind IP, wildcard binds
+     *                                   replaced by the node FQDN — see normalizeHost())
+     *                                   or a host literal `1.2.3.4`, `host.name`,
+     *                                   `host:25565`, `[2001:db8::1]:25565`.
      * @param  int  $timeoutMs  whole-operation budget (connect + write + read).
      * @return array<string, mixed>|null null whenever the server could not be queried.
      */
@@ -106,7 +121,12 @@ final class ServerListPing
             return null;
         }
 
-        return $this->decodeResponsePacket($packet);
+        // The JSON is peer-controlled: any oddity still collapses into "offline" (null).
+        try {
+            return $this->decodeResponsePacket($packet);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -117,7 +137,18 @@ final class ServerListPing
     private function normalizeHost(Allocation|string $host): array
     {
         if ($host instanceof Allocation) {
-            $address = trim(strval($host->getAttribute('ip')));
+            // Same target rules as the official player-counter plugin (GameQuery::runQuery):
+            // an IP alias is the public address of a NAT-ed bind IP, so it wins. A wildcard
+            // bind (0.0.0.0 / ::) is not an address the panel can dial — connecting to it
+            // lands on the panel host itself — so the node's FQDN takes its place.
+            $alias = trim(strval($host->getAttribute('ip_alias') ?? ''));
+            $address = filter_var($alias, FILTER_VALIDATE_IP) !== false
+                ? $alias
+                : trim(strval($host->getAttribute('ip') ?? ''));
+
+            if ($address === '' || self::isWildcardAddress($address)) {
+                $address = trim(strval($host->node?->getAttribute('fqdn') ?? ''));
+            }
 
             return [$address, intval($host->getAttribute('port'))];
         }
@@ -156,8 +187,13 @@ final class ServerListPing
 
         $context = stream_context_create(['socket' => ['tcp_nodelay' => true]]);
 
+        // IPv6 literals need brackets inside the transport URL ("tcp://[::1]:25565").
+        $target = filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false
+            ? '[' . $address . ']'
+            : $address;
+
         $socket = @stream_socket_client(
-            sprintf('tcp://%s:%d', $address, $port),
+            sprintf('tcp://%s:%d', $target, $port),
             $errno,
             $errstr,
             $seconds,
@@ -173,18 +209,49 @@ final class ServerListPing
             return null;
         }
 
-        $remaining = $deadline - microtime(true);
+        stream_set_blocking($socket, true);
 
-        if ($remaining <= 0) {
+        if (! $this->applyReadTimeout($socket, $deadline)) {
             $this->close($socket);
 
             return null;
         }
 
-        stream_set_timeout($socket, intval(floor($remaining)), intval(($remaining % 1) * 1_000_000));
-        stream_set_blocking($socket, true);
-
         return $socket;
+    }
+
+    /**
+     * Arms the socket's per-read timeout with what is left of the whole-operation
+     * budget (fractional seconds kept via fmod). Returns false once the budget is spent.
+     */
+    private function applyReadTimeout(mixed $socket, float $deadline): bool
+    {
+        $remaining = $deadline - microtime(true);
+
+        if ($remaining <= 0) {
+            return false;
+        }
+
+        $seconds = (int) floor($remaining);
+        $micros = (int) floor(fmod($remaining, 1.0) * 1_000_000);
+
+        if ($seconds === 0 && $micros < self::MIN_READ_TIMEOUT_MICROS) {
+            $micros = self::MIN_READ_TIMEOUT_MICROS;
+        }
+
+        return stream_set_timeout($socket, $seconds, $micros);
+    }
+
+    /** True for the "any address" binds (0.0.0.0, ::, and their long spellings). */
+    private static function isWildcardAddress(string $address): bool
+    {
+        if (filter_var($address, FILTER_VALIDATE_IP) === false) {
+            return false;
+        }
+
+        $packed = @inet_pton($address);
+
+        return $packed !== false && trim($packed, "\0") === '';
     }
 
     private function close(mixed $socket): void
@@ -220,7 +287,7 @@ final class ServerListPing
     {
         $outerLength = $this->readVarInt($socket, $deadline);
 
-        if ($outerLength === null || $outerLength < 1) {
+        if ($outerLength === null || $outerLength < 1 || $outerLength > self::MAX_PACKET_BYTES) {
             return false;
         }
 
@@ -283,9 +350,12 @@ final class ServerListPing
                 continue;
             }
 
+            // Peer-controlled JSON: a non-string id must not reach strval() (array → warning).
+            $id = is_string($entry['id'] ?? null) ? $entry['id'] : '';
+
             $sampleEntries[] = [
                 'name' => $name,
-                'id' => strtolower(str_replace('-', '', strval($entry['id'] ?? ''))),
+                'id' => strtolower(str_replace('-', '', $id)),
             ];
         }
 
@@ -339,18 +409,22 @@ final class ServerListPing
         return self::varint(strlen($value)) . $value;
     }
 
-    /** Blocking bounded read of exactly $length bytes. */
+    /**
+     * Blocking bounded read of exactly $length bytes: one fread() rarely returns a
+     * whole packet, so chunks (≤ READ_CHUNK_BYTES each) are collected until done, with
+     * the socket timeout re-armed from the overall deadline before every read.
+     */
     private function readExact(mixed $socket, int $length, float $deadline): ?string
     {
         $collected = '';
         $remaining = $length;
 
         while ($remaining > 0) {
-            if (microtime(true) >= $deadline) {
+            if (! $this->applyReadTimeout($socket, $deadline)) {
                 return null;
             }
 
-            $chunk = @fread($socket, $remaining);
+            $chunk = @fread($socket, min($remaining, self::READ_CHUNK_BYTES));
 
             if ($chunk === false || $chunk === '') {
                 return null;

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace McToolkit\Services\Worlds;
 
+use App\Enums\ContainerStatus;
 use App\Models\Server;
 use Illuminate\Http\Client\ConnectionException;
 use McToolkit\Services\FileBridge;
@@ -11,48 +12,51 @@ use McToolkit\Services\Nbt\NbtReader;
 use McToolkit\Support\Activity;
 
 /**
- * World-set discovery and lifecycle orchestration for the Worlds page.
+ * World-set discovery and lifecycle orchestration for the Worlds and Map pages.
  *
  * Detection model — BOTH layout conventions are supported side by side:
  *
- *  a) modern vanilla/Paper: one folder holds `region/` (overworld) plus nested
- *     `DIM-1/…` and `DIM1/…` sub-folders for nether/end;
- *  b) classic Bukkit multi-folder: sibling directories `world`, `world_nether`
- *     (`DIM-1` inside), `world_the_end` are grouped into one logical world set.
+ *  a) vanilla/Fabric/Forge: one folder holds `region/` (overworld) plus nested
+ *     `DIM-1/region` and `DIM1/region` for nether/end;
+ *  b) Bukkit/Paper split worlds: sibling directories `world`, `world_nether`
+ *     (`DIM-1/region` inside), `world_the_end` (`DIM1/region` inside) are grouped
+ *     into one logical world set.
  *
  * A directory counts as a world candidate when it directly contains `region/`,
- * or nests DIM-1/DIM1 folders. Suffix pairs (`*_nether`, `*_the_end`) link to the
- * base directory stripped of the suffix whenever that base exists at root level,
- * matching either naming convention the addon demo exposes.
+ * or nests DIM-1/DIM1 folders. Suffix members (`*_nether`, `*_the_end`) link to the
+ * base directory stripped of the suffix (case-insensitively) whenever it exists.
+ *
+ * Rows expose `maps`: the dimensions the map can draw for that folder, and `members`:
+ * the linked sibling folders downloaded/reset together with a primary world.
+ *
+ * Every mutating entry point (download, reset, import) only acts on folder names the
+ * discovery itself returns, and reset/import additionally require the server to be
+ * stopped ({@see self::assertStopped()}).
  *
  * Cost guards: every listing goes through {@see FileBridge::safeLs()}, structural
- * probes and size summation draw from capped per-call budgets, and repeated
- * listings reuse an in-call cache.
- *
- * Data enrichment parses `<dir>/level.dat` through {@see NbtReader}; unreadable
- * metadata only blanks the individual fields, never fails the page.
+ * probes and size summation draw from capped budgets.
  */
 final class WorldsService
 {
     /** Beyond this byte estimate rows render with a "~" prefix in the UI. */
     public const SIZE_APPROXIMATE_THRESHOLD = 209_715_200; // >200 MiB
 
-    /** Directory listings allowed to ONE listWorlds() structure-probe pass. */
+    /** Directory listings allowed to ONE structure-probe pass. */
     private const MAX_PROBE_LISTINGS = 40;
 
-    /** Extra listings pool powering recursive size estimation. */
-    public const MAX_SIZE_LISTINGS = 24;
+    /** Listings allowed to the size estimate of ONE world folder. */
+    public const MAX_SIZE_LISTINGS = 20;
 
     /** Recursion depth cap for size sums below each world root. */
-    private const MAX_SIZE_RECURSION_LEVELS = 2;
+    public const MAX_SIZE_RECURSION_LEVELS = 3;
 
-    /** Bytes cap handed to FileBridge so corrupted gzip payloads die before gzdecode. */
+    /** Bytes cap handed to FileBridge so corrupted gzip payloads die before inflate. */
     private const LEVEL_DAT_TRANSFER_CAP = 16_777_216;
 
     /** Root folders never probed as worlds (egg tooling conventions). */
     private const NON_WORLD_ROOTS = [
         'plugins', 'mods', 'libraries', 'logs', 'config', 'scripts',
-        'backups', 'cache', '.toolkit',
+        'backups', 'cache', '.toolkit', 'crash-reports', 'versions',
     ];
 
     /** Suffix -> logical dimension id mapping. */
@@ -64,9 +68,55 @@ final class WorldsService
     /** Sibling dirs considered when composing archive/reset sets. */
     private const GROUP_SUFFIXES = ['_nether', '_the_end'];
 
+    /** Scratch area inside the server for imports (shared with the companion bridge folder). */
+    private const STAGING_ROOT = '.toolkit';
+
+    /** Prefix of the temporary archives built for world downloads. */
+    public const DOWNLOAD_ARCHIVE_PREFIX = 'mctk-download-';
+
+    /**
+     * Toolkit download archives eligible for clean-up: `mctk-download-<slug>-<8 hex>.zip`
+     * (this version) and `mctk-world-<8 hex>.zip` (left behind by v1.0.x). Exact shapes
+     * only, so a player's own `mctk-world-backup.zip` is never touched.
+     */
+    private const DOWNLOAD_ARCHIVE_PATTERN = '/^(?:mctk-download-[a-z0-9-]{1,40}-[0-9a-f]{8}|mctk-world-[0-9a-f]{8})\.zip$/';
+
+    /** Download archives older than this are deleted (node tokens live 15 minutes). */
+    private const DOWNLOAD_ARCHIVE_TTL_SECONDS = 1800;
+
+    /** Leftover import staging folders older than this are deleted. */
+    private const STAGING_TTL_SECONDS = 21_600;
+
+    /** Listings the import may spend searching the unpacked archive. */
+    private const MAX_IMPORT_LISTINGS = 30;
+
+    /** How deep below the staging folder a world folder is searched for. */
+    private const MAX_IMPORT_DEPTH = 3;
+
+    /** Sub-folders of a world that are never candidates for "the world folder". */
+    private const WORLD_INTERNALS = [
+        'region', 'DIM-1', 'DIM1', 'data', 'playerdata', 'entities', 'poi', 'stats',
+        'advancements', 'datapacks', '__MACOSX',
+    ];
+
     public function __construct(
         private readonly FileBridge $bridge,
     ) {}
+
+    /**
+     * A folder name that is safe to hand to the node as one path segment: anything
+     * except empty, `.`, `..`, separators and NUL (spaces and unicode are fine).
+     */
+    public static function isSafeDirectoryName(string $name): bool
+    {
+        return $name !== ''
+            && $name !== '.'
+            && $name !== '..'
+            && strlen($name) <= 255
+            && ! str_contains($name, '/')
+            && ! str_contains($name, '\\')
+            && ! str_contains($name, "\0");
+    }
 
     /* ------------------------------------------------------------------ */
     /*  Listing                                                            */
@@ -75,31 +125,55 @@ final class WorldsService
     /**
      * Logical world inventory enriched with level.dat metadata.
      *
-     * Rows carry the frozen contract shape plus one additive convenience flag:
-     * `approximate` marks byte estimates above {@see self::SIZE_APPROXIMATE_THRESHOLD}
-     * so the page can render the "~"-prefix without repeating the policy client-side.
+     * Rows carry the contract shape plus: `approximate` (size is a lower bound or above
+     * {@see self::SIZE_APPROXIMATE_THRESHOLD}), `members` and `maps` (see class doc).
+     * Stale toolkit download archives in the root are cleaned up on the way.
      *
      * @return list<array<string, mixed>>
-     *
-     * @throws ConnectionException when the node cannot be reached.
      */
-    public function listWorlds(Server $server): array
+    public function listWorlds(Server $server, bool $withSizes = true): array
+    {
+        return $this->discover($server, true, $withSizes);
+    }
+
+    /**
+     * Exact folder names of every world row, without level.dat reads or size walks.
+     * The authority for "is this a world the toolkit may download/reset".
+     *
+     * @return list<string>
+     */
+    public function knownWorldNames(Server $server): array
+    {
+        return array_values(array_map(
+            static fn (array $row): string => strval($row['name']),
+            $this->discover($server, false, false),
+        ));
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function discover(Server $server, bool $enrich, bool $withSizes): array
     {
         $rootEntries = $this->bridge->safeLs($server, '/');
         $directories = [];
 
         foreach ($rootEntries as $entry) {
-            if (($entry['directory'] ?? false) === false) {
+            if (($entry['directory'] ?? false) !== true) {
                 continue;
             }
 
             $name = strval($entry['name']);
 
-            if ($name === '' || in_array(mb_strtolower($name), self::NON_WORLD_ROOTS, true)) {
+            if (! self::isSafeDirectoryName($name) || in_array(mb_strtolower($name), self::NON_WORLD_ROOTS, true)) {
                 continue;
             }
 
             $directories[] = $name;
+        }
+
+        if ($enrich) {
+            $this->sweepStaleArchives($server, $rootEntries);
         }
 
         sort($directories);
@@ -117,9 +191,9 @@ final class WorldsService
             $probes[$name] = $this->probeDirectory($server, $name, $budget);
         }
 
-        $sizes = new SizeCache($server, $this->bridge);
+        $sizes = $enrich && $withSizes ? new SizeCache($server, $this->bridge) : null;
 
-        return $this->assembleRows($server, $probes, $directories, $levelName, $sizes);
+        return $this->assembleRows($server, $probes, $levelName, $sizes, $enrich);
     }
 
     /**
@@ -137,33 +211,18 @@ final class WorldsService
             'dim_end' => false,
         ];
 
-        $entries = $this->probeList($server, $name, $budget);
         $subdirs = [];
 
-        foreach ($entries as $entry) {
-            if (($entry['directory'] ?? false) === false) {
-                continue;
+        foreach ($this->probeList($server, $name, $budget) as $entry) {
+            if (($entry['directory'] ?? false) === true) {
+                $subdirs[strval($entry['name'])] = true;
             }
-
-            $subdirs[strval($entry['name'])] = true;
         }
 
-        if (isset($subdirs['region']) || isset($subdirs['REGION'])) {
-            $result['has_region'] = true;
-            $result['candidate'] = true;
-        }
-
-        if (isset($subdirs['DIM-1']) || isset($subdirs['dim-1'])) {
-            $result['dim_nether'] = true;
-        }
-
-        if (isset($subdirs['DIM1']) || isset($subdirs['dim1'])) {
-            $result['dim_end'] = true;
-        }
-
-        if (! $result['candidate'] && ($result['dim_nether'] || $result['dim_end'])) {
-            $result['candidate'] = true;
-        }
+        $result['has_region'] = isset($subdirs['region']);
+        $result['dim_nether'] = isset($subdirs['DIM-1']);
+        $result['dim_end'] = isset($subdirs['DIM1']);
+        $result['candidate'] = $result['has_region'] || $result['dim_nether'] || $result['dim_end'];
 
         return $result;
     }
@@ -177,17 +236,14 @@ final class WorldsService
      * world first, then every other primary group alphabetically, each group
      * immediately followed by its linked dimension members (nether, then end).
      *
-     * @param  list<string>  $directories
-     * @param  array<string, array{candidate:bool,has_region:bool,dim_nether:bool,dim_end:bool}>  $probes
+     * @param  array<string, array{name:string,candidate:bool,has_region:bool,dim_nether:bool,dim_end:bool}>  $probes
      * @return list<array<string, mixed>>
      */
-    private function assembleRows(Server $server, array $probes, array $directories, string $levelName, SizeCache $sizes): array
+    private function assembleRows(Server $server, array $probes, string $levelName, ?SizeCache $sizes, bool $enrich): array
     {
-        $existing = [];
         $lowered = [];
 
-        foreach ($directories as $dir) {
-            $existing[$dir] = true;
+        foreach (array_keys($probes) as $dir) {
             $lowered[mb_strtolower($dir)] = $dir;
         }
 
@@ -203,14 +259,19 @@ final class WorldsService
                 continue;
             }
 
-            $anchor = $lowered[$base] ?? null;
+            $anchor = $lowered[mb_strtolower($base)] ?? null;
 
             if ($anchor === null || mb_strtolower($anchor) === mb_strtolower($name)) {
-                continue; // no base sibling anywhere / self-matching degenerate case
+                continue; // no base sibling / self-matching degenerate case
             }
 
             $key = mb_strtolower($anchor);
-            $groups[$key][$dimensionOfSuffix] ??= $name;
+
+            if (isset($groups[$key][$dimensionOfSuffix])) {
+                continue; // first member per dimension wins; later ones stay standalone
+            }
+
+            $groups[$key][$dimensionOfSuffix] = $name;
             $claimed[mb_strtolower($name)] = $anchor;
         }
 
@@ -219,16 +280,13 @@ final class WorldsService
         $primaries = [];
 
         foreach ($probes as $probe) {
-            $isLinkedMember = isset($claimed[mb_strtolower(strval($probe['name']))]);
-
-            if ($isLinkedMember) {
+            if (isset($claimed[mb_strtolower($probe['name'])])) {
                 continue; // emitted beneath its base below
             }
 
-            // Anchors with attached dimension members are emitted even when they
-            // carry no own region/ yet (fresh installs keep worlds here); any other
-            // non-candidate directory stays invisible.
-            if (! $probe['candidate'] && ! isset($groups[mb_strtolower(strval($probe['name']))])) {
+            // Anchors with attached members are emitted even without their own region/
+            // (fresh installs); any other non-candidate directory stays invisible.
+            if (! $probe['candidate'] && ! isset($groups[mb_strtolower($probe['name'])])) {
                 continue;
             }
 
@@ -236,10 +294,8 @@ final class WorldsService
         }
 
         usort($primaries, static function (array $a, array $b) use ($defaultWorld): int {
-            [$rankA, $rankB] = [
-                [mb_strtolower($a['name']) === mb_strtolower($defaultWorld) ? 0 : 1, mb_strtolower(strval($a['name']))],
-                [mb_strtolower($b['name']) === mb_strtolower($defaultWorld) ? 0 : 1, mb_strtolower(strval($b['name']))],
-            ];
+            $rankA = [mb_strtolower($a['name']) === mb_strtolower($defaultWorld) ? 0 : 1, mb_strtolower($a['name'])];
+            $rankB = [mb_strtolower($b['name']) === mb_strtolower($defaultWorld) ? 0 : 1, mb_strtolower($b['name'])];
 
             return $rankA <=> $rankB;
         });
@@ -248,28 +304,45 @@ final class WorldsService
         $defaultEmitted = false;
 
         foreach ($primaries as $primary) {
-            $isDefault = mb_strtolower(strval($primary['name'])) === mb_strtolower($defaultWorld) && ! $defaultEmitted;
+            $name = $primary['name'];
+            $isDefault = ! $defaultEmitted && mb_strtolower($name) === mb_strtolower($defaultWorld);
             $defaultEmitted = $defaultEmitted || $isDefault;
 
-            $meta = $this->readLevelDatMeta($server, strval($primary['name']));
-            $dimension = $this->classifyDimension($primary);
-
-            $rows[] = $this->buildRow(strval($primary['name']), $isDefault, $dimension, false, $sizes, $meta);
-
-            $baseKey = mb_strtolower(strval($primary['name']));
-            $members = $groups[$baseKey] ?? [];
+            $members = [];
 
             foreach (self::GROUP_SUFFIXES as $suffix) {
-                $dimensionId = self::LINK_SUFFIXES[$suffix];
-                $member = $members[$dimensionId] ?? null;
+                $member = $groups[mb_strtolower($name)][self::LINK_SUFFIXES[$suffix]] ?? null;
 
-                if ($member === null) {
-                    continue;
+                if ($member !== null) {
+                    $members[] = $member;
                 }
+            }
 
-                $memberMeta = $this->readLevelDatMeta($server, $member);
+            $rows[] = $this->buildRow(
+                $name,
+                $isDefault,
+                $this->classifyDimension($primary),
+                false,
+                $members,
+                $this->mapDimensions($primary, null),
+                $enrich ? $this->readLevelDatMeta($server, $name) : self::emptyMeta(),
+                $sizes,
+            );
 
-                $rows[] = $this->buildRow($member, false, $dimensionId, true, $sizes, $memberMeta);
+            foreach ($members as $member) {
+                $dimensionId = $this->splitSuffix($member)[1] ?? 'custom';
+                $probe = $probes[$member];
+
+                $rows[] = $this->buildRow(
+                    $member,
+                    false,
+                    $dimensionId,
+                    true,
+                    [],
+                    $this->mapDimensions($probe, $dimensionId),
+                    $enrich ? $this->readLevelDatMeta($server, $member) : self::emptyMeta(),
+                    $sizes,
+                );
             }
         }
 
@@ -278,9 +351,8 @@ final class WorldsService
 
     /**
      * Dimension chip id for an UNLINKED candidate based purely on probe flags:
-     * own region ⇒ overworld (nested modern dims ride along); only-nether/end
-     * nesting without its own region maps to the dominated dimension; anything
-     * ambiguous ends up custom.
+     * own region ⇒ overworld (nested dims ride along); only nether/end nesting maps
+     * to that dimension; anything ambiguous ends up custom.
      *
      * @param  array{candidate:bool,has_region:bool,dim_nether:bool,dim_end:bool}  $probe
      */
@@ -301,6 +373,41 @@ final class WorldsService
         return 'custom';
     }
 
+    /**
+     * Dimensions the map can draw for one folder. Linked members are pinned to their
+     * suffix dimension (Paper keeps `<level>_nether/DIM-1/region`, some forks flatten it
+     * to `region/`, which MapTileService falls back to).
+     *
+     * @param  array{has_region:bool,dim_nether:bool,dim_end:bool}  $probe
+     * @return list<string>
+     */
+    private function mapDimensions(array $probe, ?string $forced): array
+    {
+        if ($forced === 'nether') {
+            return $probe['dim_nether'] || $probe['has_region'] ? ['nether'] : [];
+        }
+
+        if ($forced === 'end') {
+            return $probe['dim_end'] || $probe['has_region'] ? ['end'] : [];
+        }
+
+        $dimensions = [];
+
+        if ($probe['has_region']) {
+            $dimensions[] = 'overworld';
+        }
+
+        if ($probe['dim_nether']) {
+            $dimensions[] = 'nether';
+        }
+
+        if ($probe['dim_end']) {
+            $dimensions[] = 'end';
+        }
+
+        return $dimensions;
+    }
+
     /** @return array{0:string,1:'nether'|'end'|null} */
     private function splitSuffix(string $name): array
     {
@@ -318,12 +425,15 @@ final class WorldsService
     /**
      * Contract-shaped row builder.
      *
+     * @param  list<string>  $members
+     * @param  list<string>  $maps
      * @param  array{version:?string,data_version:?int,level_name:?string,game_type:?int,hardcore:bool,last_played:?string,seed:?string,spawn_x:?int,spawn_y:?int,spawn_z:?int}  $meta
      * @return array<string, mixed>
      */
-    private function buildRow(string $name, bool $isDefault, string $dimension, bool $linked, SizeCache $sizes, array $meta): array
+    private function buildRow(string $name, bool $isDefault, string $dimension, bool $linked, array $members, array $maps, array $meta, ?SizeCache $sizes): array
     {
-        $byteSize = $sizes->estimate($name);
+        [$byteSize, $complete] = $sizes?->estimate($name) ?? [0, true];
+
         $gameMode = $meta['game_type'] !== null
             ? NbtReader::GAME_TYPES[$meta['game_type']] ?? null
             : null;
@@ -333,8 +443,10 @@ final class WorldsService
             'default' => $isDefault,
             'dimension' => $dimension,
             'linked' => $linked,
+            'members' => $members,
+            'maps' => $maps,
             'size' => $byteSize,
-            'approximate' => $byteSize > self::SIZE_APPROXIMATE_THRESHOLD,
+            'approximate' => ! $complete || $byteSize > self::SIZE_APPROXIMATE_THRESHOLD,
             'seed' => $meta['seed'],
             'game_mode' => $gameMode,
             'hardcore' => $meta['hardcore'],
@@ -351,14 +463,11 @@ final class WorldsService
     }
 
     /**
-     * Level.dat metadata; every failure quietly produces the all-null shape so one
-     * corrupt world cannot take down the listing.
-     *
      * @return array{version:?string,data_version:?int,level_name:?string,game_type:?int,hardcore:bool,last_played:?string,seed:?string,spawn_x:?int,spawn_y:?int,spawn_z:?int}
      */
-    private function readLevelDatMeta(Server $server, string $directory): array
+    private static function emptyMeta(): array
     {
-        $emptyShape = [
+        return [
             'version' => null,
             'data_version' => null,
             'level_name' => null,
@@ -370,9 +479,20 @@ final class WorldsService
             'spawn_y' => null,
             'spawn_z' => null,
         ];
+    }
+
+    /**
+     * Level.dat metadata; every failure quietly produces the all-null shape so one
+     * corrupt world cannot take down the listing.
+     *
+     * @return array{version:?string,data_version:?int,level_name:?string,game_type:?int,hardcore:bool,last_played:?string,seed:?string,spawn_x:?int,spawn_y:?int,spawn_z:?int}
+     */
+    private function readLevelDatMeta(Server $server, string $directory): array
+    {
+        $emptyShape = self::emptyMeta();
 
         try {
-            $bytes = $this->bridge->read($server, rtrim($directory, '/').'/level.dat', self::LEVEL_DAT_TRANSFER_CAP);
+            $bytes = $this->bridge->read($server, '/'.$directory.'/level.dat', self::LEVEL_DAT_TRANSFER_CAP);
         } catch (\Throwable) {
             return $emptyShape;
         }
@@ -392,6 +512,9 @@ final class WorldsService
         return is_array($parsed) ? [...$emptyShape, ...$parsed] : $emptyShape;
     }
 
+    /**
+     * @return list<array<string, mixed>>
+     */
     private function probeList(Server $server, string $path, Budget $budget): array
     {
         if ($budget->exhausted()) {
@@ -400,32 +523,18 @@ final class WorldsService
 
         $budget->spend();
 
-        return $this->bridge->safeLs($server, $path);
+        return $this->bridge->safeLs($server, '/'.$path);
     }
 
     /* ------------------------------------------------------------------ */
     /*  Active world value                                                 */
     /* ------------------------------------------------------------------ */
 
-    /**
-     * Current `level-name` from server.properties.
-     *
-     * Cross-plugin dependency: {@see \McToolkit\Services\Properties\PropertiesParser}
-     * (frozen stable contract owned by the wave-B Properties agent). Resolved lazily
-     * behind class_exists so rolling deploys degrade to the vanilla fallback instead
-     * of fataling during construction.
-     */
+    /** Current `level-name` from server.properties ('world' when unreadable). */
     private function activeLevelName(Server $server): string
     {
-        $parserClass = \McToolkit\Services\Properties\PropertiesParser::class;
-
-        if (! class_exists($parserClass)) {
-            return 'world';
-        }
-
         try {
-            $parser = app($parserClass);
-            $values = $parser->read($server)['values'] ?? [];
+            $values = app(\McToolkit\Services\Properties\PropertiesParser::class)->read($server)['values'] ?? [];
 
             $level = trim(strval($values['level-name'] ?? ''));
 
@@ -446,94 +555,150 @@ final class WorldsService
     /* ------------------------------------------------------------------ */
 
     /**
-     * Directories touched by an archive/reset of `$world`: itself plus existing
-     * `*_nether` / `*_the_end` siblings at root level.
+     * Top-level folders touched by a download/reset of `$world`: the world itself plus,
+     * for a primary world, its linked `*_nether` / `*_the_end` members. Empty when
+     * `$world` is not a folder the discovery lists (exact name match).
      *
-     * The confirmation modal lists THIS set verbatim before {@see self::reset()} runs;
-     * keeping the frozen reset(): void contract intact made this preview-helper the
-     * natural addition (documented as deviation #1).
-     *
-     * @return list<string> exact top-level names (may be empty when nothing exists).
-     *
-     * @throws ConnectionException when the node cannot be reached mid-existence check.
+     * @return list<string>
      */
     public function affectedPaths(Server $server, string $world): array
     {
-        $world = basename(trim($world));
-
-        if ($world === '' || in_array(mb_strtolower($world), self::NON_WORLD_ROOTS, true)) {
+        if (! self::isSafeDirectoryName($world)) {
             return [];
         }
 
-        $paths = [$world];
-
-        foreach (self::GROUP_SUFFIXES as $suffix) {
-            try {
-                if ($this->bridge->exists($server, $world.$suffix)) {
-                    $paths[] = $world.$suffix;
-                }
-            } catch (ConnectionException $exception) {
-                throw $exception;
-            } catch (\Throwable) {
-                continue;
+        foreach ($this->discover($server, false, false) as $row) {
+            if ($row['name'] === $world) {
+                return array_values(array_unique([$row['name'], ...$row['members']]));
             }
         }
 
-        return $paths;
+        return [];
     }
 
     /**
-     * Compress the whole linked set of `$world` next to itself inside '/'.
+     * Server must be STOPPED (and not suspended/transferring) before files of a world
+     * are deleted or replaced: a running server keeps rewriting level.dat and loaded
+     * chunks after the fact. The status is re-read instead of trusting the 15 s cache.
      *
-     * The PAGE download flow prefers the signed controller route (A1-owned
-     * WorldDownloadController performs its own compression + streaming there and
-     * enforces the exact query-signing scheme internally), so this method stays a
-     * first-class service capability while the UI rides the cheaper path — see the
-     * module-notes deviation #3 recorded alongside WorldsPage.
-     *
-     * @return string created archive file name ('' when wings omitted it)
-     *
-     * @throws ConnectionException|\DomainException
+     * @throws \DomainException with a translated, user-facing reason
      */
-    public function archive(Server $server, string $worldName): string
+    public function assertStopped(Server $server): void
     {
-        $paths = $this->affectedPaths($server, $worldName);
-
-        if ($paths === []) {
-            throw new \DomainException(trans('minecraft-toolkit::errors.statuses.download_failed'));
+        if ($server->isInConflictState()) {
+            throw new \DomainException(trans('minecraft-toolkit::errors.statuses.server_unavailable'));
         }
 
-        $filename = $this->bridge->compress(
+        cache()->forget("servers.$server->uuid.status");
+
+        $status = $server->retrieveStatus();
+
+        if ($status === ContainerStatus::Missing) {
+            throw new \DomainException(trans('minecraft-toolkit::errors.statuses.wings_502'));
+        }
+
+        $stopped = [ContainerStatus::Offline, ContainerStatus::Exited, ContainerStatus::Created, ContainerStatus::Dead];
+
+        if (! in_array($status, $stopped, true)) {
+            throw new \DomainException(trans('minecraft-toolkit::errors.statuses.stopped_required'));
+        }
+    }
+
+    /**
+     * Compresses the linked set of `$world` into a temporary zip in the server root and
+     * returns its file name, for the node's own signed download endpoint. The archive
+     * is removed by {@see self::sweepStaleArchives()} once older than
+     * {@see self::DOWNLOAD_ARCHIVE_TTL_SECONDS}.
+     *
+     * @throws \DomainException when `$world` is not a known world
+     * @throws ConnectionException|\RuntimeException
+     */
+    public function prepareDownload(Server $server, string $world): string
+    {
+        $paths = $this->affectedPaths($server, $world);
+
+        if ($paths === []) {
+            throw new \DomainException(trans('minecraft-toolkit::pages.worlds.unknown_world'));
+        }
+
+        $this->sweepStaleArchives($server);
+
+        $archive = $this->bridge->compress(
             $server,
             '/',
             $paths,
-            'mct-world-'.$this->kebab($worldName),
+            self::DOWNLOAD_ARCHIVE_PREFIX.$this->slug($world).'-'.bin2hex(random_bytes(4)),
             'zip',
         );
 
-        Activity::event('mc-toolkit:worlds.archive')
-            ->subject($server)
-            ->property(['world' => $worldName])
-            ->log();
+        if ($archive === '') {
+            throw new \RuntimeException('Wings did not return an archive name.');
+        }
 
-        return $filename;
+        return $archive;
+    }
+
+    /** Removes one download archive right away (failure paths). Never throws. */
+    public function discardArchive(Server $server, string $archive): void
+    {
+        if (preg_match(self::DOWNLOAD_ARCHIVE_PATTERN, $archive) !== 1) {
+            return;
+        }
+
+        try {
+            $this->bridge->delete($server, [$archive], '/');
+        } catch (\Throwable) {
+            // the sweep picks it up later
+        }
     }
 
     /**
-     * Delete the whole linked basename set of `$world`.
+     * Deletes toolkit download archives in the server root older than the TTL
+     * (including archives left behind by v1.0.x). Never throws.
      *
-     * Confirmation UX builds the preview via {@see self::affectedPaths()} BEFORE
-     * calling this — the frozen contract keeps reset(): void and pushes the
-     * returned-list need onto that separate helper.
+     * @param  list<array<string, mixed>>|null  $rootEntries  a fresh root listing, when the caller has one
+     */
+    public function sweepStaleArchives(Server $server, ?array $rootEntries = null): void
+    {
+        try {
+            $stale = [];
+            $threshold = time() - self::DOWNLOAD_ARCHIVE_TTL_SECONDS;
+
+            foreach ($rootEntries ?? $this->bridge->safeLs($server, '/') as $entry) {
+                $name = strval($entry['name'] ?? '');
+
+                if (($entry['file'] ?? false) !== true || preg_match(self::DOWNLOAD_ARCHIVE_PATTERN, $name) !== 1) {
+                    continue;
+                }
+
+                $modified = strtotime(strval($entry['modified'] ?? ''));
+
+                if ($modified !== false && $modified < $threshold) {
+                    $stale[] = $name;
+                }
+            }
+
+            if ($stale !== []) {
+                $this->bridge->delete($server, $stale, '/');
+            }
+        } catch (\Throwable) {
+            // best effort, next listing retries
+        }
+    }
+
+    /**
+     * Delete the whole linked set of `$world` (server must be stopped).
      *
      * @throws ConnectionException|\DomainException
      */
     public function reset(Server $server, string $worldName): void
     {
+        $this->assertStopped($server);
+
         $paths = $this->affectedPaths($server, $worldName);
 
         if ($paths === []) {
-            throw new \DomainException(trans('minecraft-toolkit::errors.statuses.permission_denied'));
+            throw new \DomainException(trans('minecraft-toolkit::pages.worlds.unknown_world'));
         }
 
         $this->bridge->delete($server, $paths, '/');
@@ -545,238 +710,306 @@ final class WorldsService
     }
 
     /**
-     * Remote-import flow: wings pulls `$zipUrl` into '/', we poll briefly for the
-     * archive, decompress it, locate the FIRST region-bearing NEW directory and
-     * rename it to `$targetName` — or, unprovided, to the server's CURRENT
-     * `level-name` so the imported world becomes the active one after restart.
+     * Remote-import flow (server must be stopped):
      *
-     * Name collisions fall back to `<target>-imported-<uniq4>` instead of failing
-     * outright (deviation #2); wings pull latency relies on bounded polling before
-     * surfacing errors.download_failed.
+     *  1. wings pulls `$zipUrl` in the FOREGROUND into a fresh staging folder
+     *     `.toolkit/import-<id>/` under a fixed file name;
+     *  2. the archive is unpacked THERE (never in the server root, so nothing live can
+     *     be overwritten) and deleted;
+     *  3. the world folder is located (shallowest folder holding `level.dat`, else
+     *     `region/`; flat archives make the staging folder itself the world);
+     *  4. it is moved to `$targetName` — or the current `level-name` — under a name that
+     *     is free at the root (`<name>-imported-<hex>` otherwise); Bukkit-style
+     *     `<world>_nether` / `<world>_the_end` siblings follow as `<dest>_nether` /
+     *     `<dest>_the_end`;
+     *  5. the staging folder is removed whatever happened.
+     *
+     * @return string the root folder name the world was imported as
      *
      * @throws ConnectionException|\DomainException friendly failure shapes
      */
-    public function import(Server $server, string $zipUrl, ?string $targetName = null): void
+    public function import(Server $server, string $zipUrl, ?string $targetName = null): string
     {
         $url = trim($zipUrl);
 
-        if ($url === '' || preg_match('/^https?:\/\//i', $url) !== 1) {
+        if (preg_match('/^https?:\/\//i', $url) !== 1 || filter_var($url, FILTER_VALIDATE_URL) === false) {
             throw new \DomainException(trans('minecraft-toolkit::errors.statuses.download_failed'));
         }
 
-        $target = basename(trim(strval($targetName ?? '')));
+        $target = trim(strval($targetName ?? ''));
 
-        if ($target !== '' && preg_match('/^[A-Za-z0-9][A-Za-z0-9._\- ]*$/', $target) !== 1) {
-            // lang gap #import_name_invalid — closest generic key reads misleadingly.
-            throw new \DomainException('The target world name contains characters that are not supported.');
+        if ($target !== '' && (! self::isSafeDirectoryName($target) || preg_match('/^[A-Za-z0-9][A-Za-z0-9._\- ]*$/', $target) !== 1)) {
+            throw new \DomainException(trans('minecraft-toolkit::pages.worlds.import_name_invalid'));
         }
 
-        $beforeNames = $this->rootNames($server);
+        $this->assertStopped($server);
+        $this->sweepStaleStaging($server);
 
-        $this->bridge->pull($server, $url, '/');
-
-        $archiveFile = $this->waitForNewArchive($server, $beforeNames);
-
-        if ($archiveFile === null) {
-            throw new \DomainException(trans('minecraft-toolkit::errors.statuses.download_failed'));
-        }
+        $staging = self::STAGING_ROOT.'/import-'.bin2hex(random_bytes(6));
+        $archive = $this->archiveFileName($url);
 
         try {
-            $this->bridge->decompress($server, '/', $archiveFile);
-        } catch (ConnectionException $exception) {
-            throw $exception;
-        } catch (\Throwable $exception) {
-            throw new \DomainException(trans('minecraft-toolkit::errors.statuses.unpack_failed'), 0, $exception);
+            try {
+                $this->bridge->pull($server, $url, '/'.$staging, $archive);
+            } catch (\Throwable $exception) {
+                throw new \DomainException(trans('minecraft-toolkit::errors.statuses.download_failed'), 0, $exception);
+            }
+
+            try {
+                $this->bridge->decompress($server, '/'.$staging, $archive);
+                $this->bridge->delete($server, [$archive], '/'.$staging);
+            } catch (\Throwable $exception) {
+                throw new \DomainException(trans('minecraft-toolkit::errors.statuses.unpack_failed'), 0, $exception);
+            }
+
+            $worldPath = $this->locateWorld($server, $staging);
+
+            if ($worldPath === null) {
+                throw new \DomainException(trans('minecraft-toolkit::pages.worlds.import_no_world'));
+            }
+
+            $siblings = $this->importSiblings($server, $worldPath, $staging);
+
+            // Re-check right before touching the root: the download may have taken minutes.
+            $this->assertStopped($server);
+
+            $destination = $this->freeDestination(
+                $server,
+                $target !== '' ? $target : $this->activeLevelName($server),
+            );
+
+            $this->bridge->rename($server, $worldPath, $destination);
+
+            if (! $this->bridge->exists($server, $destination)) {
+                throw new \DomainException(trans('minecraft-toolkit::errors.statuses.unpack_failed'));
+            }
+
+            foreach ($siblings as $suffix => $siblingPath) {
+                try {
+                    $this->bridge->rename($server, $siblingPath, $destination.$suffix);
+                } catch (\Throwable $exception) {
+                    report($exception); // the main world is in place; a lost sibling is not fatal
+                }
+            }
+        } finally {
+            try {
+                $this->bridge->delete($server, [$staging], '/');
+            } catch (\Throwable) {
+                // already moved away (flat archive) or gone; the next import sweeps leftovers
+            }
         }
-
-        $newDirs = $this->newDirectories($server, $beforeNames);
-
-        $regionDir = $this->locateRegionDir($server, $newDirs);
-
-        if ($regionDir === null) {
-            throw new \DomainException(trans('minecraft-toolkit::errors.statuses.unpack_failed'));
-        }
-
-        $destination = $target !== ''
-            ? $target
-            : $this->activeLevelName($server);
-
-        $presentAfterImport = $this->rootNames($server, [$regionDir]);
-
-        if (in_array($destination, $presentAfterImport, true)) {
-            $destination .= '-imported-'.substr(bin2hex(random_bytes(2)), 0, 4);
-        }
-
-        $this->bridge->rename($server, $regionDir, $destination);
 
         Activity::event('mc-toolkit:worlds.import')
             ->subject($server)
             ->property(['world' => $destination, 'url' => $url])
             ->log();
+
+        return $destination;
     }
 
     /* ------------------------------------------------------------------ */
     /*  Import helpers                                                     */
     /* ------------------------------------------------------------------ */
 
+    /** Fixed archive name keeping the URL's archive extension (wings sniffs content too). */
+    private function archiveFileName(string $url): string
+    {
+        $path = strtolower(strval(parse_url($url, PHP_URL_PATH) ?? ''));
+
+        foreach (['.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.tar', '.zip', '.7z', '.rar'] as $extension) {
+            if (str_ends_with($path, $extension)) {
+                return 'world-archive'.$extension;
+            }
+        }
+
+        return 'world-archive.zip';
+    }
+
     /**
-     * Poll root listing until a NEW .zip/.tar* FILE appears (bounded ≈21 s total),
-     * preferring the newest entry by modified time; wings pulls answer asynchronously.
+     * Breadth-first search below the staging folder for the world folder: the first
+     * folder holding `level.dat` that is not itself a `_nether`/`_the_end` member wins;
+     * otherwise the first folder holding `level.dat` or `region/`. World folders are
+     * not searched further (their sub-folders are world internals).
      */
-    private function waitForNewArchive(Server $server, array $beforeNames): ?string
+    private function locateWorld(Server $server, string $staging): ?string
     {
-        for ($attempt = 0; $attempt < 8; $attempt++) {
-            $candidates = [];
+        $queue = [[$staging, 0]];
+        $listings = 0;
+        $fallback = null;
 
-            foreach ($this->bridge->safeLs($server, '/') as $entry) {
-                if (($entry['directory'] ?? false) || ($entry['file'] ?? false) === false) {
+        while ($queue !== [] && $listings < self::MAX_IMPORT_LISTINGS) {
+            [$path, $depth] = array_shift($queue);
+            $listings++;
+
+            $hasLevelDat = false;
+            $hasRegion = false;
+            $children = [];
+
+            foreach ($this->bridge->safeLs($server, '/'.$path) as $entry) {
+                $name = strval($entry['name'] ?? '');
+
+                if (! self::isSafeDirectoryName($name)) {
                     continue;
                 }
 
-                $name = strval($entry['name']);
+                if (($entry['directory'] ?? false) === true) {
+                    $hasRegion = $hasRegion || $name === 'region';
 
-                if (in_array($name, $beforeNames, true)) {
-                    continue;
-                }
-
-                if (preg_match('/\.(zip|tar|gz|tgz)$/i', $name) !== 1) {
-                    continue;
-                }
-
-                $candidates[] = ['name' => $name, 'modified' => strval($entry['modified'] ?? '')];
-            }
-
-            if ($candidates !== []) {
-                usort($candidates, static fn (array $a, array $b): int => strcmp($b['modified'], $a['modified']));
-
-                return strval($candidates[0]['name']);
-            }
-
-            if ($attempt < 7) {
-                sleep(3);
-            }
-        }
-
-        return null;
-    }
-
-    /** NEW top-level DIRECTORY names (relative to the pre-import snapshot). */
-    private function newDirectories(Server $server, array $before): array
-    {
-        $new = [];
-
-        foreach ($this->bridge->safeLs($server, '/') as $entry) {
-            if (($entry['directory'] ?? false) === false) {
-                continue;
-            }
-
-            $name = strval($entry['name']);
-
-            if (! in_array($name, $before, true)) {
-                $new[] = $name;
-            }
-        }
-
-        sort($new);
-
-        return $new;
-    }
-
-    /** First region-bearing path among NEW roots, searched two levels deep. */
-    private function locateRegionDir(Server $server, array $candidates): ?string
-    {
-        foreach ($candidates as $top) {
-            if ($this->looksRegionBearing($server, strval($top), 1)) {
-                return strval($top);
-            }
-
-            foreach ($this->bridge->safeLs($server, strval($top)) as $child) {
-                if (($child['directory'] ?? false) === false) {
-                    continue;
-                }
-
-                $nested = $top.'/'.strval($child['name']);
-
-                if ($this->looksRegionBearing($server, $nested, 2)) {
-                    return $nested;
+                    if (! in_array($name, self::WORLD_INTERNALS, true)) {
+                        $children[] = $name;
+                    }
+                } elseif (($entry['file'] ?? false) === true && $name === 'level.dat') {
+                    $hasLevelDat = true;
                 }
             }
-        }
 
-        return null;
-    }
+            if ($hasLevelDat || $hasRegion) {
+                $isMember = $path !== $staging && $this->splitSuffix(basename($path))[1] !== null;
 
-    /** True when path holds raw mca files directly or nests DIM dimension region folders. */
-    private function looksRegionBearing(Server $server, string $path, int $depth): bool
-    {
-        $entries = $this->bridge->safeLs($server, $path);
+                if ($hasLevelDat && ! $isMember) {
+                    return $path;
+                }
 
-        $hasMcaFile = false;
-        $dirs = [];
-
-        foreach ($entries as $entry) {
-            $name = strval($entry['name']);
-
-            if (($entry['directory'] ?? false)) {
-                $dirs[$name] = true;
+                $fallback ??= $path;
 
                 continue;
             }
 
-            if (($entry['file'] ?? false) && str_ends_with($name, '.mca')) {
-                $hasMcaFile = true;
+            if ($depth < self::MAX_IMPORT_DEPTH) {
+                sort($children);
+
+                foreach ($children as $child) {
+                    $queue[] = [$path.'/'.$child, $depth + 1];
+                }
             }
         }
 
-        if ($hasMcaFile) {
-            return true;
+        return $fallback;
+    }
+
+    /**
+     * Bukkit-style dimension siblings next to the located world (`<base>_nether`,
+     * `<base>_the_end`), keyed by suffix.
+     *
+     * @return array<string, string>
+     */
+    private function importSiblings(Server $server, string $worldPath, string $staging): array
+    {
+        if ($worldPath === $staging) {
+            return [];
         }
 
-        if ($depth <= 0) {
-            return false;
-        }
+        $parent = dirname($worldPath);
+        $base = basename($worldPath);
+        $present = [];
 
-        foreach (['DIM-1', 'DIM1', 'DIM0'] as $dimKey) {
-            if (! isset($dirs[$dimKey])) {
-                continue;
+        foreach ($this->bridge->safeLs($server, '/'.$parent) as $entry) {
+            if (($entry['directory'] ?? false) === true) {
+                $present[strval($entry['name'])] = true;
             }
+        }
 
-            foreach ($this->bridge->safeLs($server, $path.'/'.$dimKey) as $item) {
-                if ((($item['directory'] ?? false)) && strval($item['name']) === 'region') {
+        $siblings = [];
+
+        foreach (self::GROUP_SUFFIXES as $suffix) {
+            if (isset($present[$base.$suffix])) {
+                $siblings[$suffix] = $parent.'/'.$base.$suffix;
+            }
+        }
+
+        return $siblings;
+    }
+
+    /**
+     * A root name that is free for the world AND its possible `_nether`/`_the_end`
+     * siblings (case-insensitive, as players move worlds between file systems).
+     */
+    private function freeDestination(Server $server, string $preferred): string
+    {
+        $taken = [];
+
+        foreach ($this->rootNames($server) as $name) {
+            $taken[mb_strtolower($name)] = true;
+        }
+
+        $isTaken = static function (string $candidate) use ($taken): bool {
+            foreach (['', ...self::GROUP_SUFFIXES] as $suffix) {
+                if (isset($taken[mb_strtolower($candidate.$suffix)])) {
                     return true;
                 }
             }
+
+            return false;
+        };
+
+        $base = self::isSafeDirectoryName($preferred) ? $preferred : 'world';
+        $candidate = $base;
+
+        for ($attempt = 0; $isTaken($candidate); $attempt++) {
+            if ($attempt >= 20) {
+                throw new \DomainException(trans('minecraft-toolkit::pages.worlds.import_name_invalid'));
+            }
+
+            $candidate = $base.'-imported-'.bin2hex(random_bytes(2));
         }
 
-        return false;
+        return $candidate;
+    }
+
+    /** Removes `.toolkit/import-*` folders a crashed import left behind. Never throws. */
+    private function sweepStaleStaging(Server $server): void
+    {
+        try {
+            $stale = [];
+            $threshold = time() - self::STAGING_TTL_SECONDS;
+
+            foreach ($this->bridge->safeLs($server, '/'.self::STAGING_ROOT) as $entry) {
+                $name = strval($entry['name'] ?? '');
+
+                if (($entry['directory'] ?? false) !== true || ! str_starts_with($name, 'import-')) {
+                    continue;
+                }
+
+                $modified = strtotime(strval($entry['modified'] ?? ''));
+
+                if ($modified !== false && $modified < $threshold) {
+                    $stale[] = $name;
+                }
+            }
+
+            if ($stale !== []) {
+                $this->bridge->delete($server, $stale, '/'.self::STAGING_ROOT);
+            }
+        } catch (\Throwable) {
+            // best effort
+        }
     }
 
     /**
-     * Top-level entry NAMES currently present (optionally minus excludes).
+     * Top-level entry NAMES currently present.
      *
-     * @param  list<string>  $exclude
      * @return list<string>
      */
-    private function rootNames(Server $server, array $exclude = []): array
+    private function rootNames(Server $server): array
     {
         $names = [];
 
         foreach ($this->bridge->safeLs($server, '/') as $entry) {
-            $name = strval($entry['name']);
+            $name = strval($entry['name'] ?? '');
 
-            if ($name === '' || in_array($name, $exclude, true)) {
-                continue;
+            if ($name !== '') {
+                $names[] = $name;
             }
-
-            $names[] = $name;
         }
 
         return $names;
     }
 
-    private function kebab(string $value): string
+    private function slug(string $value): string
     {
-        return trim(preg_replace('/[^A-Za-z0-9]+/', '-', $value) ?? '', '-') ?: 'unknown';
+        $slug = strtolower(trim(preg_replace('/[^A-Za-z0-9]+/', '-', $value) ?? '', '-'));
+
+        return substr($slug !== '' ? $slug : 'world', 0, 40);
     }
 }
 
@@ -790,8 +1023,7 @@ final class Budget
 {
     private int $spent = 0;
 
-    public function __construct(private readonly int $total)
-    {}
+    public function __construct(private readonly int $total) {}
 
     public function spend(): void
     {
@@ -805,67 +1037,70 @@ final class Budget
 }
 
 /**
- * Two-level recursive byte-size estimator cached across rows sharing sub-paths.
+ * Recursive byte-size estimator, one listing budget per world folder.
  *
  * Sums FILE entries only — wings reports directory nodes with inconsistent size
- * columns across node versions, byte sums of files are the stable denominator.
- * Estimation degrades silently to whatever was collectable within budget; rows
- * above {@see WorldsService::SIZE_APPROXIMATE_THRESHOLD} get flagged approximate.
+ * columns across node versions. When the budget runs out the estimate is a lower
+ * bound and flagged incomplete, so the row renders as approximate.
  *
  * @internal
  */
 final class SizeCache
 {
-    private const MAX_TOTAL_LISTINGS = WorldsService::MAX_SIZE_LISTINGS;
-
-    /** @var array<string, int> */
+    /** @var array<string, array{0:int, 1:bool}> */
     private array $cache = [];
-
-    private int $spent = 0;
 
     public function __construct(
         private readonly Server $server,
         private readonly FileBridge $bridge,
     ) {}
 
-    public function estimate(string $directory): int
+    /**
+     * @return array{0:int, 1:bool} [bytes, complete]
+     */
+    public function estimate(string $directory): array
     {
-        $key = mb_strtolower($directory);
-
-        if (isset($this->cache[$key])) {
-            return $this->cache[$key];
+        if (isset($this->cache[$directory])) {
+            return $this->cache[$directory];
         }
 
-        $value = $this->walk('/'.ltrim($directory, '/'), WorldsService::MAX_SIZE_RECURSION_LEVELS);
+        $budget = new Budget(WorldsService::MAX_SIZE_LISTINGS);
+        $complete = true;
 
-        $this->cache[$key] = $value;
+        $bytes = $this->walk('/'.ltrim($directory, '/'), WorldsService::MAX_SIZE_RECURSION_LEVELS, $budget, $complete);
 
-        return $value;
+        return $this->cache[$directory] = [$bytes, $complete];
     }
 
-    private function walk(string $path, int $levelsLeft): int
+    private function walk(string $path, int $levelsLeft, Budget $budget, bool &$complete): int
     {
-        if ($levelsLeft < 0 || $this->spent >= self::MAX_TOTAL_LISTINGS) {
+        if ($levelsLeft < 0) {
             return 0;
         }
 
-        $this->spent++;
+        if ($budget->exhausted()) {
+            $complete = false;
+
+            return 0;
+        }
+
+        $budget->spend();
 
         $sum = 0;
 
         foreach ($this->bridge->safeLs($this->server, $path) as $entry) {
-            if (($entry['symlink'] ?? false)) {
+            if (($entry['symlink'] ?? false) === true) {
                 continue;
             }
 
-            if (($entry['directory'] ?? false)) {
-                $sum += $this->walk(rtrim($path, '/').'/'.strval($entry['name']), $levelsLeft - 1);
+            if (($entry['directory'] ?? false) === true) {
+                $sum += $this->walk(rtrim($path, '/').'/'.strval($entry['name']), $levelsLeft - 1, $budget, $complete);
 
                 continue;
             }
 
-            if (($entry['file'] ?? false)) {
-                $sum += max(0, (int) $entry['size']);
+            if (($entry['file'] ?? false) === true) {
+                $sum += max(0, (int) ($entry['size'] ?? 0));
             }
         }
 

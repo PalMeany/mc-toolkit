@@ -14,13 +14,16 @@ use Illuminate\Support\Facades\Http;
  * Owner: A3.
  *
  * All requests share the plugin-wide client policy: 10s total timeout,
- * 5s connect timeout and two automatic retries (100ms backoff).
+ * 5s connect timeout and two automatic retries (100ms backoff) on transport errors / 5xx.
  * Cached payloads are keyed under the `mctoolkit.http.` cache prefix so
  * admins can clear them together with the rest of the plugin state.
  */
 final class HttpJsonCache
 {
     public const PREFIX = 'mctoolkit.http.';
+
+    /** Modrinth and Spiget ask API clients to identify themselves instead of sending Guzzle's default. */
+    public const USER_AGENT = 'mc-toolkit (Pelican panel plugin; +https://github.com/PalMeany/mc-toolkit)';
 
     /**
      * Fetch a JSON document, decoding it defensively (associative arrays only),
@@ -68,9 +71,13 @@ final class HttpJsonCache
     {
         $response = Http::asJson()
             ->acceptJson()
+            ->withUserAgent(self::USER_AGENT)
             ->timeout(10)
             ->connectTimeout(5)
-            ->retries(2, 100)
+            // Only transport failures and 5xx are worth another attempt; a 404 or 429
+            // answers the same way 100ms later.
+            ->retry(2, 100, fn (\Throwable $e): bool => $e instanceof ConnectionException
+                || ($e instanceof RequestException && $e->response->serverError()))
             ->when($headers !== [], fn ($client) => $client->withHeaders($headers))
             ->get($url, $query);
 

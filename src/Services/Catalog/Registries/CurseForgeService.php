@@ -13,11 +13,11 @@ use McToolkit\Support\HttpJsonCache;
  * Facts:
  *  - Requires the x-api-key header; config('minecraft-toolkit.curseforge_key') / env CURSEFORGE_KEY.
  *    `search()` returns null when no key is configured (source marked skipped, not an error).
- *  - GET /mods/search?gameId=432&classId=<class>&gameVersion=<mc>&searchFilter=&sortField=2
- *    &sortOrder=desc&pageSize=25&index=(page-1)*25 -> {data:[...], meta:{totalCount:int}}
- *    classId: 6 = mods, 12 = plugins (bukkit addons), 4471 = modpacks.
- *  - Mod rows carry categories with slug names matching loader keywords and latestFilesIndexes
- *    carrying gameVersion values — used to build the uniform loaders/game_versions chips.
+ *  - GET /mods/search?gameId=432&classId=<class>&searchFilter=<q>&gameVersion=<mc>&modLoaderType=<n>
+ *    &sortField=2&sortOrder=desc&pageSize=25&index=(page-1)*25 -> {data:[...], meta:{totalCount:int}}
+ *    classId: 6 = mods, 5 = Bukkit plugins, 4471 = modpacks (12 is RESOURCE PACKS).
+ *  - Loaders come from latestFilesIndexes[].modLoader (ModLoaderType: 1 Forge, 4 Fabric,
+ *    5 Quilt, 6 NeoForge); content categories never name loaders.
  *
  * Return shape used by ContentSearchService: ['items' => list<item>, 'pages' => ?int] or null.
  */
@@ -29,20 +29,21 @@ final class CurseForgeService
 
     private const GAME_ID_MINECRAFT = 432;
 
-    /** CurseForge category slugs mapped onto loader chips. */
-    private const CATEGORY_LOADER_MAP = [
-        'forge' => 'forge',
-        'neoforge' => 'neoforge',
-        'fabric' => 'fabric',
-        'quilt' => 'quilt',
-        'bukkit' => 'bukkit',
-        'spigot' => 'spigot',
-        'paper' => 'paper',
-        'purpur' => 'purpur',
-        'folia' => 'folia',
+    /** ModLoaderType enum ids onto loader chips. */
+    private const MOD_LOADER_MAP = [
+        1 => 'forge',
+        4 => 'fabric',
+        5 => 'quilt',
+        6 => 'neoforge',
     ];
 
     public function __construct(private readonly int $listCacheSeconds = 300) {}
+
+    /** Search pages honour config('minecraft-toolkit.cache_ttl.searches'); the constructor value is the fallback. */
+    private function searchTtl(): int
+    {
+        return max(0, (int) config('minecraft-toolkit.cache_ttl.searches', $this->listCacheSeconds));
+    }
 
     /** Resolve the x-api-key; empty string means "not configured". */
     public function apiKey(): string
@@ -53,31 +54,50 @@ final class CurseForgeService
     }
 
     /**
+     * ModLoaderType id for one loader token, or null when CurseForge has none.
+     */
+    public static function modLoaderTypeFor(string $loader): ?int
+    {
+        $id = array_search(strtolower(trim($loader)), self::MOD_LOADER_MAP, true);
+
+        return is_int($id) ? $id : null;
+    }
+
+    /**
      * @param  string  $gameVersion  exact Minecraft version filter ('' disables it)
-     * @param  string  $classId  '6'|'12'|'4471'
+     * @param  string  $classId  '6'|'5'|'4471'
+     * @param  string  $query  free-text search ('' = popularity listing)
+     * @param  int|null  $modLoaderType  ModLoaderType filter (null disables it)
      * @return array{items:list<array<string, mixed>>, pages:?int}|null null when no API key configured
      */
-    public function search(string $gameVersion, string $classId, int $page = 1): ?array
+    public function search(string $gameVersion, string $classId, int $page = 1, string $query = '', ?int $modLoaderType = null): ?array
     {
         if ($this->apiKey() === '') {
             return null;
         }
 
-        $query = [
+        $params = [
             'gameId' => self::GAME_ID_MINECRAFT,
             'classId' => $classId,
-            'searchFilter' => '',
-            'sortField' => 2, // popularity — id 2 on CF's SortField enum
+            'sortField' => 2, // popularity — id 2 on CF's ModsSearchSortField enum
             'sortOrder' => 'desc',
             'pageSize' => self::PAGE_SIZE,
             'index' => max(0, ($page - 1) * self::PAGE_SIZE),
         ];
 
-        if (trim($gameVersion) !== '') {
-            $query['gameVersion'] = trim($gameVersion);
+        if (trim($query) !== '') {
+            $params['searchFilter'] = trim($query);
         }
 
-        $payload = HttpJsonCache::get(self::API.'/v1/mods/search', $this->listCacheSeconds, $query, [
+        if (trim($gameVersion) !== '') {
+            $params['gameVersion'] = trim($gameVersion);
+        }
+
+        if ($modLoaderType !== null) {
+            $params['modLoaderType'] = $modLoaderType;
+        }
+
+        $payload = HttpJsonCache::get(self::API.'/v1/mods/search', $this->searchTtl(), $params, [
             'x-api-key' => $this->apiKey(),
         ]);
 
@@ -85,20 +105,27 @@ final class CurseForgeService
             return ['items' => [], 'pages' => null];
         }
 
-        /** @var list<array<string, mixed>> $rows */
         $rows = is_array($payload['data'] ?? null) ? $payload['data'] : [];
 
         $total = $payload['meta']['totalCount'] ?? null;
 
         $type = match ($classId) {
-            '12', 12 => 'plugin',
-            '4471', 4471 => 'modpack',
+            '5' => 'plugin',
+            '4471' => 'modpack',
             default => 'mod',
         };
 
+        $items = [];
+
+        foreach ($rows as $row) {
+            if (is_array($row)) {
+                $items[] = $this->normalize($row, $type);
+            }
+        }
+
         return [
-            'items' => array_values(array_map(fn (array $row) => $this->normalize($row, $type), $rows)),
-            // Meta totalCount can grow past any sane pagination budget.
+            'items' => $items,
+            // CurseForge refuses index + pageSize beyond 10 000, i.e. 400 pages of 25.
             'pages' => (is_int($total) && $total > 0)
                 ? max(1, min(400, (int) ceil($total / self::PAGE_SIZE)))
                 : null,
@@ -106,11 +133,12 @@ final class CurseForgeService
     }
 
     /**
-     * File listing for one mod (installer entry point).
+     * File listing for one mod (installer entry point), newest uploads first upstream.
      *
+     * @param  array<string, scalar>  $filters  gameVersion / modLoaderType narrowing
      * @return list<array<string, mixed>>
      */
-    public function files(int|string $modId): array
+    public function files(int|string $modId, array $filters = []): array
     {
         if ($this->apiKey() === '') {
             return [];
@@ -119,14 +147,13 @@ final class CurseForgeService
         $payload = HttpJsonCache::get(
             self::API.'/v1/mods/'.rawurlencode((string) $modId).'/files',
             120,
-            [],
+            ['pageSize' => 50, ...$filters],
             ['x-api-key' => $this->apiKey()],
         );
 
-        /** @var list<array<string, mixed>> $rows */
-        $rows = is_array($payload['data'] ?? null) ? $payload['data'] : [];
+        $rows = is_array($payload) && is_array($payload['data'] ?? null) ? $payload['data'] : [];
 
-        return $rows;
+        return array_values(array_filter($rows, fn ($row) => is_array($row)));
     }
 
     /**
@@ -142,62 +169,63 @@ final class CurseForgeService
         $summary = is_string($row['summary'] ?? null) ? $row['summary'] : '';
         $description = Str::limit(trim(strip_tags(html_entity_decode($summary, ENT_QUOTES | ENT_HTML5, 'UTF-8'))), 300);
 
-        $categories = is_array($row['categories'] ?? null) ? $row['categories'] : [];
         $loaders = [];
-        foreach ($categories as $category) {
-            $slug = is_array($category) && isset($category['slug']) && is_string($category['slug'])
-                ? strtolower($category['slug'])
-                : '';
+        $gameVersions = [];
 
-            if (isset(self::CATEGORY_LOADER_MAP[$slug])) {
-                $loaders[self::CATEGORY_LOADER_MAP[$slug]] = true;
+        foreach (is_array($row['latestFilesIndexes'] ?? null) ? $row['latestFilesIndexes'] : [] as $index) {
+            if (!is_array($index)) {
+                continue;
+            }
+
+            if (is_string($index['gameVersion'] ?? null) && $index['gameVersion'] !== '') {
+                $gameVersions[$index['gameVersion']] = true;
+            }
+
+            $loaderType = $index['modLoader'] ?? null;
+
+            if (is_int($loaderType) && isset(self::MOD_LOADER_MAP[$loaderType])) {
+                $loaders[self::MOD_LOADER_MAP[$loaderType]] = true;
             }
         }
 
-        // game_versions derived from latestFilesIndexes (unique, order preserved).
-        $indexes = is_array($row['latestFilesIndexes'] ?? null) ? $row['latestFilesIndexes'] : [];
-        $gameVersions = [];
-        foreach ($indexes as $index) {
-            if (is_array($index) && is_string($index['gameVersion'] ?? null)) {
-                $gameVersions[$index['gameVersion']] = true;
-            }
+        // Bukkit-class projects never carry a mod loader; they all target the Bukkit API.
+        if ($projectType === 'plugin') {
+            $loaders = ['bukkit' => true, 'spigot' => true];
         }
 
         $logo = is_array($row['logo'] ?? null) ? $row['logo'] : [];
         $iconUrl = is_string($logo['thumbnailUrl'] ?? null) && $logo['thumbnailUrl'] !== ''
             ? $logo['thumbnailUrl']
-            : (is_string($logo['url'] ?? null) ? $logo['url'] : null);
+            : (is_string($logo['url'] ?? null) && $logo['url'] !== '' ? $logo['url'] : null);
 
         $links = is_array($row['links'] ?? null) ? $row['links'] : [];
         $pageUrl = is_string($links['websiteUrl'] ?? null) && $links['websiteUrl'] !== ''
             ? $links['websiteUrl']
             : null;
 
+        $authors = is_array($row['authors'] ?? null) ? $row['authors'] : [];
+        $firstAuthor = is_array($authors[0] ?? null) ? $authors[0] : [];
+
         $downloads = $row['downloadCount'] ?? 0;
         $likes = $row['thumbsUpCount'] ?? 0;
 
-        $updated = match (true) {
-            is_string($row['dateModified'] ?? null) && $row['dateModified'] !== '' => $row['dateModified'],
-            default => null,
-        };
+        $updated = is_string($row['dateModified'] ?? null) && $row['dateModified'] !== '' ? $row['dateModified'] : null;
 
         $id = $row['id'] ?? null;
 
         return [
             'source' => 'curseforge',
-            'id' => is_int($id) ? (string) $id : ((string) ($id ?? ($row['slug'] ?? ''))),
+            'id' => is_int($id) ? (string) $id : (string) ($id ?? ''),
             'slug' => is_string($row['slug'] ?? null) ? $row['slug'] : Str::slug($title),
             'title' => $title,
-            // CurseForge search rows have no author object; the class owner is unknown here.
-            'author' => '',
+            'author' => is_string($firstAuthor['name'] ?? null) ? $firstAuthor['name'] : '',
             'description' => $description,
-            'downloads' => is_int($downloads) ? $downloads : (int) $downloads,
-            'likes' => is_int($likes) ? $likes : (int) $likes,
+            'downloads' => is_numeric($downloads) ? (int) $downloads : 0,
+            'likes' => is_numeric($likes) ? (int) $likes : 0,
             'updated' => $updated,
             'icon_url' => $iconUrl,
             'page_url' => $pageUrl,
-            // Bukkit-family classes have no explicit loader chips when categories are sparse.
-            'loaders' => array_values($loaders),
+            'loaders' => array_keys($loaders),
             'game_versions' => array_keys($gameVersions),
             'project_type' => $projectType,
         ];

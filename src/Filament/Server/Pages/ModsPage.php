@@ -8,11 +8,8 @@ use App\Enums\TablerIcon;
 use BackedEnum;
 use UnitEnum;
 use Filament\Actions\Action;
-use Filament\Facades\Filament;
-use Filament\Notifications\Notification;
 use Filament\Pages\Page;
 use McToolkit\Filament\Server\Pages\Concerns\InteractsWithContent;
-use Throwable;
 
 /**
  * Mods — Modrinth + CurseForge catalog "with their dependencies" (demo parity),
@@ -22,9 +19,9 @@ use Throwable;
  * app/Enums/TablerIcon.php:4663) — deliberately distinct from PluginsPage's Puzzle.
  *
  * Blocker rule (demo blocker.bukkit_message parity): the callout renders when the
- * DETECTED loader is bukkit-family — proxy-only (velocity/waterfall/bungee) boxes
- * keep browsing but show no callout because their jar semantics differ from either
- * plugins or mods (documented deviation, honest copy concerns).
+ * DETECTED loader is bukkit-family, and installs are refused (UI and server-side) —
+ * proxy-only (velocity/waterfall/bungee) boxes keep browsing but show no callout
+ * because their jar semantics differ from either plugins or mods.
  */
 final class ModsPage extends Page
 {
@@ -39,19 +36,23 @@ final class ModsPage extends Page
 
     protected string $view = 'minecraft-toolkit::server.mods';
 
+
+    /** Namespaced URL: /server/{uuid_short}/mc-toolkit/mods (README "Feature pages"). */
+
+    protected static ?string $slug = 'mc-toolkit/mods';
+
     /** Livewire event emitted by the shared detection-banner's re-detect control. */
     protected $listeners = ['mc-toolkit.redetect' => 'redetect'];
 
+    /**
+     * 'use' + 'content' on a server outside any conflict state. Filament re-runs this on
+     * every Livewire request of the page (CanAuthorizeAccess::hydrateCanAuthorizeAccess).
+     */
     public static function canAccess(): bool
     {
         return parent::canAccess()
             && (bool) config('minecraft-toolkit.pages.enabled.mods', true)
-            && user()?->can('minecraft-toolkit.use', Filament::getTenant());
-    }
-
-    protected function authorizeAccess(): void
-    {
-        abort_unless(user()?->can('minecraft-toolkit.content', Filament::getTenant()), 403);
+            && static::canAccessContentCatalog();
     }
 
     public function getTitle(): string
@@ -75,7 +76,7 @@ final class ModsPage extends Page
             Action::make('refresh')
                 ->label(trans('minecraft-toolkit::common.buttons.refresh'))
                 ->icon(TablerIcon::Refresh)
-                ->action(fn () => $this->safeRefresh()),
+                ->action(fn () => $this->refreshContent()),
         ];
     }
 
@@ -115,21 +116,5 @@ final class ModsPage extends Page
             'message' => trans('minecraft-toolkit::pages.mods.blocker.bukkit_message'),
             'versions_url' => $this->versionsUrl(),
         ];
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  Error-shielded refresh                                             */
-    /* ------------------------------------------------------------------ */
-
-    private function safeRefresh(): void
-    {
-        try {
-            $this->refresh();
-        } catch (Throwable) {
-            Notification::make()
-                ->title(trans('minecraft-toolkit::banner.failures.gateway_down'))
-                ->danger()
-                ->send();
-        }
     }
 }

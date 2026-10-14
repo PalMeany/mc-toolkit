@@ -3,6 +3,9 @@
 return [
     'statuses' => [
         'stopped_required' => 'The server must be offline to do this.',
+        'running_required' => 'The server must be running to do this.',
+        'server_unavailable' => 'This server is suspended, being transferred or restoring a backup right now.',
+        'invalid_command' => 'That command contains characters the console cannot take.',
         'wings_502' => 'The node did not answer properly — make sure the server can run commands right now.',
         'download_failed' => 'The download could not be completed. Try again in a moment.',
         'unpack_failed' => 'The archive could not be unpacked by the node.',

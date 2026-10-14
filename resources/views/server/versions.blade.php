@@ -21,7 +21,7 @@
 
     {{-- ------------------------------------------------------- detection banner --}}
     <x-dynamic-component
-        :component="'minecraft-toolkit::components.detection-banner'"
+        :component="'minecraft-toolkit::detection-banner'"
         :software="$profile ?? []"
     />
 
@@ -43,7 +43,7 @@
     <div class="flex flex-wrap items-center gap-x-2 gap-y-2">
         @foreach ($buckets as $b)
             <button type="button"
-                    wire:click="$set('bucket', '{{ $b }}')"
+                    wire:click="$set('bucket', {{ \Illuminate\Support\Js::from($b) }})"
                     class="{{ $tabBtn }} @if (($bucket ?? 'recommended') === $b)
                                bg-primary-600 text-white shadow-sm hover:bg-primary-500
                            @else
@@ -58,7 +58,7 @@
     <div class="-mx-1 flex flex-wrap gap-x-2 gap-y-2 px-1">
         @forelse ($this->typeChips as $t)
             <button type="button"
-                    wire:click="$set('type', '{{ $t['key'] }}')"
+                    wire:click="$set('type', {{ \Illuminate\Support\Js::from($t['key']) }})"
                     class="inline-flex items-center gap-x-1.5 rounded-lg px-3 py-1.5 text-sm font-medium ring-1 ring-inset transition duration-75
                            @if (($type ?? '') === $t['key'])
                                bg-primary-50 text-primary-700 ring-primary-600/25 dark:bg-primary-400/10 dark:text-primary-300 dark:ring-primary-400/30
@@ -143,12 +143,12 @@
                     <x-filament::button
                         :color="'primary'"
                         :size="'sm'"
-                        {{-- $this->type = selected catalog type id (PAPER…); the row's own
-                             `type` field is McJars' RELEASE|SNAPSHOT|BETA release kind and
-                             would build an invalid /types/{release-kind}/… URL --}}
-                        wire:click="askInstall('{{ $this->type }}', '{{ $row['id'] }}')"
+                        {{-- Only the version id travels: the page pairs it with the selected
+                             catalog type itself and ignores ids it did not list. Js::from()
+                             is the @js() equivalent usable inside component attributes. --}}
+                        wire:click="askInstall({{ \Illuminate\Support\Js::from($row['id']) }})"
                         wire:loading.attr="disabled"
-                        wire:target="runInstall(), askInstall()"
+                        wire:target="runInstall, askInstall"
                         :disabled="$busy"
                     >
                         {{ __('minecraft-toolkit::common.buttons.install') }}
@@ -162,7 +162,8 @@
             @endforelse
         </ul>
 
-        @if ((count($this->versions) < $total) && count($this->versions) > 0)
+        {{-- $hasMore follows the upstream pagination; the release/snapshot filter runs per page --}}
+        @if ($hasMore)
             <div class="border-t border-gray-200 p-4 dark:border-white/10">
                 <x-filament::button
                     :color="'gray'"
@@ -173,9 +174,7 @@
                     wire:loading.attr="disabled"
                     wire:target="showMore"
                 >
-                    @php($showMoreKey = 'minecraft-toolkit::pages.versions.show_more')
-                    @php($showMore = __($showMoreKey))
-                    {{ $showMore === $showMoreKey ? 'Show more' : $showMore }}
+                    {{ __('minecraft-toolkit::pages.versions.show_more') }}
                 </x-filament::button>
             </div>
         @endif
@@ -197,19 +196,23 @@
                     {{ __('minecraft-toolkit::pages.versions.install.body') }}
                 </p>
 
+                @php
+                    $canBackup = $this->canBackup();
+                @endphp
+
                 <div class="mt-5 space-y-4">
                     {{-- backup first --}}
                     <label for="mct-backup-first" class="block">
                         <span class="flex items-start gap-x-3">
                             <input id="mct-backup-first" type="checkbox"
                                    wire:model="backupFirst"
-                                   @unless (canBackup()) disabled @endunless
+                                   @unless ($canBackup) disabled @endunless
                                    class="mt-0.5 size-4 rounded ring-1 ring-gray-950/10 accent-primary-600 dark:ring-white/20" />
                             <span class="text-sm text-gray-950 dark:text-white">
                                 {{ __('minecraft-toolkit::pages.versions.install.backup_first') }}
                             </span>
                         </span>
-                        @unless (canBackup())
+                        @unless ($canBackup)
                             <span class="ml-7 mt-1 block text-xs text-gray-400 dark:text-gray-500">
                                 {{ __('minecraft-toolkit::pages.versions.backup_unavailable') }}
                             </span>
@@ -247,7 +250,7 @@
                         size="sm"
                         wire:click="runInstall()"
                         wire:loading.attr="disabled"
-                        wire:target="runInstall()"
+                        wire:target="runInstall"
                         :disabled="$busy"
                     >
                         {{ __('minecraft-toolkit::common.buttons.install') }}
@@ -258,7 +261,7 @@
     @endif
 
     {{-- busy overlay spinner --}}
-    <div wire:loading wire:target="runInstall()" class="fixed inset-x-0 bottom-6 z-50 flex justify-center">
+    <div wire:loading wire:target="runInstall" class="fixed inset-x-0 bottom-6 z-50 flex justify-center">
         <span class="{{ $chip }} shadow-lg">…</span>
     </div>
 </x-filament-panels::page>

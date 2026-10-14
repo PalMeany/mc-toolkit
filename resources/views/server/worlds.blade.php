@@ -21,11 +21,10 @@
 
 <x-filament-panels::page>
     @php
-        use Illuminate\Support\Carbon;
-
-        $server = \Filament\Facades\Filament::getTenant();
-        $canManage = $server !== null && user()?->can('minecraft-toolkit.manage', $server);
-        $canAdminister = $server !== null && user()?->can('minecraft-toolkit.administer', $server);
+        // No `use` imports here: this block compiles inside the page component's
+        // `if (...):` wrapper, where PHP only accepts fully-qualified names.
+        $canManage = $this->allows('manage');
+        $canAdminister = $this->allows('administer');
 
         $chipNeutral = 'inline-flex items-center justify-center rounded-md bg-gray-50 px-2 py-0.5 '
             .'text-xs font-medium text-gray-600 ring-1 ring-inset ring-gray-600/10 '
@@ -67,7 +66,7 @@
             }
 
             try {
-                return 'Played '.Carbon::parse($iso)->translatedFormat('M j, Y'); // lang gap #worlds.meta.played
+                return 'Played '.\Illuminate\Support\Carbon::parse($iso)->translatedFormat('M j, Y'); // lang gap #worlds.meta.played
             } catch (\Throwable) {
                 return null;
             }
@@ -76,7 +75,7 @@
 
     {{-- Detection banner pinned top of every toolkit page --}}
     <x-dynamic-component
-        :component="'minecraft-toolkit::components.detection-banner'"
+        :component="'minecraft-toolkit::detection-banner'"
         :software="$detection"
     />
 
@@ -114,7 +113,7 @@
     <div class="relative flex flex-col rounded-xl bg-white shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
         <div class="flex flex-col gap-3 border-b border-gray-200 p-4 sm:flex-row sm:items-center sm:justify-between sm:px-6 dark:border-white/10">
             <span class="text-sm font-semibold text-gray-950 dark:text-white">
-                {{ __('minecraft-toolkit::pages.worlds.title') }} {{ count($worlds) }} {{-- lang gap #worlds.counter }}
+                {{ __('minecraft-toolkit::pages.worlds.title') }} {{ count($worlds) }} {{-- lang gap #worlds.counter --}}
             </span>
         </div>
 
@@ -234,7 +233,7 @@
                 </div>
 
                 <p class="text-sm text-gray-500 dark:text-gray-400">
-                    {{ __('minecraft-toolkit::pages.worlds.rows.part_of_default') }}
+                    {{ __('minecraft-toolkit::pages.worlds.reset_note') }}
                 </p>
 
                 <ul class="max-h-48 space-y-1 overflow-y-auto font-mono text-xs text-gray-700 dark:text-gray-300">

@@ -2,7 +2,7 @@
     Minecraft Toolkit — Properties page (server panel).
 
     Pairs with McToolkit\Filament\Server\Pages\PropertiesPage:
-      - detection banner pinned top, loader-family warning callout beneath it,
+      - detection banner pinned top, proxy / unknown-software / node-down callout beneath it,
       - Alpine chip filter row (visibleGroup drives per-section x-show attrs),
       - debounced live search bound to $search,
       - ONE big InteractsWithForms form split into Sections per group,
@@ -16,14 +16,14 @@
     {{-- Detection banner (parity item on every toolkit page)             --}}
     {{-- ------------------------------------------------------------------}}
     <x-dynamic-component
-        :component="'minecraft-toolkit::components.detection-banner'"
+        :component="'minecraft-toolkit::detection-banner'"
         :software="$this->detection ?? []"
     />
 
-    @if ($this->showLoaderWarning)
+    @if (filled($this->loaderWarning))
         <x-filament::callout color="warning" :icon="'tabler-alert-triangle'">
             <x-slot name="description">
-                {{ __('minecraft-toolkit::banner.failures.not_minecraft') }}
+                {{ $this->loaderWarning }}
             </x-slot>
         </x-filament::callout>
     @endif

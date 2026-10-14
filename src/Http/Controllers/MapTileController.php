@@ -7,43 +7,58 @@ namespace McToolkit\Http\Controllers;
 use App\Models\Server;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use McToolkit\Services\Maps\MapTileService;
+use McToolkit\Services\Worlds\WorldsService;
 
 /**
  * Returns one top-down map tile as JSON.
  *
- * GET /server/{uuid_short}/mc-toolkit/map/tile?world={dir}&rx={int}&rz={int}
+ * GET /server/{uuid_short}/mc-toolkit/map/tile?world={dir}&dim={overworld|nether|end}&rx={int}&rz={int}&v={mtime}
  *
- * The renderer (McToolkit\Services\Maps\MapTileService, wave-B) may not exist yet
- * during rolling deploys — until the class is present this endpoint degrades to a 503
- * JSON body instead of crashing. Once present it simply proxies
- * MapTileService::renderRegion() output.
+ * `world` is the world folder name exactly as listed (any character but path
+ * separators / dot segments), `dim` picks the dimension inside it, `v` is the region
+ * file's mtime from the page listing (part of the render cache key, 0 when unknown).
+ *
+ * Response shape: {tile: {width, height, pixels(base64 RGBA), originX, originZ, …}|null}.
+ * A `null` tile with HTTP 200 means "nothing to draw here" and is final for the client;
+ * 4xx/5xx answers carry {error} and the client backs off.
  */
 final class MapTileController
 {
-    /** Default top-of-view Y for renders when no explicit level is requested. */
-    private const DEFAULT_Y_RANGE_TOP = 320;
-
     public function __invoke(Request $request, string $uuid_short): JsonResponse
     {
         $server = Server::query()->where('uuid_short', $uuid_short)->firstOrFail();
 
+        $user = $request->user();
+
         abort_unless(
-            user()?->can('minecraft-toolkit.map', $server) && user()?->can('minecraft-toolkit.use', $server),
+            $user !== null
+                && $user->can('minecraft-toolkit.use', $server)
+                && $user->can('minecraft-toolkit.map', $server),
             403,
         );
 
-        if (! class_exists(\McToolkit\Services\Maps\MapTileService::class)) {
+        if ($server->isInConflictState()) {
             return response()->json([
                 'tile' => null,
-                'error' => trans('minecraft-toolkit::errors.statuses.service_unavailable'),
-            ], 503);
+                'error' => trans('minecraft-toolkit::errors.statuses.server_unavailable'),
+            ], 409);
         }
 
-        $world = basename((string) $request->query('world', ''));
-        $regionX = (int) $request->query('rx', '0');
-        $regionZ = (int) $request->query('rz', '0');
+        $world = $request->query('world');
+        $dimension = $request->query('dim', 'overworld');
+        $regionX = filter_var($request->query('rx'), FILTER_VALIDATE_INT);
+        $regionZ = filter_var($request->query('rz'), FILTER_VALIDATE_INT);
+        $mtime = filter_var($request->query('v', '0'), FILTER_VALIDATE_INT);
 
-        if ($world === '') {
+        if (! is_string($world)
+            || ! WorldsService::isSafeDirectoryName($world)
+            || ! is_string($dimension)
+            || ! in_array($dimension, MapTileService::DIMENSIONS, true)
+            || ! is_int($regionX)
+            || ! is_int($regionZ)
+            || abs($regionX) > MapTileService::MAX_REGION_COORDINATE
+            || abs($regionZ) > MapTileService::MAX_REGION_COORDINATE) {
             return response()->json([
                 'tile' => null,
                 'error' => trans('minecraft-toolkit::errors.statuses.download_failed'),
@@ -51,8 +66,14 @@ final class MapTileController
         }
 
         try {
-            $tile = app(\McToolkit\Services\Maps\MapTileService::class)
-                ->renderRegion($server, $world, $regionX, $regionZ, self::DEFAULT_Y_RANGE_TOP);
+            $tile = app(MapTileService::class)->renderRegion(
+                $server,
+                $world,
+                $dimension,
+                $regionX,
+                $regionZ,
+                is_int($mtime) ? max(0, $mtime) : 0,
+            );
         } catch (\Throwable $exception) {
             report($exception);
 
@@ -62,7 +83,6 @@ final class MapTileController
             ], 502);
         }
 
-        // shape: {width: int, height: int, pixels: string(base64 rgba)} — fully scalar-safe JSON.
         return response()->json([
             'tile' => $tile,
         ]);

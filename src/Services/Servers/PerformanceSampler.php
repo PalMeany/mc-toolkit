@@ -296,7 +296,10 @@ final class PerformanceSampler
      */
     private function averageTriple(array $bridge): ?array
     {
-        $container = self::firstArray($bridge, ['tps_avg', 'averages', 'tps_averages', 'avg_tps']);
+        // firstArray() reports "nothing found" as [], never null — normalize so the
+        // flat fallbacks below actually kick in for payloads without the nesting level.
+        $found = self::firstArray($bridge, ['tps_avg', 'averages', 'tps_averages', 'avg_tps']);
+        $container = $found === [] ? null : $found;
 
         $resolve = function (?array $base, array $slots): ?float {
             return $base === null ? null : self::firstNumeric($base, $slots, 0.0, self::TPS_CLAMP_MAX);
@@ -476,9 +479,9 @@ final class PerformanceSampler
     }
 
     /**
-     * First nested array under any of the listed keys.
+     * First nested array under any of the listed keys; [] when none is present.
      *
-     * @return list<mixed>
+     * @return array<array-key, mixed>
      */
     private static function firstArray(array $data, array $keys): array
     {

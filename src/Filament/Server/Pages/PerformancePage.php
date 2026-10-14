@@ -46,6 +46,11 @@ final class PerformancePage extends Page
 
     protected string $view = 'minecraft-toolkit::server.performance';
 
+
+    /** Namespaced URL: /server/{uuid_short}/mc-toolkit/performance (README "Feature pages"). */
+
+    protected static ?string $slug = 'mc-toolkit/performance';
+
     /**
      * Livewire-managed sample payloads (all serializable arrays).
      */
@@ -66,21 +71,32 @@ final class PerformancePage extends Page
 
     public function mount(): void
     {
-        $this->authorizeAccess();
-
         $this->reloadData();
     }
 
+    /**
+     * Single access gate. Filament runs it on mount AND on every later Livewire request
+     * (CanAuthorizeAccess::mount/hydrate hooks), so tick()/refresh() are covered too.
+     * Includes the core conflict-state lock (BlockAccessInConflict parity — that trait's
+     * own canAccess would be shadowed by this one).
+     */
     public static function canAccess(): bool
     {
-        return parent::canAccess()
-            && (bool) config('minecraft-toolkit.pages.enabled.performance', true)
-            && user()?->can('minecraft-toolkit.use', Filament::getTenant());
-    }
+        if (! (bool) config('minecraft-toolkit.pages.enabled.performance', true)) {
+            return false;
+        }
 
-    protected function authorizeAccess(): void
-    {
-        abort_unless(user()?->can('minecraft-toolkit.use', Filament::getTenant()), 403);
+        $server = Filament::getTenant();
+
+        if (! $server instanceof Server || $server->isInConflictState()) {
+            return false;
+        }
+
+        $user = user();
+
+        return parent::canAccess()
+            && $user !== null
+            && $user->can('minecraft-toolkit.use', $server);
     }
 
     public function getTitle(): string
@@ -119,8 +135,6 @@ final class PerformancePage extends Page
      */
     public function tick(): void
     {
-        $this->authorizeAccess();
-
         try {
             $this->reloadData();
         } catch (Throwable) {
@@ -134,8 +148,6 @@ final class PerformancePage extends Page
      */
     public function refresh(): void
     {
-        $this->authorizeAccess();
-
         try {
             $this->reloadData(force: true);
         } catch (Throwable) {

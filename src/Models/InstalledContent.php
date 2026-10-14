@@ -70,4 +70,27 @@ class InstalledContent extends Model
     {
         return $query->where('kind', $kind);
     }
+
+    /**
+     * Whether this row is one file delivered by a modpack (its project_id is the PACK's id,
+     * so it must never be matched, updated or retired as a standalone project).
+     */
+    public function isPackChild(): bool
+    {
+        return is_array($this->dependencies) && is_string($this->dependencies['pack'] ?? null);
+    }
+
+    /** Human title recorded at install time (pack name for pack children), '' when unknown. */
+    public function displayTitle(): string
+    {
+        $deps = is_array($this->dependencies) ? $this->dependencies : [];
+
+        foreach (['title', 'pack'] as $key) {
+            if (is_string($deps[$key] ?? null) && trim($deps[$key]) !== '') {
+                return trim($deps[$key]);
+            }
+        }
+
+        return '';
+    }
 }

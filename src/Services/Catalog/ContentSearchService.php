@@ -16,17 +16,21 @@ use McToolkit\Services\Catalog\Registries\SpigetService;
  *
  * Contract signature (frozen):
  *
- *   search(kind plugins|mods|modpacks, source?, q, page, compat(array{loader,mcVersion})?)
+ *   search(kind plugins|mods|modpacks, source?, q, page, compat(array{loader,mc_version})?)
  *   → ['items'=>[shape], 'pages'=>?int total, 'sources_used'=>[], 'sources_skipped'=>[]]
  *
  * Every item is normalized to the contract shape
  * ['source','id','slug','title','author','description','downloads','likes','updated',
  *  'icon_url','page_url','loaders','game_versions','project_type'] plus a computed
  * boolean `compatible` (see below).
+ *
+ * Ordering: each registry answers in its own relevance order, so several sources are
+ * merged round-robin (1st of each, then 2nd of each, …) instead of re-sorting — the
+ * pages' "Downloads" / "Newest" sorts are applied on top of that by the caller.
  */
 final class ContentSearchService
 {
-    /** Enabled sources per kind (order = merge precedence when downloads tie). */
+    /** Enabled sources per kind (order = round-robin merge order). */
     private const SOURCES = [
         'plugins' => ['modrinth', 'hangar', 'spigot', 'curseforge'],
         'mods' => ['modrinth', 'curseforge'],
@@ -61,6 +65,9 @@ final class ContentSearchService
 
         if ($source !== null) {
             $requested = strtolower(trim($source));
+            // Spiget items carry 'spigotmc' while the chip key is 'spigot'.
+            $requested = $requested === 'spigotmc' ? 'spigot' : $requested;
+
             throw_unless(in_array($requested, $wanted, true), new \InvalidArgumentException(
                 "Source [{$requested}] does not serve the {$kind} catalog."
             ));
@@ -68,7 +75,7 @@ final class ContentSearchService
             $wanted = [$requested];
         }
 
-        $items = [];
+        $perSource = [];
         $pagesMax = 0;
         $used = [];
         $skipped = [];
@@ -94,16 +101,18 @@ final class ContentSearchService
                 continue;
             }
 
+            $bucket = [];
+
             foreach ($result['items'] as $item) {
                 if (!is_array($item)) {
                     continue;
                 }
 
-                $item['compatible'] ??= true;
                 $item['compatible'] = $this->computeCompatible($item, $compat);
-                $items[] = $item;
+                $bucket[] = $item;
             }
 
+            $perSource[] = $bucket;
             $used[] = $one;
 
             if (is_int($result['pages']) && $result['pages'] > $pagesMax) {
@@ -111,16 +120,66 @@ final class ContentSearchService
             }
         }
 
-        usort($items, fn (array $a, array $b): int => ((int) ($b['downloads'] ?? 0)) <=> ((int) ($a['downloads'] ?? 0)));
-
         return [
-            'items' => $items,
+            'items' => self::interleave($perSource),
             // Merged pagination is approximate when several registries contribute at once:
-            // the loosest bound across used sources keeps "next page" always available.
-            'pages' => $pagesMax > 0 || count($used) > 1 ? max(1, $pagesMax) : null,
+            // the loosest bound across used sources keeps "next page" available while any has more.
+            'pages' => $pagesMax > 0 ? $pagesMax : null,
             'sources_used' => $used,
             'sources_skipped' => $skipped,
         ];
+    }
+
+    /**
+     * Whether one advertised game version covers the server's version.
+     *
+     * Exact match, plus line-level tags: "1.21.x" and the major-only "1.21" (SpigotMC's
+     * testedVersions only ever lists major lines) cover every 1.21.* patch release.
+     */
+    public static function gameVersionMatches(string $candidate, string $server): bool
+    {
+        $candidate = strtolower(trim($candidate));
+        $server = strtolower(trim($server));
+
+        if ($candidate === '' || $server === '') {
+            return false;
+        }
+
+        if ($candidate === $server) {
+            return true;
+        }
+
+        $line = str_ends_with($candidate, '.x') ? substr($candidate, 0, -2) : $candidate;
+
+        // Only a two-segment line ("1.21") may stand for its patches; "1.21.1" never covers "1.21.10".
+        if (substr_count($line, '.') !== 1) {
+            return false;
+        }
+
+        return str_starts_with($server.'.', $line.'.');
+    }
+
+    /**
+     * Server-family map for local compat matching. Bukkit-style loaders, fabric/quilt pairs,
+     * forge lineage and proxies collapse into families so e.g. a paper plugin counts as
+     * compatible on purpur/folia servers etc.
+     *
+     * @return list<string>
+     */
+    public static function loadersEquivalent(string $loader): array
+    {
+        $loader = strtolower(trim($loader));
+
+        return match (true) {
+            in_array($loader, ['spigot', 'paper', 'bukkit', 'purpur', 'folia', 'leaves', 'pufferfish', 'mohist', 'arclight'], true) => [
+                'paper', 'spigot', 'bukkit', 'purpur', 'folia',
+            ],
+            in_array($loader, ['fabric', 'quilt'], true) => ['fabric', 'quilt'],
+            in_array($loader, ['forge', 'neoforge'], true) => ['forge', 'neoforge'],
+            in_array($loader, ['velocity', 'waterfall', 'bungeecord'], true) => ['velocity', 'waterfall', 'bungeecord'],
+            $loader !== '' && $loader !== 'unknown' && $loader !== 'vanilla' => [$loader],
+            default => [],
+        };
     }
 
     /**
@@ -137,7 +196,13 @@ final class ContentSearchService
             'modrinth' => $this->searchModrinth($kind, $q, $page, $loader, $mcVersion),
             'spigot' => $this->spigot->search($q, $page),
             'hangar' => $this->hangar->search($q, $loader, $page),
-            'curseforge' => $this->curseForge->search($mcVersion, self::classIdForKind($kind), $page),
+            'curseforge' => $this->curseForge->search(
+                $mcVersion,
+                self::classIdForKind($kind),
+                $page,
+                $q,
+                $loader !== '' ? CurseForgeService::modLoaderTypeFor($loader) : null,
+            ),
             default => throw new \LogicException("Unknown registry [{$source}]."),
         };
     }
@@ -151,10 +216,12 @@ final class ContentSearchService
         };
 
         $facets = [];
+        $equivalents = self::loadersEquivalent($loader);
 
-        // OR-group per selected loader: [["categories:fabric"], ["categories:quilt"]] == fabric OR quilt.
-        foreach (self::loadersEquivalent($loader) as $equivalent) {
-            $facets[] = ["categories:{$equivalent}"];
+        // ONE facet group = OR: [["categories:paper","categories:spigot",…]] means "any of them".
+        // (Separate groups would AND every loader together and match nothing.)
+        if ($equivalents !== []) {
+            $facets[] = array_map(fn (string $equivalent): string => "categories:{$equivalent}", $equivalents);
         }
 
         if ($mcVersion !== '') {
@@ -165,38 +232,41 @@ final class ContentSearchService
     }
 
     /**
-     * Server-family map for local compat matching. Bukkit-style loaders, fabric/quilt pairs,
-     * forge lineage and proxies collapse into families so e.g. a paper plugin counts as
-     * compatible on purpur/folia servers etc.
-     *
-     * @return list<string>
-     */
-    private static function loadersEquivalent(string $loader): array
-    {
-        $loader = strtolower(trim($loader));
-
-        return match (true) {
-            in_array($loader, ['spigot', 'paper', 'bukkit', 'purpur', 'folia', 'leaves', 'pufferfish', 'mohist', 'arclight', 'sponge'], true) => [
-                'paper', 'spigot', 'bukkit', 'purpur', 'folia', 'leaves', 'pufferfish', 'mohist', 'arclight', 'sponge',
-            ],
-            in_array($loader, ['fabric', 'quilt'], true) => ['fabric', 'quilt'],
-            in_array($loader, ['forge', 'neoforge'], true) => ['forge', 'neoforge'],
-            in_array($loader, ['velocity', 'waterfall', 'bungeecord'], true) => ['velocity', 'waterfall', 'bungeecord'],
-            $loader !== '' && $loader !== 'unknown' => [$loader],
-            default => [],
-        };
-    }
-
-    /**
-     * CurseForge class ids for each content kind.
+     * CurseForge class ids for each content kind (432 = Minecraft).
      */
     private static function classIdForKind(string $kind): string
     {
         return match ($kind) {
-            'plugins' => '12',
-            'modpacks' => '4471',
-            default => '6',
+            'plugins' => '5',     // Bukkit Plugins
+            'modpacks' => '4471', // Modpacks
+            default => '6',       // Mods
         };
+    }
+
+    /**
+     * Round-robin merge keeping every source's own relevance order.
+     *
+     * @param  list<list<array<string, mixed>>>  $buckets
+     * @return list<array<string, mixed>>
+     */
+    private static function interleave(array $buckets): array
+    {
+        $merged = [];
+        $longest = 0;
+
+        foreach ($buckets as $bucket) {
+            $longest = max($longest, count($bucket));
+        }
+
+        for ($i = 0; $i < $longest; $i++) {
+            foreach ($buckets as $bucket) {
+                if (isset($bucket[$i])) {
+                    $merged[] = $bucket[$i];
+                }
+            }
+        }
+
+        return $merged;
     }
 
     /**
@@ -204,14 +274,10 @@ final class ContentSearchService
      *
      * Semantics:
      *  - no compat info given -> true (nothing constrained);
-     *  - loader family intersection must be non-empty AND (when mc version known)
-     *    `game_versions` includes it via plain string inclusion (exact match or prefix of
-     *    range-ish strings like "1.21.x"). Mods/plugins that don't publish versions stay
-     *    compatible=false only when their loader mismatches; MC-version matching is skipped
-     *    for empty game_versions lists because most registries omit them.
-     *
-     * Known limitation (documented in handoff notes): modrinth rarely lists ranges; only
-     * exact/prefix string containment is checked.
+     *  - the item's loaders must intersect the server family — an item that declares no
+     *    loader at all is unknown, not incompatible;
+     *  - with a known server version, one of `game_versions` must cover it
+     *    ({@see self::gameVersionMatches()}); untagged items stay compatible.
      *
      * @param  array<string, mixed>  $item
      */
@@ -222,13 +288,14 @@ final class ContentSearchService
         }
 
         $family = self::loadersEquivalent((string) ($compat['loader'] ?? ''));
-        $itemLoaders = array_map('strtolower', is_array($item['loaders'] ?? null) ? $item['loaders'] : []);
+        $itemLoaders = array_map(
+            'strtolower',
+            array_filter(is_array($item['loaders'] ?? null) ? $item['loaders'] : [], fn ($l) => is_string($l)),
+        );
 
-        if ($family !== [] && count(array_intersect($family, $itemLoaders)) === 0) {
+        if ($family !== [] && $itemLoaders !== [] && array_intersect($family, $itemLoaders) === []) {
             return false;
         }
-
-        // Loader unknown -> it cannot invalidate anything; fall through to MC-version check.
 
         $mcVersion = trim((string) ($compat['mc_version'] ?? ''));
 
@@ -244,18 +311,7 @@ final class ContentSearchService
         }
 
         foreach ($versions as $version) {
-            if (!is_string($version)) {
-                continue;
-            }
-
-            $candidate = strtolower(trim($version));
-
-            if ($candidate === $mcVersion || str_starts_with($candidate, $mcVersion.'.') || str_starts_with($candidate, $mcVersion.'-')) {
-                return true;
-            }
-
-            // Prefix entries like "1.21.x" / "1.21" cover newer patches too.
-            if (str_ends_with($candidate, '.x') && str_starts_with($mcVersion.'.', substr($candidate, 0, -2))) {
+            if (is_string($version) && self::gameVersionMatches($version, $mcVersion)) {
                 return true;
             }
         }

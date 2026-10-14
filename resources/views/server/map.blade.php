@@ -2,12 +2,12 @@
 <x-filament-panels::page>
     {{-- Detection summary pinned to the top of EVERY toolkit page ------------------- --}}
     <x-dynamic-component
-        :component="'minecraft-toolkit::components.detection-banner'"
+        :component="'minecraft-toolkit::detection-banner'"
         :software="$software"
     />
 
     <p class="text-sm leading-6 text-gray-500 dark:text-gray-400">
-        {{ __('minecraft-toolkit::pages.map.render_note', ['world' => $selectedWorld]) }}
+        {{ __('minecraft-toolkit::pages.map.render_note', ['world' => $this->selectedLabel()]) }}
     </p>
 
     <div class="mt-4 grid items-start gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
@@ -16,7 +16,7 @@
         {{-- =========================================================== --}}
         <div class="flex flex-col gap-4">
 
-            {{-- Worlds ---------------------------------------------------- --}}
+            {{-- Map targets (world folder × dimension) -------------------- --}}
             <div class="rounded-xl bg-white shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
                 <div class="border-b border-gray-200 px-4 py-3 dark:border-white/10">
                     <p class="flex items-center justify-between text-sm font-semibold text-gray-950 dark:text-white">
@@ -31,24 +31,24 @@
                     @forelse ($worlds as $world)
                         <button
                             type="button"
-                            wire:click="selectWorld('{{ e($world['name']) }}')"
+                            wire:key="map-target-{{ md5($world['key']) }}"
+                            wire:click="selectWorld(@js($world['key']))"
                             @class([
                                 'flex w-full items-center justify-between gap-2 px-4 py-2.5 text-start text-sm transition',
-                                'bg-gray-50 dark:bg-white/5' => $selectedWorld === $world['name'],
-                                'hover:bg-gray-50 dark:hover:bg-white/5' => $selectedWorld !== $world['name'],
+                                'bg-gray-50 dark:bg-white/5' => $selectedWorld === $world['key'],
+                                'hover:bg-gray-50 dark:hover:bg-white/5' => $selectedWorld !== $world['key'],
                             ])
                         >
-                            <span class="inline-flex items-center gap-x-2 truncate">
+                            <span class="inline-flex min-w-0 items-center gap-x-2">
                                 <span
-                                    @class(['size-3.5 shrink-0 rounded-full ring-2' => true])
-                                    style="{{ 'background:'.'#f59e0b' }}"
-                                    wire:key="world-dot-{{ md5($world['name']) }}"
+                                    class="size-3.5 shrink-0 rounded-full ring-2 ring-white/10"
+                                    style="background: {{ ['overworld' => '#22c55e', 'nether' => '#ef4444', 'end' => '#a855f7'][$world['dimension']] ?? '#f59e0b' }}"
                                 ></span>
                                 <span class="truncate font-medium text-gray-950 dark:text-white">{{ $world['name'] }}</span>
                             </span>
 
                             <span class="shrink-0 text-xs font-medium text-gray-500 dark:text-gray-400">
-                                {{ ['overworld' => __('minecraft-toolkit::pages.worlds.title'), 'nether' => 'Nether', 'end' => 'End'][$world['dimension']] ?? __('minecraft-toolkit::pages.worlds.title') }}
+                                {{ __('minecraft-toolkit::pages.map.dimensions.'.$world['dimension']) }}
                             </span>
                         </button>
                     @empty
@@ -96,7 +96,7 @@
                         {{ __('minecraft-toolkit::pages.map.layers.markers') }}
                         <span class="ml-1 text-xs font-normal text-gray-500 dark:text-gray-400">({{ count($markers) }})</span>
                     </p>
-                    @if ($this->canManageMarkers())
+                    @if ($this->canManageMarkers() && $selectedWorld !== '')
                         {{-- opens the mounted `add_marker` Filament Action modal (schema fields) --}}
                         <x-filament::button
                             size="xs"
@@ -107,7 +107,7 @@
                     @endif
                 </div>
 
-                <ul class="divide-y divide-gray-200 dark:divide-white/10" wire:key="marker-list-{{ count($markers) }}">
+                <ul class="divide-y divide-gray-200 dark:divide-white/10" wire:key="marker-list-{{ md5($selectedWorld) }}-{{ count($markers) }}">
                     @forelse ($markers as $marker)
                         <li class="group flex items-center justify-between gap-2 px-4 py-2 hover:bg-gray-50 dark:hover:bg-white/5">
                             <span class="inline-flex min-w-0 items-center gap-x-2">
@@ -124,9 +124,9 @@
                                 <button
                                     type="button"
                                     class="{{ 'text-danger-600 opacity-0 transition group-hover:opacity-100 hover:opacity-100 focus:opacity-100' }}"
-                                    wire:click="deleteMarker({{ $marker['id'] }})"
-                                    :aria-label="__('minecraft-toolkit::common.buttons.close').' '.$marker['label']"
-                                    title="{{ __('minecraft-toolkit::common.buttons.close') }} — {{ $marker['label'] }}"
+                                    wire:click="deleteMarker({{ (int) $marker['id'] }})"
+                                    aria-label="{{ __('minecraft-toolkit::pages.map.delete_marker') }} — {{ $marker['label'] }}"
+                                    title="{{ __('minecraft-toolkit::pages.map.delete_marker') }} — {{ $marker['label'] }}"
                                 >
                                     <x-filament::icon icon="tabler-trash" class="h-4 w-4" />
                                 </button>
@@ -139,8 +139,8 @@
                     @endforelse
                 </ul>
 
-                @if ($this->canManageMarkers())
-                    {{-- marker creation moved into the mounted `add_marker` Action modal --}}
+                @if ($this->canManageMarkers() && $selectedWorld !== '')
+                    {{-- marker creation lives in the mounted `add_marker` Action modal --}}
                     <div class="border-t border-gray-200 p-4 dark:border-white/10">
                         <x-filament::button
                             size="sm"
@@ -169,7 +169,7 @@
                             <li class="flex items-center justify-between gap-2 px-4 py-2">
                                 <span class="inline-flex min-w-0 items-center gap-x-2">
                                     <img
-                                        src="https://mc-heads.net/avatar/{{ urlencode($pin['name']) }}/24"
+                                        src="https://mc-heads.net/avatar/{{ rawurlencode($pin['name']) }}/24"
                                         alt=""
                                         loading="lazy"
                                         decoding="async"
@@ -211,18 +211,36 @@
                 id="mct-mirror"
                 hidden
                 wire:poll.12s="refreshBridge"
-                data-world="{{ e($selectedWorld) }}"
+                data-target="{{ $selectedWorld }}"
+                data-world="{{ $this->selectedFolder() }}"
+                data-dim="{{ $this->currentDimension() }}"
                 data-epoch="{{ $tileEpoch }}"
                 data-follow="{{ $follow ? '1' : '0' }}"
                 data-show-spawn="{{ $showSpawn ? '1' : '0' }}"
                 data-show-border="{{ $showWorldBorder ? '1' : '0' }}"
                 data-spawn="{{ json_encode($this->spawnAnchor()) }}"
-
-                {{-- non-Livewire tile endpoint base consumed by the inline scheduler --}}
-                data-tile-base="{{ route('mc-toolkit.map.tile', ['uuid_short' => $this->server()->uuid_short]) }}"
+                data-tile-base="{{ $this->tileBaseUrl() }}"
                 data-time="{{ $gameTimeTicks ?? '' }}"
-                data-regions="{{ json_encode($regionMeta['regions']) }}"
+                data-regions="{{ json_encode($regionMeta['regions'] ?? []) }}"
             ></div>
+
+            {{-- Server-rendered pin feeds read by the canvas script (placed BEFORE it so the
+                 observer can attach on first load) ------------------------------------ --}}
+            <div id="mct-feeds" class="hidden" aria-hidden="true">
+                <div id="mct-player-feed">{{ json_encode(collect($pins)->map(fn ($pin) => [
+                    'kind' => 'player',
+                    'name' => $pin['name'],
+                    'wx' => $pin['x'],
+                    'wz' => $pin['z'],
+                ])->values()) }}</div>
+                <div id="mct-marker-feed">{{ json_encode(collect($markers)->map(fn ($marker) => [
+                    'kind' => 'marker',
+                    'name' => $marker['label'],
+                    'wx' => $marker['x'],
+                    'wz' => $marker['z'],
+                    'color' => $marker['color'] ?: '#fbbf24',
+                ])->values()) }}</div>
+            </div>
 
             <div class="flex flex-wrap items-center justify-between gap-2">
                 <x-filament::button
@@ -247,7 +265,8 @@
                 </x-filament::button>
             </div>
 
-            {{-- Stage: immune to Livewire morphs so the canvas/context survives polls --}}
+            {{-- Stage: the element itself and every script-owned child are wire:ignore'd so
+                 Livewire morphs (12 s poll, clicks) never reset the canvas or drop pins --}}
             <div
                 id="mct-map-stage"
                 wire:ignore.self
@@ -256,14 +275,16 @@
                 role="application"
                 aria-label="{{ __('minecraft-toolkit::pages.map.title') }}"
             >
-                <canvas id="mct-canvas" class="absolute inset-0 h-full w-full touch-none select-none"></canvas>
+                <canvas id="mct-canvas" wire:ignore wire:key="mct-canvas" class="absolute inset-0 h-full w-full touch-none select-none"></canvas>
 
                 {{-- player / marker overlay pins are injected here (absolute positioning) --}}
-                <div id="mct-pins-layer" class="pointer-events-none absolute inset-0"></div>
+                <div id="mct-pins-layer" wire:ignore wire:key="mct-pins-layer" class="pointer-events-none absolute inset-0"></div>
 
                 {{-- TIMECLOCK top-right ----------------------------------------- --}}
                 <div
                     id="mct-clock"
+                    wire:ignore
+                    wire:key="mct-clock"
                     class="{{ 'absolute end-3 top-3 rounded-md bg-gray-900/80 px-2 py-1 font-medium text-xs text-gray-100 backdrop-blur' }} dark:bg-gray-950/70"
                     aria-live="off"
                 >--:--</div>
@@ -271,6 +292,8 @@
                 {{-- LOCATION bottom-left chip (aria-live polite parity) ---------- --}}
                 <div
                     id="mct-location"
+                    wire:ignore
+                    wire:key="mct-location"
                     class="{{ 'absolute bottom-3 start-3 rounded-md bg-gray-900/80 px-2 py-1 font-medium text-xs tabular-nums text-gray-100 backdrop-blur' }} dark:bg-gray-950/70"
                     aria-live="polite"
                 >LOCATION</div>
@@ -278,6 +301,8 @@
                 {{-- busy indicator ---------------------------------------------- --}}
                 <div
                     id="mct-busy"
+                    wire:ignore
+                    wire:key="mct-busy"
                     class="pointer-events-none absolute end-3 bottom-3 hidden items-center gap-1 rounded-md bg-gray-900/80 px-2 py-1 text-xs text-gray-100 backdrop-blur dark:bg-gray-950/70"
                 >
                     <svg class="h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10" opacity="0.25"/><path d="M22 12a10 10 0 0 0-10-10"/></svg>
@@ -285,13 +310,13 @@
 
                 {{-- Under construction / zero regions explainer -------------- --}}
                 @if (count(data_get($regionMeta, 'regions', [])) === 0)
-                    <div class="absolute inset-0 grid place-items-center p-6">
+                    <div class="absolute inset-0 grid place-items-center p-6" wire:key="mct-empty-{{ md5($selectedWorld) }}">
                         <div class="max-w-sm rounded-xl bg-white p-6 text-center shadow-xl ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
                             <p class="font-semibold text-gray-950 dark:text-white">
                                 {{ __('minecraft-toolkit::common.empty.nothing_here') }}
                             </p>
                             <p class="mt-2 text-sm leading-6 text-gray-500 dark:text-gray-400">
-                                {{ __('minecraft-toolkit::pages.map.render_note', ['world' => $selectedWorld]) }}
+                                {{ __('minecraft-toolkit::pages.map.render_note', ['world' => $this->selectedLabel()]) }}
                             </p>
                         </div>
                     </div>
@@ -325,16 +350,17 @@
              * McToolkit\Services\Maps\*):
              *   blocksPerChunk   = 16
              *   chunks per region axis = 32  -> region covers 512 blocks
-             *   one rendered tile spans exactly chunkSpanForSanity chunks
              * ------------------------------------------------------------ */
-            const BLOCKS_PER_CHUNK = 16;
             const REGION_BLOCKS_AXIS = 512;
 
             const MIN_ZOOM = 0.25;          // wheel zoom clamp (task contract)
             const MAX_ZOOM = 4;
             const ZOOM_STEP = 1.15;         // wheel delta factor base
             const INITIAL_VISIBLE_SPAN_BLOCKS = 1024; // spawn-centered first fit
-            const TILE_CONCURRENCY = 3;     // BFS center-out worker pool budget
+            const TILE_CONCURRENCY = 3;     // center-out worker pool budget
+            const NETWORK_RETRY_MS = 15000; // back-off step after a transient network failure
+            const MAX_NETWORK_ATTEMPTS = 3; // then the tile stays fog until Redraw
+            const DEFAULT_RETRY_AFTER_S = 30; // 429 without a Retry-After header
             const WORLD_BORDER_HALF_BLOCKS = 30_000_000; // vanilla-border guess (documented)
             const MARKER_COLORS_DEFAULT = '#fbbf24';
             const FOG_HEX = '#0b0e14';
@@ -354,165 +380,236 @@
             const busyEl = stage.querySelector('#mct-busy');
             const mirror = document.getElementById('mct-mirror');
 
+            if (! canvas || ! pinsLayer) return;
+
             const dpr = () => Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
 
             let ctx = null;
             let rafHandle = 0;
-            let running = true;
+            let running = document.visibilityState !== 'hidden'; // RAF only while visible
+            let destroyed = false;                                // set once by teardown
             let resizeObserver = null;
             let mirrorObserver = null;
-            let pollTimer = 0;
+            let feedsObserver = null;
+            let resumeTimer = 0;
 
             /* ------------------------------------------------------------
              * View transform: pixels-per-block plus focus block coordinates.
              * ------------------------------------------------------------ */
             const view = {
-                ppb: 0.25,      // pixels per (rendered) block at zoom factor 1
+                ppb: 0.25,
                 centerX: 0,
                 centerZ: 0,
                 fitReady: false,
             };
 
-            const pointer = { down: false, moved: false, lastX: 0, lastY: 0 };
+            const pointer = { down: false, moved: false, lastX: 0, lastY: 0, lastClientX: 0, lastClientY: 0 };
 
             /* ------------------------------------------------------------
-             * Tiles + scheduler
+             * Tiles + scheduler. Keys embed the map target so tiles of two
+             * worlds/dimensions can never be mixed up. Every fetch carries the
+             * scheduler generation; results of an older generation are ignored.
              * ------------------------------------------------------------ */
-            const tileCache = new Map();         // "rx_rz" -> HTMLCanvasElement
-            const failedTiles = new Set();
-            const queue = [];                    // [{rx,rz,dist}]
+            const tileCache = new Map();    // "target|rx_rz" -> HTMLCanvasElement
+            const failedTiles = new Map();  // key -> { until: epoch ms, attempts }
+            const queue = [];               // [{rx, rz, v, dist}]
             const inflight = new Set();
             let aborter = new AbortController();
-
-            let currentWorld = mirror?.dataset.world || '';
-            let regionsList = [];
-            let currentEpoch = mirror?.dataset.epoch || '1';
+            let schedulerGen = 0;
+            let pausedUntil = 0;            // global pause after HTTP 429
 
             const parsedJson = (raw, fallback) => {
                 try { return JSON.parse(raw) ?? fallback; } catch (_) { return fallback; }
             };
 
-            const syncMirrorState = () => {
-                if (! mirror) return;
+            let currentTarget = mirror?.dataset.target || '';
+            let currentWorld = mirror?.dataset.world || '';
+            let currentDim = mirror?.dataset.dim || 'overworld';
+            let currentEpoch = mirror?.dataset.epoch || '1';
+            let regionsSignature = mirror?.dataset.regions || '[]';
+            let regionsList = (() => {
+                const parsed = parsedJson(regionsSignature, []);
+                return Array.isArray(parsed) ? parsed : [];
+            })();
 
-                if (mirror.dataset.world !== currentWorld) {
-                    currentWorld = mirror.dataset.world;
-                    resetScheduler();
-                }
-
-                const nextRegions = parsedJson(mirror.dataset.regions || '[]', []);
-                if (JSON.stringify(nextRegions) !== JSON.stringify(regionsList)) {
-                    regionsList = Array.isArray(nextRegions) ? nextRegions : [];
-                    resetScheduler();
-                }
-
-                if (mirror.dataset.epoch !== currentEpoch) {
-                    currentEpoch = mirror.dataset.epoch;
-                    resetScheduler(true);
-                }
-
-                syncAnnotations();
-            };
-
-            const resetScheduler = (hard = false) => {
-                if (hard) {
-                    tileCache.clear();
-                    failedTiles.clear();
-                    aborter.abort();
-                    aborter = new AbortController();
-                }
-
-                queue.length = 0;
-                rebuildQueue();
-            };
+            const tileKey = (rx, rz) => currentTarget + '|' + rx + '_' + rz;
 
             const focusRegion = () => ({
                 rx: Math.floor(view.centerX / REGION_BLOCKS_AXIS),
                 rz: Math.floor(view.centerZ / REGION_BLOCKS_AXIS),
             });
 
+            const updateBusy = () => {
+                if (! busyEl) return;
+                busyEl.classList.toggle('hidden', ! inflight.size);
+                busyEl.classList.toggle('inline-flex', !! inflight.size);
+            };
+
             const rebuildQueue = () => {
+                queue.length = 0;
+
                 if (! regionsList.length) return;
 
                 const focus = focusRegion();
-
-                queue.length = 0;
+                const now = Date.now();
 
                 for (const r of regionsList) {
-                    const key = r.rx + '_' + r.rz;
+                    const key = tileKey(r.rx, r.rz);
 
-                    if (tileCache.has(key) || failedTiles.has(key) || inflight.has(key)) continue;
+                    if (tileCache.has(key) || inflight.has(key)) continue;
 
-                    // BFS-style center-out distance ordering.
+                    const failure = failedTiles.get(key);
+                    if (failure && failure.until > now) continue;
+
                     const dx = r.rx - focus.rx;
                     const dz = r.rz - focus.rz;
-                    queue.push({ rx: r.rx, rz: r.rz, dist: dx*dx + dz*dz });
+                    queue.push({ rx: r.rx, rz: r.rz, v: Number(r.mtime) || 0, dist: dx * dx + dz * dz });
                 }
 
                 queue.sort((a, b) => a.dist - b.dist);
             };
 
-            const tileUrl = (rx, rz) => {
-                const base = mirror?.dataset.tileBase || '';
-                const url = new URL(base, window.location.href);
+            const tileUrl = (job) => {
+                const url = new URL(mirror?.dataset.tileBase || '', window.location.href);
                 url.searchParams.set('world', currentWorld);
-                url.searchParams.set('rx', String(rx));
-                url.searchParams.set('rz', String(rz));
-                url.searchParams.set('epoch', String(currentEpoch)); // client cache-bust passthrough
+                url.searchParams.set('dim', currentDim);
+                url.searchParams.set('rx', String(job.rx));
+                url.searchParams.set('rz', String(job.rz));
+                url.searchParams.set('v', String(job.v));
+                url.searchParams.set('epoch', String(currentEpoch)); // browser cache-bust only
                 return url.toString();
             };
 
             const makeTileFromTile = (payload, key) => {
+                const width = Number(payload.width) || 0;
+                const height = Number(payload.height) || 0;
                 const bin = atob(payload.pixels);
+
+                if (! width || ! height || bin.length !== width * height * 4) return false;
+
                 const bytes = new Uint8ClampedArray(bin.length);
                 for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
 
                 const off = document.createElement('canvas');
-                off.width = payload.width;
-                off.height = payload.height;
+                off.width = width;
+                off.height = height;
 
                 const octx = off.getContext('2d');
-                if (octx) octx.putImageData(new ImageData(bytes, payload.width, payload.height), 0, 0);
+                if (! octx) return false;
 
+                octx.putImageData(new ImageData(bytes, width, height), 0, 0);
                 tileCache.set(key, off);
+
+                return true;
+            };
+
+            const scheduleResume = (delayMs) => {
+                clearTimeout(resumeTimer);
+                resumeTimer = setTimeout(() => {
+                    if (destroyed) return;
+                    rebuildQueue();
+                    pumpQueue();
+                }, Math.max(250, delayMs));
             };
 
             const pumpQueue = () => {
+                if (destroyed) return;
+
+                const now = Date.now();
+
+                if (pausedUntil > now) {
+                    scheduleResume(pausedUntil - now);
+                    updateBusy();
+                    return;
+                }
+
                 while (inflight.size < TILE_CONCURRENCY && queue.length) {
                     const job = queue.shift();
-                    const key = job.rx + '_' + job.rz;
-                    inflight.add(key);
+                    const key = tileKey(job.rx, job.rz);
 
-                    fetch(tileUrl(job.rx, job.rz), {
+                    if (tileCache.has(key) || inflight.has(key)) continue;
+
+                    inflight.add(key);
+                    const gen = schedulerGen;
+
+                    fetch(tileUrl(job), {
                         signal: aborter.signal,
                         credentials: 'same-origin',
                         headers: { Accept: 'application/json' },
                     })
-                        .then((res) => res.ok ? res.json() : Promise.reject(res.status))
-                        .then((body) => {
+                        .then(async (res) => {
+                            if (gen !== schedulerGen) return;
+
+                            if (res.status === 429) {
+                                // Throttled: pause the whole scheduler, the tile stays eligible.
+                                const retryAfter = Number(res.headers.get('Retry-After'));
+                                const seconds = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : DEFAULT_RETRY_AFTER_S;
+                                pausedUntil = Date.now() + seconds * 1000;
+                                return;
+                            }
+
+                            if (! res.ok) {
+                                // Permission, validation or server error: final until Redraw.
+                                failedTiles.set(key, { until: Infinity, attempts: MAX_NETWORK_ATTEMPTS });
+                                return;
+                            }
+
+                            const body = await res.json();
+                            if (gen !== schedulerGen) return;
+
                             const tile = body && body.tile;
-                            if (tile && tile.pixels && tile.width) {
-                                makeTileFromTile(tile, key);
-                            } else {
-                                failedTiles.add(key); // graceful fog stays painted
+                            if (! (tile && tile.pixels && makeTileFromTile(tile, key))) {
+                                failedTiles.set(key, { until: Infinity, attempts: MAX_NETWORK_ATTEMPTS }); // graceful fog
                             }
                         })
-                        .catch(() => {})
+                        .catch((error) => {
+                            if (gen !== schedulerGen || destroyed || (error && error.name === 'AbortError')) return;
+
+                            const previous = failedTiles.get(key);
+                            const attempts = (previous ? previous.attempts : 0) + 1;
+                            const final = attempts >= MAX_NETWORK_ATTEMPTS;
+
+                            failedTiles.set(key, { until: final ? Infinity : Date.now() + NETWORK_RETRY_MS * attempts, attempts });
+
+                            if (! final) scheduleResume(NETWORK_RETRY_MS * attempts);
+                        })
                         .finally(() => {
+                            // Stale generation (hard reset / teardown): state was already reset.
+                            if (gen !== schedulerGen) return;
+
                             inflight.delete(key);
+
+                            if (destroyed) return;
+
                             rebuildQueue();
                             pumpQueue();
                         });
                 }
 
-                if (busyEl) {
-                    busyEl.classList.toggle('hidden', ! inflight.size);
-                    busyEl.classList.toggle('inline-flex', !! inflight.size);
+                updateBusy();
+            };
+
+            const resetScheduler = (hard) => {
+                if (destroyed) return;
+
+                if (hard) {
+                    schedulerGen++;
+                    aborter.abort();
+                    aborter = new AbortController();
+                    inflight.clear();
+                    tileCache.clear();
+                    failedTiles.clear();
+                    pausedUntil = 0;
+                    clearTimeout(resumeTimer);
                 }
+
+                rebuildQueue();
+                pumpQueue();
             };
 
             /* ------------------------------------------------------------
-             * Overlay pins (players + markers) kept as raw DOM nodes
+             * Overlay pins (players + markers) kept as raw DOM nodes inside the
+             * wire:ignore'd #mct-pins-layer.
              * ------------------------------------------------------------ */
             let pinNodes = [];
             let pinsSignature = '';
@@ -524,14 +621,14 @@
                 const players = playerHost ? parsedJson(playerHost.textContent || '[]', []) : [];
                 const markers = markerHost ? parsedJson(markerHost.textContent || '[]', []) : [];
 
-                return [...players, ...markers];
+                return [...(Array.isArray(players) ? players : []), ...(Array.isArray(markers) ? markers : [])];
             };
 
             const syncPins = () => {
                 const feed = pinFeed();
                 const signature = JSON.stringify(feed);
 
-                if (signature === pinsSignature && pinNodes.length === feed.length) return;
+                if (signature === pinsSignature && pinsLayer.childElementCount === pinNodes.length) return;
                 pinsSignature = signature;
 
                 pinsLayer.replaceChildren();
@@ -542,7 +639,6 @@
 
                     const el = document.createElement('div');
                     el.className = 'absolute will-change-transform';
-
                     el.style.transformOrigin = 'center';
 
                     const avatarWrap = document.createElement('span');
@@ -594,13 +690,9 @@
                 if (! clockEl) return;
 
                 const ticksRaw = mirror?.dataset.time || '';
-                if (ticksRaw === '') {
-                    clockEl.textContent = '--:--';
-                    return;
-                }
-
                 const ticks = Number(ticksRaw);
-                if (! Number.isFinite(ticks)) {
+
+                if (ticksRaw === '' || ! Number.isFinite(ticks)) {
                     clockEl.textContent = '--:--';
                     return;
                 }
@@ -608,22 +700,61 @@
                 const dayTicks = ((ticks % 24000) + 24000) % 24000;
                 const hourTotal = (dayTicks / 1000 + 6) % 24;
                 const hh = String(Math.floor(hourTotal)).padStart(2, '0');
-                const mm = String(Math.floor(((hourTotal % 1) * 60))).padStart(2, '0');
+                const mm = String(Math.floor((hourTotal % 1) * 60)).padStart(2, '0');
                 clockEl.textContent = hh + ':' + mm;
             };
 
             /* ------------------------------------------------------------
              * Spawn / border annotation sync (layer preset switches)
              * ------------------------------------------------------------ */
-            let showSpawn = (mirror?.dataset.showSpawn ?? '1') === '1';
-            let showBorder = (mirror?.dataset.showBorder ?? '0') === '1';
-            let spawnAnchor = parsedJson(mirror?.dataset.spawn || '{"x":0,"z":0}', { x: 0, z: 0 });
+            let showSpawn = true;
+            let showBorder = false;
+            let spawnAnchor = { x: 0, z: 0 };
 
             const syncAnnotations = () => {
                 if (! mirror) return;
                 showSpawn = (mirror.dataset.showSpawn ?? '1') === '1';
                 showBorder = (mirror.dataset.showBorder ?? '0') === '1';
                 spawnAnchor = parsedJson(mirror.dataset.spawn || '{"x":0,"z":0}', { x: 0, z: 0 });
+            };
+
+            /* ------------------------------------------------------------
+             * Mirror sync: a new target or Redraw epoch is a HARD reset (abort,
+             * drop tiles, refit on the new spawn); a new region list is soft.
+             * ------------------------------------------------------------ */
+            const syncMirrorState = () => {
+                if (! mirror || destroyed) return;
+
+                let hard = false;
+                let soft = false;
+
+                if ((mirror.dataset.target || '') !== currentTarget) {
+                    currentTarget = mirror.dataset.target || '';
+                    currentWorld = mirror.dataset.world || '';
+                    currentDim = mirror.dataset.dim || 'overworld';
+                    view.fitReady = false;
+                    hard = true;
+                }
+
+                if ((mirror.dataset.epoch || '1') !== currentEpoch) {
+                    currentEpoch = mirror.dataset.epoch || '1';
+                    hard = true;
+                }
+
+                const regionsRaw = mirror.dataset.regions || '[]';
+
+                if (regionsRaw !== regionsSignature) {
+                    regionsSignature = regionsRaw;
+                    const parsed = parsedJson(regionsRaw, []);
+                    regionsList = Array.isArray(parsed) ? parsed : [];
+                    soft = true;
+                }
+
+                syncAnnotations();
+
+                if (hard || soft) {
+                    resetScheduler(hard);
+                }
             };
 
             /* ------------------------------------------------------------
@@ -640,8 +771,8 @@
 
                 fitPpb = Math.min(rect.width, rect.height) / INITIAL_VISIBLE_SPAN_BLOCKS;
                 view.ppb = fitPpb;
-                view.centerX = Number(spawnAnchor.x ?? 0);
-                view.centerZ = Number(spawnAnchor.z ?? 0);
+                view.centerX = Number(spawnAnchor.x ?? 0) || 0;
+                view.centerZ = Number(spawnAnchor.z ?? 0) || 0;
                 view.fitReady = true;
             };
 
@@ -649,10 +780,8 @@
                 ensureFit();
                 if (! view.fitReady || fitPpb <= 0) return;
 
-                // Zoom FACTOR semantics: current relative zoom x pow(1.15,-deltaY),
-                // clamped before translating back into absolute pixels-per-block.
                 const currentFactor = view.ppb / fitPpb;
-                const nextFactor = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, currentFactor * Math.pow(ZOOM_STEP, -deltaY)));
+                const nextFactor = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, currentFactor * Math.pow(ZOOM_STEP, -deltaY / 100)));
                 const next = nextFactor * fitPpb;
 
                 if (Math.abs(next - view.ppb) < 1e-9) return;
@@ -660,12 +789,14 @@
                 const rect = stage.getBoundingClientRect();
 
                 // Anchor: keep the world point under the cursor stationary.
-                const wxBefore = ((clientX - rect.left) - rect.width / 2) / view.ppb + view.centerX;
-                const wzBefore = ((clientY - rect.top) - rect.height / 2) / view.ppb + view.centerZ;
+                const offsetX = (clientX - rect.left) - rect.width / 2;
+                const offsetY = (clientY - rect.top) - rect.height / 2;
+                const wxBefore = offsetX / view.ppb + view.centerX;
+                const wzBefore = offsetY / view.ppb + view.centerZ;
 
                 view.ppb = next;
-                view.centerX += wxBefore - (((clientX - rect.left) - rect.width / 2) / view.ppb + view.centerX);
-                view.centerZ += wzBefore - (((clientY - rect.top) - rect.height / 2) / view.ppb + view.centerZ);
+                view.centerX = wxBefore - offsetX / view.ppb;
+                view.centerZ = wzBefore - offsetY / view.ppb;
 
                 rebuildQueue();
                 pumpQueue();
@@ -695,22 +826,34 @@
                 locationEl.textContent = 'LOCATION ' + point.x + ', ~, ' + point.z;
             };
 
+            // Queue refresh when the focus region changes so pans fetch nearby tiles first.
+            let queuedFocus = '';
+            const rebuildQueueWhenScrolledFar = () => {
+                const focus = focusRegion();
+                const key = focus.rx + '_' + focus.rz;
+
+                if (key === queuedFocus) return;
+                queuedFocus = key;
+                rebuildQueue();
+                pumpQueue();
+            };
+
             /* ------------------------------------------------------------ */
             /* Render loop                                                  */
             /* ------------------------------------------------------------ */
-            let frameStart = performance.now();
-
             const drawFrame = () => {
-                if (! running || ! ctx) return;
+                if (destroyed || ! running || ! ctx) {
+                    rafHandle = 0; // lets onVisibility restart the loop later
+                    return;
+                }
 
-                ensureFit();
                 syncMirrorState();
+                ensureFit();
                 syncPins();
                 renderClock();
 
-                // Follow mode: recenters onto the LEAD player pin (stable list head)
-                // each ping cycle; free mode keeps manual pans untouched.
-                if ((mirror?.dataset.follow ?? '0') === '1' && performance.now() - frameStart > 250) {
+                // Follow mode: recenters onto the LEAD player pin each frame.
+                if ((mirror?.dataset.follow ?? '0') === '1') {
                     const lead = pinNodes.find((node) => node.isPlayer) || null;
                     if (lead) {
                         view.centerX = lead.wx;
@@ -735,40 +878,29 @@
                 const halfW = rect.width / 2;
                 const halfH = rect.height / 2;
 
-                const minWX = view.centerX - halfW / view.ppb - REGION_BLOCKS_AXIS;
-                const maxWX = view.centerX + halfW / view.ppb + REGION_BLOCKS_AXIS;
-                const minWZ = view.centerZ - halfH / view.ppb - REGION_BLOCKS_AXIS;
-                const maxWZ = view.centerZ + halfH / view.ppb + REGION_BLOCKS_AXIS;
-
-                const startRX = Math.floor(minWX / REGION_BLOCKS_AXIS);
-                const endRX = Math.ceil(maxWX / REGION_BLOCKS_AXIS);
-                const startRZ = Math.floor(minWZ / REGION_BLOCKS_AXIS);
-                const endRZ = Math.ceil(maxWZ / REGION_BLOCKS_AXIS);
-
-                const known = new Set(regionsList.map((r) => r.rx + '_' + r.rz));
+                const startRX = Math.floor((view.centerX - halfW / view.ppb) / REGION_BLOCKS_AXIS) - 1;
+                const endRX = Math.ceil((view.centerX + halfW / view.ppb) / REGION_BLOCKS_AXIS) + 1;
+                const startRZ = Math.floor((view.centerZ - halfH / view.ppb) / REGION_BLOCKS_AXIS) - 1;
+                const endRZ = Math.ceil((view.centerZ + halfH / view.ppb) / REGION_BLOCKS_AXIS) + 1;
 
                 const toScreenX = (wx) => halfW + (wx - view.centerX) * view.ppb;
                 const toScreenY = (wz) => halfH + (wz - view.centerZ) * view.ppb;
+                const sizePx = REGION_BLOCKS_AXIS * view.ppb;
 
                 for (let rx = startRX; rx < endRX; rx++) {
                     for (let rz = startRZ; rz < endRZ; rz++) {
-                        const key = rx + '_' + rz;
-                        const tile = tileCache.get(key);
+                        const tile = tileCache.get(tileKey(rx, rz));
 
                         if (! tile) continue;             // fog shows through until fetched
 
-                        const sx = toScreenX(rx * REGION_BLOCKS_AXIS);
-                        const sy = toScreenY(rz * REGION_BLOCKS_AXIS);
-                        const sizePx = REGION_BLOCKS_AXIS * view.ppb;
-
-                        ctx.drawImage(tile, sx, sy, sizePx, sizePx);
+                        ctx.drawImage(tile, toScreenX(rx * REGION_BLOCKS_AXIS), toScreenY(rz * REGION_BLOCKS_AXIS), sizePx, sizePx);
                     }
                 }
 
                 // ---- annotation layer: spawn + guessed vanilla border ------
                 if (showSpawn) {
-                    const sx = toScreenX(Number(spawnAnchor.x ?? 0));
-                    const sy = toScreenY(Number(spawnAnchor.z ?? 0));
+                    const sx = toScreenX(Number(spawnAnchor.x ?? 0) || 0);
+                    const sy = toScreenY(Number(spawnAnchor.z ?? 0) || 0);
 
                     ctx.strokeStyle = 'rgba(245,158,11,0.9)';
                     ctx.lineWidth = 2;
@@ -807,18 +939,6 @@
                 rebuildQueueWhenScrolledFar();
 
                 rafHandle = requestAnimationFrame(drawFrame);
-            };
-
-            // Queue refresh threshold: half a region so slow pans don't thrash jobs.
-            let queuedFocus = '';
-            const rebuildQueueWhenScrolledFar = () => {
-                const focus = focusRegion();
-                const key = focus.rx + '_' + focus.rz;
-
-                if (key === queuedFocus) return;
-                queuedFocus = key;
-                rebuildQueue();
-                pumpQueue();
             };
 
             /* ------------------------------------------------------------ */
@@ -876,25 +996,23 @@
                 zoomAt(event.clientX, event.clientY, event.deltaY);
             };
 
-            const resizeCanvasSafely = () => { /* handled by DPR-aware draw loop */ };
-
             const onVisibility = () => {
-                running = document.visibilityState === 'visible';
+                running = document.visibilityState !== 'hidden';
 
-                if (running && ! rafHandle) {
+                if (running && ! rafHandle && ! destroyed) {
                     rafHandle = requestAnimationFrame(drawFrame);
                 }
             };
 
-            // Mirror mutations arrive through Livewire DOM updates; observe textContent.
+            // Mirror mutations arrive through Livewire DOM updates (data-* attributes).
             mirrorObserver = new MutationObserver(syncMirrorState);
             if (mirror) mirrorObserver.observe(mirror, { attributes: true });
 
-            // Annotation feeds (server-rendered JSON payloads outside the wire:ignore box)
+            // Annotation feeds (server-rendered JSON payloads above the stage).
             const feedsRoot = document.getElementById('mct-feeds');
 
             if (feedsRoot) {
-                const feedsObserver = new MutationObserver(syncPins);
+                feedsObserver = new MutationObserver(syncPins);
                 feedsObserver.observe(feedsRoot, { childList: true, subtree: true, characterData: true });
             }
 
@@ -905,22 +1023,34 @@
             stage.addEventListener('wheel', onWheel, { passive: false });
             stage.addEventListener('keydown', onKeyDown);
 
-            resizeObserver = new ResizeObserver(resizeCanvasSafely);
+            // The DPR-aware draw loop resizes the canvas itself; the observer only wakes a
+            // stopped loop when the stage changes size.
+            resizeObserver = new ResizeObserver(() => onVisibility());
             resizeObserver.observe(stage);
 
             document.addEventListener('visibilitychange', onVisibility);
 
-            // Lifecycle: hard requirement (design-system §13) — drop RAF/intervals/fetches
-            // before the SPA swaps away from this page.
+            // Lifecycle: drop RAF/timers/fetches before the SPA swaps away from this page.
+            // Bumping the scheduler generation first makes every aborted fetch a no-op, so
+            // nothing re-queues work after teardown.
             const teardown = () => {
+                if (destroyed) return;
+
+                destroyed = true;
                 running = false;
+                schedulerGen++;
+
                 cancelAnimationFrame(rafHandle);
                 rafHandle = 0;
 
                 aborter.abort();
-                clearTimeout(pollTimer);
+                clearTimeout(resumeTimer);
+
+                queue.length = 0;
+                inflight.clear();
 
                 mirrorObserver?.disconnect();
+                feedsObserver?.disconnect();
                 resizeObserver?.disconnect();
 
                 stage.removeEventListener('pointerdown', onPointerDown);
@@ -933,46 +1063,36 @@
                 document.removeEventListener('livewire:navigating', teardown);
 
                 tileCache.clear();
+                failedTiles.clear();
                 pinNodes = [];
+
+                if (window[BOOT_KEY] && window[BOOT_KEY].teardown === teardown) {
+                    delete window[BOOT_KEY];
+                }
             };
 
             document.addEventListener('livewire:navigating', teardown, { once: true });
 
             // Debug handle ONLY when the app admits debug mode (mirrors core blade usage).
             @if (app()->hasDebugModeEnabled())
-                window[BOOT_KEY] = { teardown, tileCache, view, get regions: () => regionsList };
+                window[BOOT_KEY] = { teardown, tileCache, view, get regions() { return regionsList; } };
             @else
                 window[BOOT_KEY] = { teardown };
             @endif
 
             // Kick-off
-            const bootCtx = canvas.getContext('2d');
-            ctx = bootCtx;
+            ctx = canvas.getContext('2d');
 
-            regionsList = parsedJson(mirror?.dataset.regions || '[]', []);
             syncAnnotations();
+            ensureFit();
             rebuildQueue();
             pumpQueue();
-            rafHandle = requestAnimationFrame(drawFrame);
+
+            if (running) {
+                rafHandle = requestAnimationFrame(drawFrame);
+            }
         })();
     </script>
-
-    {{-- Server-rendered pin feeds consumed by the observer above -------------------- --}}
-    <div id="mct-feeds" class="hidden" aria-hidden="true">
-        <div id="mct-player-feed">{{ json_encode(collect($pins)->map(fn ($pin) => [
-            'kind' => 'player',
-            'name' => $pin['name'],
-            'wx' => $pin['x'],
-            'wz' => $pin['z'],
-        ])->values()) }}</div>
-        <div id="mct-marker-feed">{{ json_encode(collect($markers)->map(fn ($marker) => [
-            'kind' => 'marker',
-            'name' => $marker['label'],
-            'wx' => $marker['x'],
-            'wz' => $marker['z'],
-            'color' => $marker['color'] ?: '#fbbf24',
-        ])->values()) }}</div>
-    </div>
 
     {{-- Tile endpoint base is mirrored on #mct-mirror (kept outside wire:ignore) ----- --}}
 </x-filament-panels::page>

@@ -32,7 +32,13 @@ use McToolkit\Services\FileBridge;
  *   player has no ban row the value stays null (documented parity decision).
  * - ping sample ids arrive dash-less; they are normalized before intersection.
  *   Sample-only players (offline-mode setups where no registry row exists) are
- *   appended with false flags so counters and card grids stay consistent.
+ *   appended with false flags so counters and card grids stay consistent — but only
+ *   when the id is a real (non-nil) uuid and the name is a real player name, so the
+ *   decorative text lines / "Anonymous Player" entries many servers put into the
+ *   sample never become clickable rows.
+ * - every row's `uuid` is a canonical dashed lowercase uuid: entries whose uuid does not
+ *   parse as 32 hex digits are dropped (the value lands in the page's wire:click
+ *   expressions and in lookups, so it must never be free-form text).
  * - counters prefer the live ping (`online`/`max`) because the sample list is capped
  *   at 12 entries; when the ping failed we fall back to counting intersected rows and
  *   a config-less default max of 20 is reported via `max_is_estimate`.
@@ -67,6 +73,20 @@ final class PlayerRegistry
 
     /** Fallback max-players when neither the ping nor properties could tell us. */
     private const FALLBACK_MAX_PLAYERS = 20;
+
+    /**
+     * Player-name shape accepted anywhere a name is put into a console command:
+     * Java names (legacy accounts may be shorter than 3 chars) plus the optional
+     * "." prefix Floodgate gives Bedrock players. `D` keeps `$` from matching
+     * before a trailing newline.
+     */
+    public const PLAYER_NAME_PATTERN = '/^\.?[A-Za-z0-9_]{1,16}$/D';
+
+    /** Dash-less lowercase uuid. */
+    private const UUID_HEX_PATTERN = '/^[0-9a-f]{32}$/D';
+
+    /** The all-zero uuid Paper & co. hand out for anonymised sample entries. */
+    private const NIL_UUID_HEX = '00000000000000000000000000000000';
 
     public function __construct(
         private readonly FileBridge $files,
@@ -208,7 +228,7 @@ final class PlayerRegistry
         $bans = [];
 
         foreach ($entries as $entry) {
-            $ip = strval($entry['ip'] ?? '');
+            $ip = is_array($entry) && is_string($entry['ip'] ?? null) ? trim($entry['ip']) : '';
 
             if ($ip === '') {
                 continue;
@@ -244,8 +264,12 @@ final class PlayerRegistry
 
         foreach ($flagMap as $file => $flags) {
             foreach ($this->readEntryList($server, $file) as $entry) {
-                $name = strval($entry['name'] ?? '');
-                $uuidKey = $this->canonicalUuid($entry['uuid'] ?? '');
+                if (! is_array($entry)) {
+                    continue;
+                }
+
+                $name = is_string($entry['name'] ?? null) ? trim($entry['name']) : '';
+                $uuidKey = $this->canonicalUuid($entry['uuid'] ?? null);
 
                 if ($uuidKey === '' || $name === '') {
                     continue;
@@ -283,6 +307,7 @@ final class PlayerRegistry
     private function applyOnlineState(Server $server, array $rows): array
     {
         // No primary allocation => the ping call itself returns null immediately.
+        // ServerListPing picks the reachable target (alias / node FQDN for wildcards).
         $status = $this->ping->ping(
             $server->allocation ?? '',
             2500,
@@ -292,19 +317,24 @@ final class PlayerRegistry
         $byName = [];
 
         foreach ($status['players']['sample'] ?? [] as $sample) {
-            $id = strval($sample['id'] ?? '');
+            $id = strtolower(strval($sample['id'] ?? ''));
+            $sampledName = strval($sample['name'] ?? '');
 
-            if ($id !== '') {
-                $byId[$id] = strval($sample['name']);
+            if ($sampledName === '') {
+                continue;
             }
 
-            $byName[mb_strtolower(strval($sample['name']))] = $id;
+            if (preg_match(self::UUID_HEX_PATTERN, $id) === 1 && $id !== self::NIL_UUID_HEX) {
+                $byId[$id] = $sampledName;
+            }
+
+            $byName[mb_strtolower($sampledName)] = $id;
         }
 
         $output = [];
 
         foreach ($rows as $uuid => $row) {
-            $dashless = str_replace('-', '', $uuid);
+            $dashless = str_replace('-', '', strval($uuid));
 
             $isSampled = isset($byId[$dashless]);
 
@@ -322,11 +352,18 @@ final class PlayerRegistry
         $matchedCount = count(array_filter($output, fn (array $r): bool => (bool) $r['online']));
 
         // Sample-only rows appended LAST so registered identities always win the grid.
+        // $byId only holds validated 32-hex ids; names must also look like real players.
         foreach ($byId as $id => $sampledName) {
+            $id = (string) $id;
+
+            if (preg_match(self::PLAYER_NAME_PATTERN, $sampledName) !== 1) {
+                continue;
+            }
+
             $already = false;
 
             foreach ($output as $row) {
-                if (str_replace('-', '', $row['uuid']) === $id
+                if (str_replace('-', '', strval($row['uuid'])) === $id
                     || mb_strtolower(strval($row['name'])) === mb_strtolower($sampledName)) {
                     $already = true;
 
@@ -338,9 +375,7 @@ final class PlayerRegistry
                 continue;
             }
 
-            $dashed = $this->dashOut($id);
-
-            $row = $this->freshRow($dashed !== '' ? $dashed : $id, $sampledName);
+            $row = $this->freshRow($this->dashOut($id), $sampledName);
             $row['online'] = true;
 
             $output[] = $row;
@@ -440,11 +475,19 @@ final class PlayerRegistry
         return $rows;
     }
 
+    /**
+     * Canonical dashed lowercase uuid, or '' when the value is not a uuid at all
+     * (callers drop such entries — see the class docblock).
+     */
     private function canonicalUuid(mixed $uuid): string
     {
-        $clean = strtolower(str_replace('-', '', strval($uuid)));
+        if (! is_string($uuid)) {
+            return '';
+        }
 
-        if ($clean === '') {
+        $clean = strtolower(str_replace('-', '', trim($uuid)));
+
+        if (preg_match(self::UUID_HEX_PATTERN, $clean) !== 1) {
             return '';
         }
 
@@ -454,8 +497,8 @@ final class PlayerRegistry
     /** Re-dashes a compressed uuid ("8667ba71b85a...") into display form. */
     private function dashOut(string $dashless): string
     {
-        if (strlen($dashless) !== 32 || preg_match('/^[0-9a-f]{32}$/', $dashless) !== 1) {
-            return $dashless; // non-canonical ids are passed through untouched
+        if (preg_match(self::UUID_HEX_PATTERN, $dashless) !== 1) {
+            return ''; // never reached with validated input; refuse free-form ids anyway
         }
 
         return substr($dashless, 0, 8) . '-'

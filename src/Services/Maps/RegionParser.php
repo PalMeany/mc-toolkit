@@ -12,40 +12,35 @@ use McToolkit\Services\FileBridge;
  *
  * Owns every low-level piece of the map pipeline:
  *
- * 1. {@see self::regionBytes()} downloads `r.{rx}.{rz}.mca` ONCE through FileBridge
- *    (capped by config('minecraft-toolkit.limits.region_fetch_max_bytes'), 8 MiB by
- *    default) and memoizes it under
- *    `storage_path("app/mctoolkit/{uuid_short}/mapcache/{world}/{rx}_{rz}_{mtime}.mca")`.
- *    Repeated tile requests reuse the local copy until the wings mtime changes.
- * 2. The 8 KiB Anvil header is decoded into the 4096-entry sector-offset table
- *    (big-endian uint32 packing `sector_index << 8 | sector_count`).
+ * 1. {@see self::regionBytes()} downloads `<regionDir>/r.{rx}.{rz}.mca` ONCE through
+ *    FileBridge (capped by config('minecraft-toolkit.limits.region_fetch_max_bytes'),
+ *    8 MiB by default) and mirrors it under
+ *    `storage_path("app/mctoolkit/{uuid_short}/mapcache/{regionDirKey}/{rx}_{rz}_{mtime}.mca")`.
+ *    The wings mtime is part of the name, so a changed region is fetched again and the
+ *    older generation of THAT region (same rx/rz only) is pruned.
+ * 2. The 8 KiB Anvil header is decoded into the 1024-entry sector table
+ *    (big-endian uint32 packing `sector_offset << 8 | sector_count`).
  * 3. Each chunk record is length-prefixed (int32 BE, value includes the trailing
- *    compression byte) and inflated through the BOUNDED helper below (ceiling
- *    {@see self::MAX_INFLATED_CHUNK_BYTES}): 1 = gzip, 2 = zlib envelope with a
- *    documented fallback chain (raw zlib decode, then `gzinflate` after stripping the
- *    2-byte wrapper), 3 = stored uncompressed. Anything else degrades to fog.
- * 4. A minimal BIG-ENDIAN NBT walker covers tag ids 0..12 (the protocol has twelve
- *    real tags between End and LongArray inclusive; the task brief counts them as
- *    "1..13") with a depth cap of {@see self::MAX_NBT_DEPTH} so hostile/corrupt
- *    payloads cannot recurse unbounded. IntArray/LongArray are supported; 64-bit
- *    values are kept losslessly as PHP ints (two's complement) and split into
- *    32-bit halves before any bit shifting, avoiding unpack() float overflow.
- * 5. Section container layouts are resolved pragmatically because writers differ:
- *    `Level.Sections` (legacy nested), root `Sections`, root lowercase `sections`
- *    (vanilla >= 1.18), and root `Data.Sections`. Pre-1.13 flat chunk format
- *    (nibble-array Blocks/Data/Add) is intentionally NOT supported - such regions
- *    simply stay fogged. Palette block ids come from `Name`; indices are unpacked
- *    from the LSB-first-per-long BitStates longs with bit size
- *    `max(4, ceil(log2(len(palette))))` (the >= 1.16 packing rule).
- * 6. Column colors walk Y descending and stop at the first surface block: air
- *    variants are skipped, glass family is passed through (documented tradeoff -
- *    glass roofs show the ground beneath them), water triggers the documented
- *    WATER_BLEND_FACTOR composite below its underlying ground tone.
+ *    compression byte) and inflated through a BOUNDED helper: 1 = gzip, 2 = zlib,
+ *    3 = stored. LZ4 (4) and external `.mcc` chunks (0x80 flag) degrade to fog.
+ * 4. A SELECTIVE big-endian NBT decoder materializes only what the renderer needs
+ *    (DataVersion, Status, the section list and, inside each section, Y + block
+ *    states); every other subtree (block entities, entities, structures, heightmaps…)
+ *    is skipped arithmetically, so deep chests or jigsaw structures can neither blow
+ *    memory up nor cut the parse short.
+ * 5. Section layouts: `sections[].block_states.{palette,data}` (>= 1.18) and
+ *    `Level.Sections[].{Palette,BlockStates}` (1.13 – 1.17). A single-entry palette has
+ *    no data array (the whole section is that block). Bits per entry are
+ *    `max(4, ceil(log2(palette size)))`; since 1.16 (DataVersion 2529) entries never
+ *    span two longs, before that they do — the chunk's DataVersion picks the rule.
+ *    Pre-1.13 numeric-id chunks have no palette and stay fogged.
+ * 6. Column colors walk Y descending and stop at the first surface block: air is
+ *    skipped, glass and small decorations (grass, flowers, torches, rails…) are passed
+ *    through, water triggers the documented WATER_BLEND_FACTOR composite.
  *
- * Honest limits (all painted as {@see self::FOG_COLOR_HEX}): missing/corrupt
- * regions, unsupported compression tags, truncated downloads, empty status-less
- * chunks, and pre-1.18-without-sections variants. The client renders fog pixels
- * identically (#0b0e14) so partially rendered tiles blend seamlessly.
+ * Honest limits (all painted as {@see self::FOG_COLOR_HEX}): missing/corrupt regions,
+ * unsupported compression, truncated downloads, regions above the fetch cap,
+ * not-yet-full proto chunks and pre-1.13 chunks.
  */
 final class RegionParser
 {
@@ -72,17 +67,66 @@ final class RegionParser
     /** Linear mix weight applied over the ground tone when water sits above it. */
     public const WATER_BLEND_FACTOR = 0.6;
 
-    private const MAX_NBT_DEPTH = 7;
+    /** First DataVersion (20w17a / 1.16) whose packed longs no longer span entries. */
+    public const NON_SPANNING_DATA_VERSION = 2529;
+
+    /** Depth cap for materialized tags; deeper wanted data is skipped, never truncating. */
+    private const MAX_NBT_DEPTH = 12;
+
+    /** Nesting cap while skipping; real chunks stay far below, hostile ones just end the scope. */
+    private const MAX_SKIP_DEPTH = 256;
+
+    /** More sections than this per chunk are skipped (vanilla tops out at 26). */
+    private const MAX_SECTIONS = 64;
 
     private const FOG_RGB = [11, 14, 20];
 
     private const COMPRESSION_NONE = 3;
 
+    /** Chunk-root keys the renderer reads; everything else is skipped. */
+    private const ROOT_KEEP = ['DataVersion', 'Status', 'sections', 'Sections', 'Level', 'Data'];
+
+    /** Keys read inside the legacy `Level` (or `Data`) wrapper compound. */
+    private const LEVEL_KEEP = ['Status', 'Sections', 'sections', 'DataVersion'];
+
+    /** Keys read inside one section compound. */
+    private const SECTION_KEEP = ['Y', 'block_states', 'Palette', 'BlockStates'];
+
+    /** Small/transparent blocks the column walk looks through. */
+    private const PASS_THROUGH = [
+        'short_grass', 'grass', 'tall_grass', 'fern', 'large_fern', 'dead_bush', 'vine',
+        'cave_vines', 'cave_vines_plant', 'glow_lichen', 'hanging_roots', 'spore_blossom',
+        'torch', 'wall_torch', 'soul_torch', 'soul_wall_torch', 'redstone_torch',
+        'redstone_wall_torch', 'lever', 'tripwire', 'tripwire_hook', 'string', 'ladder',
+        'rail', 'powered_rail', 'detector_rail', 'activator_rail', 'redstone_wire',
+        'light', 'barrier', 'structure_void', 'dandelion', 'poppy', 'blue_orchid',
+        'allium', 'azure_bluet', 'red_tulip', 'orange_tulip', 'white_tulip', 'pink_tulip',
+        'oxeye_daisy', 'cornflower', 'lily_of_the_valley', 'wither_rose', 'torchflower',
+        'sunflower', 'lilac', 'rose_bush', 'peony', 'pitcher_plant', 'brown_mushroom',
+        'red_mushroom', 'sweet_berry_bush', 'nether_sprouts', 'warped_roots',
+        'crimson_roots', 'fire', 'soul_fire', 'cobweb', 'scaffolding',
+    ];
+
+    /** Suffixes of small/transparent block families (saplings, signs, buttons…). */
+    private const PASS_THROUGH_SUFFIXES = [
+        '_sapling', '_button', '_sign', '_wall_sign', '_hanging_sign', '_wall_hanging_sign',
+        '_banner', '_wall_banner', '_torch', '_candle', '_pane',
+    ];
+
+    /** Suffixes stripped to find a base material color (oak_slab -> oak_planks…). */
+    private const SHAPE_SUFFIXES = [
+        '_slab', '_stairs', '_wall', '_fence_gate', '_fence', '_door', '_trapdoor',
+        '_pressure_plate', '_carpet',
+    ];
+
     /** Deep-water tone used when a column contains ONLY water. */
     private const DEEP_WATER_HEX = '#3156ad';
 
-    /** Hex color cache decoded lazily from resources/data/blockcolors.json. */
+    /** Hex color table decoded lazily from resources/data/blockcolors.json. */
     private ?array $colors = null;
+
+    /** @var array<string, array{0:int,1:int,2:int}> resolved per block name */
+    private array $rgbCache = [];
 
     public function __construct(private readonly FileBridge $bridge) {}
 
@@ -94,15 +138,17 @@ final class RegionParser
      * Renders one region as an S x S grid of packed "R G B" bytes (row-major,
      * north-west corner at [0]).
      *
+     * @param  string  $regionDir  server-relative region folder, e.g. `world/region` or
+     *                             `world_nether/DIM-1/region` (built by MapTileService)
      * @param  int  $coarse  downscale factor: how many blocks one output pixel spans
      *                          along each axis (valid: 1, 2, 4, 8)
      * @param  int  $yTop    highest world Y considered while walking columns down
      * @return array{rgb:string, side:int, present_chunks:int, total_chunks:int}|null
      *         null when the region cannot be obtained or parsed at all
      */
-    public function rasterize(Server $server, string $worldDir, int $regionX, int $regionZ, int $coarse, int $yTop, ?int $mtimeHint = null): ?array
+    public function rasterize(Server $server, string $regionDir, int $regionX, int $regionZ, int $coarse, int $yTop, ?int $mtimeHint = null): ?array
     {
-        $bytes = $this->regionBytes($server, $worldDir, $regionX, $regionZ, $mtimeHint);
+        $bytes = $this->regionBytes($server, $regionDir, $regionX, $regionZ, $mtimeHint);
 
         if ($bytes === null || strlen($bytes) < self::SECTOR_BYTES * 2) {
             return null;
@@ -121,73 +167,101 @@ final class RegionParser
         ];
     }
 
+    /** Deletes every locally mirrored `.mca` of one region folder (Redraw). */
+    public function purgeMirror(Server $server, string $regionDir): void
+    {
+        $directory = $this->cacheDirectory($server, $regionDir);
+
+        if (! is_dir($directory)) {
+            return;
+        }
+
+        foreach ((array) glob($directory.DIRECTORY_SEPARATOR.'*.mca') as $file) {
+            if (is_string($file)) {
+                @unlink($file);
+            }
+        }
+    }
+
     /**
      * Inline sanity routine used during development builds only (never auto-run).
-     * Builds a tiny synthetic chunk NBT blob in-memory, gzips it exactly like wings'
-     * region files do, and pushes it through the decode + sections pipeline so a
-     * broken decompression chain / NBT walker / key handling surfaces early without
-     * a real server nearby. Returns true ONLY when every asserted field matches.
+     * Builds tiny synthetic chunks in both section layouts (legacy `Level.Sections` +
+     * `Palette`, and >= 1.18 root `sections` + `block_states` with a single-entry
+     * palette), gzips them like region files do and pushes them through the decode +
+     * sections pipeline. Returns true ONLY when every asserted field matches.
      */
     public static function selfTestDecodingSample(): bool
     {
-        // --- craft {"":{"Level":{"Sections":[{Y=5, Palette=[{Name=oak_log}]}]}}} ---
-        // Realistic section shape (palette comp + empty BitStates), wire-exact with
-        // every compound closed explicitly by its End byte.
-        $paletteEntry =                              // list element: compound BODY only (no tag header)
-            "\x08\x00\x04Name\x00\x07oak_log"
-            ."\x00";                                  // End
+        $paletteEntry = "\x08\x00\x04Name\x00\x11minecraft:oak_log"."\x00";
 
-        $sectionElement =
-            "\x01\x00\x01Y".pack('c', 5)              // TAG_Byte Y = 5
-            ."\x09\x00\x07Palette"                    // TAG_List named "Palette"
-            .pack('c', 10)                            //   element tag id = Compound
-            .pack('N', 1)                             //   count = 1
-            .$paletteEntry;
+        // Legacy: {"":{Level:{Sections:[{Y:5b, Palette:[{Name:oak_log}], BlockStates:[L;0L x256]}]}}}
+        $legacySection =
+            "\x01\x00\x01Y".pack('c', 5)
+            ."\x09\x00\x07Palette".pack('c', 10).pack('N', 1).$paletteEntry
+            ."\x0c\x00\x0bBlockStates".pack('N', 256).str_repeat("\x00", 256 * 8)
+            ."\x00";
 
-        $rootBlob = "\x0a\x00\x00"                    // root compound, empty name
-            ."\x0a\x00\x05Level"                      // TAG_Compound named "Level"
-            ."\x09\x00\x08Sections"                   // TAG_List named "Sections"
-            .pack('c', 10)                            //   element tag id = Compound
-            .pack('N', 1)                             //   length = 1
-            .$sectionElement."\x00"                   // section element compound End
-            ."\x00";                                  // Level compound End
+        $legacy = "\x0a\x00\x00"
+            ."\x03\x00\x0bDataVersion".pack('N', 2586)
+            ."\x0a\x00\x05Level"
+            ."\x09\x00\x08Sections".pack('c', 10).pack('N', 1).$legacySection
+            ."\x00"
+            ."\x00";
 
-        $gzipped = @gzencode($rootBlob);
+        // Modern: {"":{DataVersion:3953, block_entities:{a:{b:{…{h:{i:1}}}}},
+        //           sections:[{Y:-4b, block_states:{palette:[{Name:oak_log}]}}]}} — a deep
+        //           unrelated subtree BEFORE sections must not cut the parse short.
+        $deep = "\x0a\x00\x01a"."\x0a\x00\x01b"."\x0a\x00\x01c"."\x0a\x00\x01d"."\x0a\x00\x01e"
+            ."\x0a\x00\x01f"."\x0a\x00\x01g"."\x0a\x00\x01h"."\x03\x00\x01i".pack('N', 1)
+            .str_repeat("\x00", 8);
 
-        if (! is_string($gzipped)) {
-            return false;
-        }
+        $modern = "\x0a\x00\x00"
+            ."\x03\x00\x0bDataVersion".pack('N', 3953)
+            ."\x0a\x00\x0eblock_entities".$deep."\x00"
+            ."\x09\x00\x08sections".pack('c', 10).pack('N', 1)
+            ."\x01\x00\x01Y".pack('c', -4)
+            ."\x0a\x00\x0cblock_states"
+            ."\x09\x00\x07palette".pack('c', 10).pack('N', 1).$paletteEntry
+            ."\x00"
+            ."\x00"
+            ."\x00";
 
-        // Constructed WITHOUT its FileBridge dependency on purpose: the sanity path
-        // only exercises pure byte-level helpers, so the probe stays runnable outside
-        // a bootstrapped container (plain `php -r`, CI, etc.).
         try {
             $probe = (new \ReflectionClass(self::class))->newInstanceWithoutConstructor();
         } catch (\ReflectionException) {
             return false;
         }
 
-        // Route through the SAME inflate chain (compression tag 1 = gzip).
-        $inflated = self::inflateChunkPayload($gzipped, 1);
+        foreach ([[$legacy, 5, false], [$modern, -4, true]] as [$blob, $expectedY, $expectUniform]) {
+            $gzipped = @gzencode($blob);
 
-        if (! is_string($inflated)) {
-            return false;
+            if (! is_string($gzipped)) {
+                return false;
+            }
+
+            $inflated = self::inflateChunkPayload($gzipped, 1);
+
+            if (! is_string($inflated)) {
+                return false;
+            }
+
+            $root = $probe->decodeChunkNbt($inflated);
+
+            if (! is_array($root)) {
+                return false;
+            }
+
+            $sections = $probe->sectionsOf($root);
+
+            if (count($sections) !== 1
+                || $sections[0]['y'] !== $expectedY
+                || ($sections[0]['palette_names'][0] ?? null) !== 'oak_log'
+                || $sections[0]['uniform'] !== $expectUniform) {
+                return false;
+            }
         }
 
-        $root = $probe->decodeChunkNbt($inflated);
-
-        if (! is_array($root) || ! isset($root['Level']['Sections'])) {
-            return false;
-        }
-
-        $sections = $probe->sectionsOf($root);
-
-        return is_array($root)
-            && isset($root['Level']['Sections'][0]['Palette'][0]['Name'])
-            && $root['Level']['Sections'][0]['Palette'][0]['Name'] === 'oak_log'
-            && count($sections) === 1
-            && (($sections[0]['y'] ?? -99) === 5)
-            && (($sections[0]['palette_names'][0] ?? null) === 'oak_log');
+        return true;
     }
 
     /* ------------------------------------------------------------------ */
@@ -195,36 +269,29 @@ final class RegionParser
     /* ------------------------------------------------------------------ */
 
     /**
-     * Returns the raw `.mca` contents, downloading once and caching locally under
-     * storage_path("app/mctoolkit/{uuid_short}/mapcache/{world}/").
-     *
-     * The filename carries the wings-reported mtime so stale caches are superseded
-     * instead of being overwritten mid-request. sanitizeWorldDir() strips path
-     * traversal attempts already at this layer (the HTTP controller basenames too).
+     * Returns the raw `.mca` contents, downloading once per wings mtime and mirroring
+     * locally (see class doc). The region dir is built server-side from validated parts;
+     * it is re-checked here so no `..` segment ever reaches wings or the local disk.
      */
-    private function regionBytes(Server $server, string $worldDir, int $rx, int $rz, ?int $mtimeHint): ?string
+    private function regionBytes(Server $server, string $regionDir, int $rx, int $rz, ?int $mtimeHint): ?string
     {
-        $remotePath = sprintf('%s/region/r.%d.%d.mca', $this->sanitizeSegment($worldDir), $rx, $rz);
+        if (! self::isSafeRelativePath($regionDir)) {
+            return null;
+        }
 
-        $cacheDirectory = implode(DIRECTORY_SEPARATOR, [
-            storage_path('app'),
-            'mctoolkit',
-            preg_replace('/[^A-Za-z0-9_-]/', '', substr((string) $server->uuid_short, 0, 24)) ?: 'unknown',
-            'mapcache',
-            $this->sanitizeSegment($worldDir),
-        ]);
+        $remotePath = sprintf('/%s/r.%d.%d.mca', trim($regionDir, '/'), $rx, $rz);
+        $cacheDirectory = $this->cacheDirectory($server, $regionDir);
+        $generation = max(0, $mtimeHint ?? 0);
 
-        $cacheFile = $cacheDirectory.DIRECTORY_SEPARATOR.sprintf(
-            '%d_%d_%d.mca',
-            $rx,
-            $rz,
-            $mtimeHint ?? 0,
-        );
+        $cacheFile = $cacheDirectory.DIRECTORY_SEPARATOR.sprintf('%d_%d_%d.mca', $rx, $rz, $generation);
 
-        if (is_file($cacheFile)) {
+        // Without an mtime the mirror cannot tell fresh from stale: always re-fetch.
+        if ($generation > 0 && is_file($cacheFile)) {
             $cached = @file_get_contents($cacheFile);
 
-            return is_string($cached) && $cached !== '' ? $cached : null;
+            if (is_string($cached) && $cached !== '') {
+                return $cached;
+            }
         }
 
         try {
@@ -238,12 +305,13 @@ final class RegionParser
         }
 
         // Best-effort persistence: a failed disk write must NOT poison rendering.
-        if (@mkdir($cacheDirectory, 0775, true) || is_dir($cacheDirectory)) {
+        if ($generation > 0 && (@mkdir($cacheDirectory, 0775, true) || is_dir($cacheDirectory))) {
             $tmp = $cacheFile.'.'.bin2hex(random_bytes(4)).'.tmp';
 
             if (@file_put_contents($tmp, $fetched) !== false && @rename($tmp, $cacheFile)) {
-                // pruned sibling generations get cleaned opportunistically below.
-                $this->pruneStaleGenerations($cacheDirectory, basename($cacheFile));
+                $this->pruneStaleGenerations($cacheDirectory, $rx, $rz, basename($cacheFile));
+            } else {
+                @unlink($tmp);
             }
         }
 
@@ -255,23 +323,46 @@ final class RegionParser
         return (int) (config('minecraft-toolkit.limits.region_fetch_max_bytes', 8_388_608));
     }
 
-    private function sanitizeSegment(string $segment): string
+    /** Local mirror folder of one region dir: readable prefix + hash (never a raw path). */
+    private function cacheDirectory(Server $server, string $regionDir): string
     {
-        $clean = basename(str_replace('\\', '/', trim($segment)));
+        $readable = substr(preg_replace('/[^A-Za-z0-9_-]+/', '_', trim($regionDir, '/')) ?? '', 0, 48);
 
-        return preg_replace('/[^A-Za-z0-9._-]/', '_', $clean) ?: 'world';
+        return implode(DIRECTORY_SEPARATOR, [
+            storage_path('app'),
+            'mctoolkit',
+            preg_replace('/[^A-Za-z0-9_-]/', '', substr((string) $server->uuid_short, 0, 24)) ?: 'unknown',
+            'mapcache',
+            ($readable !== '' ? $readable : 'region').'-'.substr(sha1($regionDir), 0, 10),
+        ]);
     }
 
-    private function pruneStaleGenerations(string $directory, string $keepBasename): void
+    /** Drops older mirrors of THIS region only (`{rx}_{rz}_*.mca`). */
+    private function pruneStaleGenerations(string $directory, int $rx, int $rz, string $keepBasename): void
     {
-        [$rxrz, ] = explode('_', $keepBasename.'_');
-        $prefix = implode('_', [$rxrz]);
-
-        foreach ((array) @glob($directory.DIRECTORY_SEPARATOR.$prefix.'*_*.mca') as $candidate) {
+        foreach ((array) @glob($directory.DIRECTORY_SEPARATOR.sprintf('%d_%d_*.mca', $rx, $rz)) as $candidate) {
             if (is_string($candidate) && basename($candidate) !== $keepBasename) {
                 @unlink($candidate);
             }
         }
+    }
+
+    /** Relative path made of real names only: no empty, `.`/`..` or backslash segments. */
+    private static function isSafeRelativePath(string $path): bool
+    {
+        $trimmed = trim($path, '/');
+
+        if ($trimmed === '' || str_contains($trimmed, '\\') || str_contains($trimmed, "\0")) {
+            return false;
+        }
+
+        foreach (explode('/', $trimmed) as $segment) {
+            if ($segment === '' || $segment === '.' || $segment === '..') {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /* ------------------------------------------------------------------ */
@@ -285,6 +376,7 @@ final class RegionParser
     {
         $parsed = 0;
         $candidates = 0;
+        $regionLength = strlen($regionBytes);
 
         $header = unpack('N1024', substr($regionBytes, 0, self::SECTOR_BYTES));
 
@@ -292,8 +384,10 @@ final class RegionParser
             return ['parsed' => 0, 'candidates' => 0];
         }
 
+        $yTopCap = min(320, max(-64, $yTop));
+
         for ($index = 0; $index < 1024; $index++) {
-            $entry = $header[$index + 1];
+            $entry = (int) ($header[$index + 1] ?? 0);
 
             if ($entry === 0) {
                 continue;
@@ -310,38 +404,37 @@ final class RegionParser
 
             $start = $sectorOffset * self::SECTOR_BYTES;
 
-            if ($start + 5 > strlen($regionBytes)) {
+            if ($start + 5 > $regionLength) {
                 continue;
             }
 
-            $lengthMeta = unpack('N', substr($regionBytes, $start, 4));
-            $length = (int) ($lengthMeta[1] ?? 0);
+            $length = (int) (unpack('N', substr($regionBytes, $start, 4))[1] ?? 0);
 
             // The prefix INCLUDES the trailing compression byte.
             if ($length < 2) {
                 continue;
             }
 
-            $payloadLength = $length - 1;
-            $compressionByte = ord($regionBytes[$start + 4]);
-            $payloadStart = $start + 5;
-
-            if ($payloadStart + $payloadLength > strlen($regionBytes)) {
-                $payloadLength = strlen($regionBytes) - $payloadStart;
-            }
+            $payloadLength = min($length - 1, $regionLength - ($start + 5));
 
             if ($payloadLength <= 0) {
                 continue;
             }
 
-            $payload = substr($regionBytes, $payloadStart, $payloadLength);
-            $inflated = self::inflateChunkPayload($payload, $compressionByte);
+            $compressionByte = ord($regionBytes[$start + 4]);
+            $inflated = self::inflateChunkPayload(substr($regionBytes, $start + 5, $payloadLength), $compressionByte);
 
             if ($inflated === null) {
                 continue;
             }
 
-            $root = $this->decodeChunkNbt($inflated);
+            try {
+                $root = $this->decodeChunkNbt($inflated);
+            } catch (\Throwable) {
+                $root = null; // one damaged chunk must not cost the whole region
+            }
+
+            unset($inflated);
 
             if ($root === null) {
                 continue;
@@ -353,23 +446,21 @@ final class RegionParser
                 continue;
             }
 
-            $status = strval($root['Status'] ?? $root['Level']['Status'] ?? '');
-            $isReady = in_array($status, ['minecraft:full', 'full'], true) || $status === '';
+            $status = $root['Status'] ?? ($root['Level']['Status'] ?? '');
+            $status = is_string($status) ? $status : '';
 
-            // Chunk-local origin inside the region (0..31 based, negatives wrap).
+            if (! in_array($status, ['minecraft:full', 'full', 'fullchunk', 'postprocessed', ''], true)) {
+                continue; // proto chunk still generating: leave fog
+            }
+
+            $dataVersion = $root['DataVersion'] ?? ($root['Level']['DataVersion'] ?? null);
+            $spanning = is_int($dataVersion) && $dataVersion < self::NON_SPANNING_DATA_VERSION;
+
+            // Chunk-local origin inside the region (index = x + z * 32).
             $cx = $index % 32;
             $cz = intdiv($index, 32);
 
-            $this->paintChunkColumns(
-                $sections,
-                $cx,
-                $cz,
-                $coarse,
-                min(320, max(-64, $yTop)),
-                $isReady,
-                $buffer,
-                $side,
-            );
+            $this->paintChunkColumns($sections, $cx, $cz, $coarse, $yTopCap, $spanning, $buffer, $side);
 
             $parsed++;
         }
@@ -378,14 +469,11 @@ final class RegionParser
     }
 
     /**
-     * Documented inflate chain: 1=gzip, 2=zlib envelope (raw decode first, then
-     * raw-deflate fallbacks after stripping the two leading zlib bytes / trying the
-     * whole buffer), 3=stored. Anything else (future tags, corruption) returns null
-     * so the chunk falls back to fog.
+     * Documented inflate chain: 1=gzip, 2=zlib envelope (raw-deflate fallbacks after
+     * stripping the two leading zlib bytes / trying the whole buffer), 3=stored.
+     * Anything else (LZ4, external chunk flag, corruption) returns null -> fog.
      *
-     * Every inflate runs BOUNDED ({@see self::MAX_INFLATED_CHUNK_BYTES}): a hostile
-     * or corrupt .mca chunk record cannot expand beyond the ceiling inside memory
-     * (decompression-bomb guard for imported/uploaded worlds).
+     * Every inflate runs BOUNDED ({@see self::MAX_INFLATED_CHUNK_BYTES}).
      */
     private static function inflateChunkPayload(string $payload, int $compressionByte): ?string
     {
@@ -415,18 +503,17 @@ final class RegionParser
                 }
             }
         } catch (\Throwable) {
-            // PhP inflating functions throw on corrupt streams depending on build; fall through.
+            // Inflate functions throw on corrupt streams depending on build; fall through.
         }
 
         return null;
     }
 
-    /** Decompression-bomb ceiling for ONE chunk record (~a full chunk column worth many times over). */
+    /** Decompression-bomb ceiling for ONE chunk record. */
     private const MAX_INFLATED_CHUNK_BYTES = 16_777_216;
 
     /**
-     * Streaming inflate with an output-size ceiling enforced WHILE feeding input
-     * chunks (not after allocating the whole expansion like gzdecode/zlib_decode do).
+     * Streaming inflate with an output-size ceiling enforced WHILE feeding input.
      *
      * @return string|null inflated bytes; null on corruption, emptiness or ceiling breach
      */
@@ -474,16 +561,12 @@ final class RegionParser
     }
 
     /* ------------------------------------------------------------------ */
-    /*  Minimal big-endian NBT                                             */
+    /*  Selective big-endian NBT                                           */
     /* ------------------------------------------------------------------ */
 
     /**
-     * Decodes the chunk-root compound (tag id 10 + length-prefixed root name +
-     * compound body). Returns `name => value` recursively; tag id 0 closes scopes.
-     *
-     * Tag coverage: 1 Byte .. 12 LongArray (ids referenced as "1..13 inclusive"
-     * in the design brief; End is counted there as well). Depth is capped at
-     * MAX_NBT_DEPTH; deeper compounds/lists are dropped rather than recursed.
+     * Decodes the chunk-root compound (tag id 10 + length-prefixed root name + body),
+     * keeping only {@see self::ROOT_KEEP} keys.
      */
     private function decodeChunkNbt(string $binary): ?array
     {
@@ -493,34 +576,105 @@ final class RegionParser
             return null;
         }
 
-        $nameLen = unpack('n', $binary[1].$binary[2])[1];
-        $pos = 3 + $nameLen;
+        $pos = 3 + self::u16($binary, 1);
 
         if ($pos > $len) {
             return null;
         }
 
-        $value = [];
+        [$root] = $this->readCompound($binary, $pos, 1, self::ROOT_KEEP, true);
 
-        while ($pos < $len) {
-            $tagId = ord($binary[$pos++]);
-
-            if ($tagId === 0) {
-                break;
-            }
-
-            $keyLen = unpack('n', $binary[$pos].$binary[$pos + 1])[1];
-            $key = substr($binary, $pos + 2, $keyLen);
-            $pos += 2 + $keyLen;
-
-            [$value[$key], $pos] = $this->readTagPayload($binary, $pos, $tagId, 1);
-        }
-
-        return $value;
+        return $root;
     }
 
     /**
-     * Reads ONE tag payload; returns [value, nextPosition].
+     * Reads a compound body starting at $pos (right after its name). Children are read
+     * at $childDepth; with $keep only those names are built, the rest is skipped.
+     *
+     * @param  list<string>|null  $keep
+     * @return array{0:array<string, mixed>, 1:int}
+     */
+    private function readCompound(string $binary, int $pos, int $childDepth, ?array $keep, bool $isRoot = false): array
+    {
+        $len = strlen($binary);
+        $out = [];
+
+        while ($pos < $len) {
+            $tag = ord($binary[$pos++]);
+
+            if ($tag === 0) {
+                break;
+            }
+
+            if ($tag > 12 || $pos + 2 > $len) {
+                return [$out, $len];
+            }
+
+            $keyLen = self::u16($binary, $pos);
+            $key = substr($binary, $pos + 2, $keyLen);
+            $pos += 2 + $keyLen;
+
+            if ($keep !== null && ! in_array($key, $keep, true)) {
+                $pos = self::skipPayload($binary, $pos, $tag, $childDepth);
+
+                continue;
+            }
+
+            if ($isRoot && $tag === 10 && ($key === 'Level' || $key === 'Data')) {
+                [$out[$key], $pos] = $this->readCompound($binary, $pos, $childDepth + 1, self::LEVEL_KEEP);
+            } elseif ($tag === 9 && ($key === 'sections' || $key === 'Sections')) {
+                [$out[$key], $pos] = $this->readSectionList($binary, $pos, $childDepth);
+            } else {
+                [$out[$key], $pos] = $this->readTagPayload($binary, $pos, $tag, $childDepth);
+            }
+        }
+
+        return [$out, min($len, $pos)];
+    }
+
+    /**
+     * Section list: compounds read with {@see self::SECTION_KEEP}.
+     *
+     * @return array{0:list<array<string, mixed>>, 1:int}
+     */
+    private function readSectionList(string $binary, int $pos, int $depth): array
+    {
+        $len = strlen($binary);
+
+        if ($pos + 5 > $len) {
+            return [[], $len];
+        }
+
+        $elementTag = ord($binary[$pos]);
+        $count = self::i32($binary, $pos + 1);
+        $cursor = $pos + 5;
+
+        if ($count <= 0 || $elementTag === 0) {
+            return [[], $cursor];
+        }
+
+        if ($elementTag !== 10) {
+            return [[], self::skipPayload($binary, $pos, 9, $depth)];
+        }
+
+        $items = [];
+
+        for ($i = 0; $i < $count && $cursor < $len; $i++) {
+            if ($i >= self::MAX_SECTIONS) {
+                $cursor = self::skipPayload($binary, $cursor, 10, $depth + 1);
+
+                continue;
+            }
+
+            [$items[], $cursor] = $this->readCompound($binary, $cursor, $depth + 2, self::SECTION_KEEP);
+        }
+
+        return [$items, min($len, $cursor)];
+    }
+
+    /**
+     * Reads ONE wanted tag payload; returns [value, nextPosition]. Beyond
+     * {@see self::MAX_NBT_DEPTH} the value is skipped (correct end position, no data).
      *
      * @return array{0:mixed, 1:int}
      */
@@ -528,17 +682,21 @@ final class RegionParser
     {
         $len = strlen($binary);
 
-        if ($depth > self::MAX_NBT_DEPTH || $pos > $len) {
+        if ($pos > $len) {
             return [null, $len];
+        }
+
+        if ($depth > self::MAX_NBT_DEPTH) {
+            return [null, self::skipPayload($binary, $pos, $tagId, 0)];
         }
 
         switch ($tagId) {
             case 1: // Byte (Java signed byte -> PHP signed int)
-                if ($pos >= $len) {
+                if ($pos + 1 > $len) {
                     return [0, $len];
                 }
 
-                $raw = unpack('C', $binary[$pos])[1];
+                $raw = ord($binary[$pos]);
 
                 return [$raw > 127 ? $raw - 256 : $raw, $pos + 1];
 
@@ -547,7 +705,7 @@ final class RegionParser
                     return [0, $len];
                 }
 
-                $raw = unpack('n', substr($binary, $pos, 2))[1];
+                $raw = self::u16($binary, $pos);
 
                 return [$raw > 32767 ? $raw - 65536 : $raw, $pos + 2];
 
@@ -556,26 +714,21 @@ final class RegionParser
                     return [0, $len];
                 }
 
-                $raw = unpack('N', substr($binary, $pos, 4))[1];
+                return [self::i32($binary, $pos), $pos + 4];
 
-                return [$raw > 2147483647 ? $raw - 4294967296 : $raw, $pos + 4];
-
-            case 4: // Long (kept as PHP int, two's complement identical to the wire form)
+            case 4: // Long (two's complement identical to the wire form)
                 if ($pos + 8 > $len) {
                     return [0, $len];
                 }
 
-                [$hi, $lo] = array_values(unpack('N2', substr($binary, $pos, 8)));
-                $value = ($hi << 32) | $lo; // $hi<<32 wraps negative on PHP ints by design.
-
-                return [$value, $pos + 8];
+                return [(int) (unpack('J', substr($binary, $pos, 8))[1] ?? 0), $pos + 8];
 
             case 5: // Float (format G = big-endian float32)
                 if ($pos + 4 > $len) {
                     return [0.0, $len];
                 }
 
-                return [(float) unpack('G', substr($binary, $pos, 4))[1], $pos + 4];
+                return [(float) (unpack('G', substr($binary, $pos, 4))[1] ?? 0.0), $pos + 4];
 
             case 6: // Double
                 if ($pos + 8 > $len) {
@@ -589,25 +742,21 @@ final class RegionParser
                     return ['', $len];
                 }
 
-                $size = unpack('N', substr($binary, $pos, 4))[1];
+                $size = max(0, self::i32($binary, $pos));
                 $bodyStart = $pos + 4;
-
-                if ($bodyStart + $size > $len) {
-                    $size = $len - $bodyStart;
-                }
+                $size = min($size, $len - $bodyStart);
 
                 return [substr($binary, $bodyStart, $size), $bodyStart + $size];
 
-            case 8: // String (modified UTF-8, read verbatim; renderer compares ASCII keys only)
+            case 8: // String (modified UTF-8, read verbatim; renderer compares ASCII ids only)
                 if ($pos + 2 > $len) {
                     return ['', $len];
                 }
 
-                $strLen = unpack('n', substr($binary, $pos, 2))[1];
+                $strLen = self::u16($binary, $pos);
                 $bodyStart = $pos + 2;
-                $safe = min($strLen, $len - $bodyStart);
 
-                return [substr($binary, $bodyStart, $safe), $bodyStart + $strLen];
+                return [substr($binary, $bodyStart, min($strLen, $len - $bodyStart)), min($len, $bodyStart + $strLen)];
 
             case 9: // List
                 if ($pos + 5 > $len) {
@@ -615,118 +764,197 @@ final class RegionParser
                 }
 
                 $elementTag = ord($binary[$pos]);
-                $countRaw = unpack('N', substr($binary, $pos + 1, 4))[1];
-                $count = $countRaw > 2147483647 ? $countRaw - 4294967296 : $countRaw;
+                $count = self::i32($binary, $pos + 1);
                 $cursor = $pos + 5;
 
-                if ($count <= 0 || $elementTag === 0 || $elementTag > 12) {
+                if ($count <= 0 || $elementTag === 0) {
                     return [[], $cursor];
                 }
 
+                if ($elementTag > 12) {
+                    return [[], $len];
+                }
+
                 $items = [];
-                $cap = min($count, 131072); // hard safety valve; real sections stay far below
+                $cap = min($count, 4096); // palettes top out at 4096 entries
 
                 for ($i = 0; $i < $cap && $cursor < $len; $i++) {
                     [$items[], $cursor] = $this->readTagPayload($binary, $cursor, $elementTag, $depth + 1);
                 }
 
-                return [$items, $cursor];
-
-            case 10: // Compound
-                $out = [];
-                $cursor = $pos;
-
-                while ($cursor < $len) {
-                    $innerTag = ord($binary[$cursor++]);
-
-                    if ($innerTag === 0) {
-                        break;
-                    }
-
-                    // Defensive: ids beyond the known set cannot be skipped soundly,
-                    // so the scope is truncated instead of risking a stalled cursor.
-                    if ($innerTag > 12 || $cursor + 2 > $len) {
-                        break;
-                    }
-
-                    $keyLen = unpack('n', substr($binary, $cursor, 2))[1];
-                    $key = substr($binary, $cursor + 2, $keyLen);
-                    $cursor += 2 + $keyLen;
-
-                    [$out[$key], $cursor] = $this->readTagPayload($binary, $cursor, $innerTag, $depth + 1);
+                for (; $i < $count && $cursor < $len; $i++) {
+                    $cursor = self::skipPayload($binary, $cursor, $elementTag, $depth + 1);
                 }
 
-                return [$out, min($len, max($pos, $cursor))];
+                return [$items, min($len, $cursor)];
+
+            case 10: // Compound
+                return $this->readCompound($binary, $pos, $depth + 1, null);
 
             case 11: // IntArray
                 if ($pos + 4 > $len) {
                     return [[], $len];
                 }
 
-                $count = unpack('N', substr($binary, $pos, 4))[1];
+                $count = max(0, self::i32($binary, $pos));
                 $bodyStart = $pos + 4;
-                $available = intdiv(max(0, $len - $bodyStart), 4);
-                $take = min($count, $available, 65536);
+                $take = min($count, intdiv(max(0, $len - $bodyStart), 4), 65536);
 
-                $values = $take > 0 ? array_values(unpack('N'.$take, substr($binary, $bodyStart, $take * 4))) : [];
-                $values = array_map(static fn ($raw) => $raw > 2147483647 ? $raw - 4294967296 : $raw, $values);
+                $values = $take > 0 ? array_values(unpack('N'.$take, substr($binary, $bodyStart, $take * 4)) ?: []) : [];
+                $values = array_map(static fn (int $raw): int => $raw > 2147483647 ? $raw - 4294967296 : $raw, $values);
 
-                return [$values, $bodyStart + $count * 4];
+                return [$values, min($len, $bodyStart + $count * 4)];
 
             case 12: // LongArray
                 if ($pos + 4 > $len) {
                     return [[], $len];
                 }
 
-                $count = unpack('N', substr($binary, $pos, 4))[1];
+                $count = max(0, self::i32($binary, $pos));
                 $bodyStart = $pos + 4;
-                $available = intdiv(max(0, $len - $bodyStart), 8);
-                $take = min($count, $available, 262144);
+                $take = min($count, intdiv(max(0, $len - $bodyStart), 8), 262144);
 
                 $values = [];
 
                 if ($take > 0) {
-                    $raw = unpack('N'.($take * 2), substr($binary, $bodyStart, $take * 8));
+                    $raw = unpack('N'.($take * 2), substr($binary, $bodyStart, $take * 8)) ?: [];
 
                     for ($i = 1; $i <= $take * 2; $i += 2) {
-                        $hi = $raw[$i];
-                        $lo = $raw[$i + 1];
-                        $values[] = ($hi << 32) | $lo;
+                        // $hi << 32 wraps to the signed 64-bit value by design.
+                        $values[] = (((int) ($raw[$i] ?? 0)) << 32) | ((int) ($raw[$i + 1] ?? 0));
                     }
                 }
 
-                return [$values, $bodyStart + $count * 8];
+                return [$values, min($len, $bodyStart + $count * 8)];
 
-            default: // Future/unexpected tag ids: the value is dropped and the cursor is
-                     // left untouched; every caller bounds its own iteration counts.
-                return [null, $pos];
+            default: // Unknown ids cannot be skipped soundly: end this scope.
+                return [null, $len];
         }
     }
 
+    /**
+     * Advances over one payload without building values; returns the next position.
+     * Lists of fixed-size scalars are skipped arithmetically.
+     */
+    private static function skipPayload(string $binary, int $pos, int $tagId, int $depth): int
+    {
+        $len = strlen($binary);
+
+        if ($pos >= $len || $depth > self::MAX_SKIP_DEPTH) {
+            return $len;
+        }
+
+        switch ($tagId) {
+            case 1:
+                return min($len, $pos + 1);
+            case 2:
+                return min($len, $pos + 2);
+            case 3:
+            case 5:
+                return min($len, $pos + 4);
+            case 4:
+            case 6:
+                return min($len, $pos + 8);
+            case 7:
+            case 11:
+            case 12:
+                if ($pos + 4 > $len) {
+                    return $len;
+                }
+
+                $unit = $tagId === 7 ? 1 : ($tagId === 11 ? 4 : 8);
+
+                return min($len, $pos + 4 + max(0, self::i32($binary, $pos)) * $unit);
+            case 8:
+                if ($pos + 2 > $len) {
+                    return $len;
+                }
+
+                return min($len, $pos + 2 + self::u16($binary, $pos));
+            case 9:
+                if ($pos + 5 > $len) {
+                    return $len;
+                }
+
+                $elementTag = ord($binary[$pos]);
+                $count = self::i32($binary, $pos + 1);
+                $cursor = $pos + 5;
+
+                if ($count <= 0 || $elementTag === 0) {
+                    return $cursor;
+                }
+
+                if ($elementTag > 12) {
+                    return $len;
+                }
+
+                $fixed = [1 => 1, 2 => 2, 3 => 4, 4 => 8, 5 => 4, 6 => 8][$elementTag] ?? null;
+
+                if ($fixed !== null) {
+                    return min($len, $cursor + $count * $fixed);
+                }
+
+                for ($i = 0; $i < $count && $cursor < $len; $i++) {
+                    $cursor = self::skipPayload($binary, $cursor, $elementTag, $depth + 1);
+                }
+
+                return min($len, $cursor);
+            case 10:
+                $cursor = $pos;
+
+                while ($cursor < $len) {
+                    $inner = ord($binary[$cursor++]);
+
+                    if ($inner === 0) {
+                        return $cursor;
+                    }
+
+                    if ($inner > 12 || $cursor + 2 > $len) {
+                        return $len;
+                    }
+
+                    $cursor += 2 + self::u16($binary, $cursor);
+                    $cursor = self::skipPayload($binary, $cursor, $inner, $depth + 1);
+                }
+
+                return $len;
+            default:
+                return $len;
+        }
+    }
+
+    private static function u16(string $binary, int $pos): int
+    {
+        return (int) (unpack('n', substr($binary, $pos, 2))[1] ?? 0);
+    }
+
+    private static function i32(string $binary, int $pos): int
+    {
+        $raw = (int) (unpack('N', substr($binary, $pos, 4))[1] ?? 0);
+
+        return $raw > 2147483647 ? $raw - 4294967296 : $raw;
+    }
+
     /* ------------------------------------------------------------------ */
-    /*  Sections dual-path resolution                                      */
+    /*  Sections                                                           */
     /* ------------------------------------------------------------------ */
 
     /**
-     * Pragmatic dual-path reader: legacy writers nest sections under `Level`,
-     * vanilla >= 1.18 puts lowercase `sections` at the root, other writers emit
-     * capitalized `Sections` or wrap everything in `Data`. Detection is by key
-     * presence; first hit wins.
+     * Normalizes both section layouts into rows sorted by Y descending:
+     * [{y:int, palette_names:list<string>, state_words:list<int>, uniform:bool}]
+     * where state_words flattens every packed long into its two 32-bit halves
+     * ([lo, hi, lo, hi, ...]) so bit windows never need 64-bit shifting, and `uniform`
+     * marks a single-entry palette without data (the whole section is palette[0]).
      *
-     * Normalized rows: [{y:int, palette_names:list<string>, state_words:list<int>}]
-     * where state_words flattens EVERY BitState long into its two 32-bit halves
-     * ([hi, lo, hi, lo, ...]) so bit windows never require 64-bit shifting.
-     * Sections are returned sorted by Y descending.
-     *
-     * @return list<array{y:int, palette_names:list<string>, state_words:list<int>}>
+     * @return list<array{y:int, palette_names:list<string>, state_words:list<int>, uniform:bool}>
      */
     private function sectionsOf(array $root): array
     {
         $candidates = [
+            $root['sections'] ?? null,
+            $root['Sections'] ?? null,
             $root['Level']['Sections'] ?? null,
             $root['Level']['sections'] ?? null,
-            $root['Sections'] ?? null,
-            $root['sections'] ?? null,
             $root['Data']['Sections'] ?? null,
             $root['Data']['sections'] ?? null,
         ];
@@ -739,30 +967,35 @@ final class RegionParser
             $rows = [];
 
             foreach ($raw as $section) {
-                if (! is_array($section)) {
+                if (! is_array($section) || ! is_int($section['Y'] ?? null)) {
                     continue;
                 }
 
-                $y = is_int($section['Y'] ?? null) ? $section['Y'] : (is_numeric($section['Y'] ?? null) ? intval($section['Y']) : null);
+                $blockStates = is_array($section['block_states'] ?? null) ? $section['block_states'] : [];
+                $palette = $section['Palette'] ?? ($blockStates['palette'] ?? null);
+                $data = $section['BlockStates'] ?? ($blockStates['data'] ?? null);
 
-                if ($y === null) {
+                if (! is_array($palette) || $palette === []) {
                     continue;
                 }
 
                 $names = [];
 
-                if (isset($section['Palette']) && is_array($section['Palette'])) {
-                    foreach ($section['Palette'] as $block) {
-                        $names[] = $this->normalizeBlockName(is_array($block) ? strval($block['Name'] ?? '') : '');
-                    }
+                foreach ($palette as $block) {
+                    $names[] = $this->normalizeBlockName(is_array($block) && is_string($block['Name'] ?? null) ? $block['Name'] : '');
                 }
 
-                $words = $this->flattenBitStates($section['BlockStates'] ?? null);
+                $words = $this->flattenBitStates($data);
+
+                if ($words === [] && count($names) !== 1) {
+                    continue; // multi-entry palette without data is malformed
+                }
 
                 $rows[] = [
-                    'y' => $y,
+                    'y' => $section['Y'],
                     'palette_names' => $names,
                     'state_words' => $words,
+                    'uniform' => $words === [],
                 ];
             }
 
@@ -776,8 +1009,7 @@ final class RegionParser
 
     /**
      * Normalizes `minecraft:oak_leaves` -> `oak_leaves` and lowercases anything
-     * coming from non-vanilla namespaces (modded blocks collapse onto their
-     * cleaned identifier instead of crashing the renderer).
+     * coming from non-vanilla namespaces.
      */
     private function normalizeBlockName(string $id): string
     {
@@ -793,12 +1025,9 @@ final class RegionParser
     }
 
     /**
-     * Turns the raw BitStates payload (List of Longs) into the flat 32-bit word
-     * array the bit-unpacker consumes.
-     *
-     * Word order matters: Java long bit 0 (numeric LSB) lives in the LOW half,
-     * so each long contributes [lo, hi] — that keeps the flattened stream aligned
-     * with the global bit numbering (word k covers bits [k*32 .. k*32+31)).
+     * Turns the packed longs into the flat 32-bit word array the bit-unpacker consumes.
+     * Java long bit 0 lives in the LOW half, so each long contributes [lo, hi]; the
+     * arithmetic `>> 32` of a negative long is masked back to 32 bits.
      *
      * @return list<int>
      */
@@ -823,17 +1052,11 @@ final class RegionParser
     }
 
     /**
-     * Extracts one bit-window (LSB-first per Java long semantics, matching the
-     * >= 1.16 palette packing) from the flattened word array. Window widths are
-     * always << 32 bits here (palettes hold far fewer than 2^32 blocks), so no
-     * 64-bit arithmetic is required anywhere in the renderer.
+     * Extracts one LSB-first bit window from the flattened word stream; windows may
+     * cross word (and, in the spanning layout, long) boundaries.
      */
     private static function readWindow(array $words, int $startBit, int $width): int
     {
-        if ($width <= 0) {
-            return 0;
-        }
-
         $value = 0;
         $consumed = 0;
 
@@ -856,12 +1079,8 @@ final class RegionParser
     /* ------------------------------------------------------------------ */
 
     /**
-     * Paints the coarse-sampled column grid of one chunk onto the buffer.
-     *
-     * Mapping: relative chunk coords (cx,cz) live inside the 32x32 grid; sampled
-     * block positions advance by `$coarse` horizontally so each output pixel owns
-     * the topmost visible block at its south-west sample anchor (documented
-     * nearest-block heuristic for downscaled tiles).
+     * Paints the coarse-sampled column grid of one chunk onto the buffer. Each output
+     * pixel takes the topmost visible block at its north-west sample anchor.
      */
     private function paintChunkColumns(
         array $sections,
@@ -869,27 +1088,23 @@ final class RegionParser
         int $cz,
         int $coarse,
         int $yTopCap,
-        bool $statusReady,
+        bool $spanning,
         string &$buffer,
         int $side,
     ): void {
-        if (! $statusReady) {
-            return; // unpainted candidates simply remain fog.
-        }
-
-        // Pre-resolve kind codes once per section (air=0 skipped, water blends,
-        // glass passes through, everything else terminates the walk opaquely).
-        $paletteKind = [];
-
+        // Pre-resolve kind codes and colors once per section.
         foreach ($sections as &$section) {
             $kinds = [];
+            $colors = [];
 
             foreach ($section['palette_names'] as $idx => $name) {
                 $kinds[$idx] = self::classify($name);
+                $colors[$idx] = $this->rgbFor($name);
             }
 
             $section['kinds'] = $kinds;
-            $section['color_rgb'] = $this->rgbTableFor($section['palette_names']);
+            $section['color_rgb'] = $colors;
+            $section['bits'] = max(4, (int) ceil(log(max(count($section['palette_names']), 1), 2)));
         }
 
         unset($section);
@@ -898,22 +1113,14 @@ final class RegionParser
 
         for ($localZ = 0; $localZ < self::BLOCKS_PER_CHUNK; $localZ += $step) {
             for ($localX = 0; $localX < self::BLOCKS_PER_CHUNK; $localX += $step) {
-                $columnRgb = $this->columnColor($sections, $localX, $localZ, $yTopCap);
+                $columnRgb = $this->columnColor($sections, $localX, $localZ, $yTopCap, $spanning);
 
                 if ($columnRgb === null) {
                     continue; // leave fog underneath.
                 }
 
-                // Global block coordinates within the region grid.
-                $gridX = $cx * self::BLOCKS_PER_CHUNK + $localX;
-                $gridZ = $cz * self::BLOCKS_PER_CHUNK + $localZ;
-
-                if ($gridX >= self::BLOCKS_PER_REGION_AXIS || $gridZ >= self::BLOCKS_PER_REGION_AXIS) {
-                    continue;
-                }
-
-                $px = intdiv($gridX, $coarse);
-                $pz = intdiv($gridZ, $coarse);
+                $px = intdiv($cx * self::BLOCKS_PER_CHUNK + $localX, $step);
+                $pz = intdiv($cz * self::BLOCKS_PER_CHUNK + $localZ, $step);
 
                 if ($px >= $side || $pz >= $side) {
                     continue;
@@ -930,130 +1137,144 @@ final class RegionParser
     /** Kind classification: 0 air (walk past), 1 opaque surface, 2 water blend, 3 see-through pass. */
     private static function classify(string $name): int
     {
-        if ($name === '') {
+        if ($name === '' || $name === 'air' || $name === 'void_air' || $name === 'cave_air') {
             return 0;
         }
 
-        if (in_array($name, ['air', 'void_air', 'cave_air'], true)) {
-            return 0;
-        }
-
-        if (str_contains($name, 'water') || $name === 'bubble_column' || $name === 'sea_grass' || $name === 'seagrass' || $name === 'kelp') {
+        if (str_contains($name, 'water') || in_array($name, ['bubble_column', 'seagrass', 'tall_seagrass', 'sea_grass', 'kelp', 'kelp_plant'], true)) {
             return 2;
         }
 
-        if (str_contains($name, 'glass')) {
+        if (str_contains($name, 'glass') || in_array($name, self::PASS_THROUGH, true)) {
             return 3;
+        }
+
+        foreach (self::PASS_THROUGH_SUFFIXES as $suffix) {
+            if (str_ends_with($name, $suffix)) {
+                return 3;
+            }
         }
 
         return 1;
     }
 
     /**
-     * Walks one column downwards until a terminating block appears. Returns the
-     * final RGB triplet or null (leave-fog contract).
-     *
-     * Water behavior: the FIRST water block met stores the tint; the walk continues
-     * beneath it. When ground eventually shows up the final color composites
-     * WATER_BLEND_FACTOR of the recorded water tint OVER the ground tone
-     * (documented approximation of looking into shallow water). When the whole
-     * column is water, the deep-water tone paints instead.
+     * Walks one column downwards until a terminating block appears. Returns the final
+     * RGB triplet or null (leave-fog contract). The first water block stores the tint;
+     * when ground shows up beneath it, WATER_BLEND_FACTOR of the tint is composited
+     * over the ground tone; an all-water column paints deep water.
      *
      * @return array{0:int, 1:int, 2:int}|null
      */
-    private function columnColor(array $sections, int $localX, int $localZ, int $yTopCap): ?array
+    private function columnColor(array $sections, int $localX, int $localZ, int $yTopCap, bool $spanning): ?array
     {
         $waterAbove = null;
-        $yScanStarted = false;
-        $encountered = false; // did we meet ANY informative (non-air-resolved) block?
+        $encountered = false; // did we meet ANY informative (non-air) block?
 
         foreach ($sections as $section) {
-            $baseY = $section['y'] * 16;
-            $paletteNames = $section['palette_names'];
-            $kinds = $section['kinds'] ?? [];
-            $words = $section['state_words'];
+            $paletteSize = count($section['palette_names']);
 
-            if ($paletteNames === [] || $words === []) {
+            if ($paletteSize === 0) {
                 continue;
             }
 
-            $bitSize = max(4, (int) ceil(log(max(count($paletteNames), 1), 2)));
+            $kinds = $section['kinds'];
+
+            // Whole-section single block: air sections cost nothing.
+            if ($section['uniform'] && ($kinds[0] ?? 0) === 0) {
+                continue;
+            }
+
+            $baseY = $section['y'] * 16;
+            $bitSize = $section['bits'];
+            $entriesPerLong = intdiv(64, $bitSize);
 
             for ($yLocal = 15; $yLocal >= 0; $yLocal--) {
-                $worldY = $baseY + $yLocal;
-
-                if (!$yScanStarted && $worldY > $yTopCap) {
-                    continue; // clamp the very top of tall section stacks.
+                if ($baseY + $yLocal > $yTopCap) {
+                    continue;
                 }
 
-                $yScanStarted = true;
+                if ($section['uniform']) {
+                    $entry = 0;
+                } else {
+                    // Section block order: Y-major, then Z, then X.
+                    $index = ($yLocal * 256) + ($localZ * 16) + $localX;
+                    $startBit = $spanning
+                        ? $index * $bitSize
+                        : intdiv($index, $entriesPerLong) * 64 + ($index % $entriesPerLong) * $bitSize;
+                    $entry = self::readWindow($section['state_words'], $startBit, $bitSize);
+                }
 
-                // Anvil ordering inside a section: Y-major, then Z, then X.
-                // Packing address: each Java long carries floor(64/bitSize) entries;
-                // leftover bits per long are PADDING skipped before the next long.
-                $index = ($yLocal * 256) + ($localZ * 16) + $localX;
-                $entriesPerLong = intdiv(64, $bitSize);
-                $startBit = intdiv($index, $entriesPerLong) * 64 + ($index % $entriesPerLong) * $bitSize;
-                $entry = self::readWindow($words, $startBit, $bitSize);
-
-                if ($entry >= count($paletteNames)) {
+                if ($entry >= $paletteSize) {
                     continue;
                 }
 
                 $kind = $kinds[$entry] ?? 1;
 
-                if ($kind === 0) {
-                    continue;
+                if ($kind === 0 || $kind === 3) {
+                    continue; // air, glass roofs and small decorations: look beneath.
                 }
 
-                $encountered = true; // water & opaque both count; glass alone does not.
-
-                if ($kind === 3) {
-                    continue; // glass roof: keep looking beneath (documented).
-                }
-
+                $encountered = true;
                 $rgb = $section['color_rgb'][$entry] ?? self::hexToRgb(self::UNKNOWN_BLOCK_COLOR);
 
                 if ($kind === 2) {
                     $waterAbove ??= $rgb;
 
-                    continue; // carry on below for underwater ground tone.
+                    continue; // carry on below for the underwater ground tone.
                 }
 
-                return $waterAbove === null
-                    ? $rgb
-                    : self::blendWater($waterAbove, $rgb);
+                return $waterAbove === null ? $rgb : self::blendWater($waterAbove, $rgb);
             }
         }
 
-        if (!$encountered) {
-            return null; // nothing informative in this column -> keep fog (leave-fog contract)
+        if (! $encountered) {
+            return null; // nothing informative in this column -> keep fog
         }
 
-        return $waterAbove === null ? self::hexToRgb(self::UNKNOWN_BLOCK_COLOR) : self::blendWater($waterAbove, self::hexToRgb(self::UNKNOWN_BLOCK_COLOR));
+        return $waterAbove === null
+            ? self::hexToRgb(self::UNKNOWN_BLOCK_COLOR)
+            : self::blendWater($waterAbove, self::hexToRgb(self::DEEP_WATER_HEX));
     }
 
     /**
-     * Cached hex -> rgb triplets per palette entry (UNKNOWN_BLOCK_COLOR fallback).
+     * Color of one block id: exact table hit, then shape-stripped material fallbacks
+     * (oak_slab -> oak_planks, stone_brick_stairs -> stone_bricks…), else neutral gray.
      *
-     * @return list<array{0:int,1:int,2:int}>
+     * @return array{0:int,1:int,2:int}
      */
-    private function rgbTableFor(array $names): array
+    private function rgbFor(string $name): array
     {
-        $table = [];
-        $known = $this->colors();
-
-        foreach ($names as $name) {
-            $hex = $known[$name] ?? null;
-
-            if (! is_string($hex) || ! preg_match('/^#[0-9a-fA-F]{6}$/', $hex)) {
-                $hex = $name === '' ? self::FOG_COLOR_HEX : self::UNKNOWN_BLOCK_COLOR;
-            }
-
-            $table[] = self::hexToRgb($hex);
+        if (isset($this->rgbCache[$name])) {
+            return $this->rgbCache[$name];
         }
 
-        return $table;
+        $known = $this->colors();
+        $hex = $known[$name] ?? null;
+
+        if ($hex === null) {
+            foreach (self::SHAPE_SUFFIXES as $suffix) {
+                if (! str_ends_with($name, $suffix)) {
+                    continue;
+                }
+
+                $base = substr($name, 0, -strlen($suffix));
+
+                foreach ([$base, $base.'_planks', $base.'s', $base.'_block'] as $candidate) {
+                    if (isset($known[$candidate])) {
+                        $hex = $known[$candidate];
+
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        if (! is_string($hex) || preg_match('/^#[0-9a-fA-F]{6}$/', $hex) !== 1) {
+            $hex = $name === '' ? self::FOG_COLOR_HEX : self::UNKNOWN_BLOCK_COLOR;
+        }
+
+        return $this->rgbCache[$name] = self::hexToRgb($hex);
     }
 
     /**
@@ -1068,7 +1289,7 @@ final class RegionParser
 
             if (is_file($path)) {
                 try {
-                    $decoded = json_decode((string) file_get_contents($path), true, 4, JSON_THROW_ON_ERROR) ?? [];
+                    $decoded = json_decode((string) file_get_contents($path), true, 8, JSON_THROW_ON_ERROR) ?? [];
                 } catch (\JsonException) {
                     $decoded = [];
                 }
@@ -1084,6 +1305,7 @@ final class RegionParser
         return $this->colors;
     }
 
+    /** @return array{0:int,1:int,2:int} */
     private static function hexToRgb(string $hex): array
     {
         $value = (int) hexdec(substr(trim($hex, '#'), 0, 6));
@@ -1092,8 +1314,7 @@ final class RegionParser
     }
 
     /**
-     * Composite blend: `factor` amount of the water tint layered over the ground
-     * tone (WATER_BLEND_FACTOR = 0.6 per design note).
+     * Composite blend: `factor` amount of the water tint layered over the ground tone.
      *
      * @param  array{0:int,1:int,2:int}  $water
      * @param  array{0:int,1:int,2:int}  $ground

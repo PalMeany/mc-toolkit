@@ -8,11 +8,8 @@ use App\Enums\TablerIcon;
 use BackedEnum;
 use UnitEnum;
 use Filament\Actions\Action;
-use Filament\Facades\Filament;
-use Filament\Notifications\Notification;
 use Filament\Pages\Page;
 use McToolkit\Filament\Server\Pages\Concerns\InteractsWithContent;
-use Throwable;
 
 /**
  * Plugins — catalog from Modrinth / Hangar / SpigotMC (+ CurseForge with a key),
@@ -23,7 +20,8 @@ use Throwable;
  * No-toolkit parity callout: pure vanilla / undetected servers get the translated
  * "This server does not load plugins" note, but INSTALL stays available — placing
  * plugins BEFORE swapping software on the Versions page is a real workflow
- * (decision documented in the wave handoff notes).
+ * (decision documented in the wave handoff notes). Proxies (Velocity / Waterfall /
+ * BungeeCord) DO load plugins and get no callout.
  */
 final class PluginsPage extends Page
 {
@@ -38,19 +36,23 @@ final class PluginsPage extends Page
 
     protected string $view = 'minecraft-toolkit::server.plugins';
 
+
+    /** Namespaced URL: /server/{uuid_short}/mc-toolkit/plugins (README "Feature pages"). */
+
+    protected static ?string $slug = 'mc-toolkit/plugins';
+
     /** Livewire event emitted by the shared detection-banner's re-detect control. */
     protected $listeners = ['mc-toolkit.redetect' => 'redetect'];
 
+    /**
+     * 'use' + 'content' on a server outside any conflict state. Filament re-runs this on
+     * every Livewire request of the page (CanAuthorizeAccess::hydrateCanAuthorizeAccess).
+     */
     public static function canAccess(): bool
     {
         return parent::canAccess()
             && (bool) config('minecraft-toolkit.pages.enabled.plugins', true)
-            && user()?->can('minecraft-toolkit.use', Filament::getTenant());
-    }
-
-    protected function authorizeAccess(): void
-    {
-        abort_unless(user()?->can('minecraft-toolkit.content', Filament::getTenant()), 403);
+            && static::canAccessContentCatalog();
     }
 
     public function getTitle(): string
@@ -74,7 +76,7 @@ final class PluginsPage extends Page
             Action::make('refresh')
                 ->label(trans('minecraft-toolkit::common.buttons.refresh'))
                 ->icon(TablerIcon::Refresh)
-                ->action(fn () => $this->safeRefresh()),
+                ->action(fn () => $this->refreshContent()),
         ];
     }
 
@@ -103,7 +105,7 @@ final class PluginsPage extends Page
         $software = strtolower((string) ($detected['software'] ?? 'unknown'));
         $loader = strtolower((string) ($detected['loader'] ?? 'vanilla'));
 
-        if ($software === 'unknown' || in_array($loader, ['vanilla', 'velocity'], true)) {
+        if ($software === 'unknown' || $loader === 'vanilla') {
             return [
                 'title' => trans('minecraft-toolkit::pages.plugins.no_toolkit.title'),
                 'message' => trans('minecraft-toolkit::pages.plugins.no_toolkit.desc'),
@@ -112,21 +114,5 @@ final class PluginsPage extends Page
         }
 
         return null;
-    }
-
-    /* ------------------------------------------------------------------ */
-    /*  Error-shielded refresh (header action wrapper)                     */
-    /* ------------------------------------------------------------------ */
-
-    private function safeRefresh(): void
-    {
-        try {
-            $this->refresh();
-        } catch (Throwable) {
-            Notification::make()
-                ->title(trans('minecraft-toolkit::banner.failures.gateway_down'))
-                ->danger()
-                ->send();
-        }
     }
 }

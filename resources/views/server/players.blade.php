@@ -75,9 +75,9 @@
 
     {{-- ---------------------------------------------------------------
          Pinned detection banner — shared across every toolkit page.
-      ---------------------------------------------------------------- }}
+      ------------------------------------------------------------------}}
     <x-dynamic-component
-        :component="'minecraft-toolkit::components.detection-banner'"
+        :component="'minecraft-toolkit::detection-banner'"
         :software="$detection"
     />
 
@@ -100,7 +100,7 @@
 
     {{-- ---------------------------------------------------------------
          Toolbar — counter "x of y online", Instant chip, polling toggle.
-      ---------------------------------------------------------------- }}
+      ------------------------------------------------------------------}}
     <div class="{{ $cardShell }} flex flex-wrap items-center justify-between gap-x-4 gap-y-3 p-4 sm:p-5">
         <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
             <span class="text-sm font-semibold tabular-nums text-gray-950 dark:text-white">
@@ -157,7 +157,7 @@
 
     {{-- ---------------------------------------------------------------
          Segmented filters + search + quick whitelist add row.
-      ---------------------------------------------------------------- }}
+      ------------------------------------------------------------------}}
     <div class="flex flex-col gap-4 lg:flex-row lg:items-start">
         <div class="flex flex-1 flex-col gap-3">
             <div class="flex flex-wrap items-center gap-x-3 gap-y-3">
@@ -189,8 +189,24 @@
                 </label>
             </div>
 
-            {{-- quick add-to-whitelist input moved onto the page form schema
-                 (renders inside the Controls card, triggers via its Add button there) --}}
+            {{-- quick add-to-whitelist: its own schema (PlayersPage::whitelistForm), rendered
+                 here so it works with no player selected — e.g. nobody online yet --}}
+            <div class="{{ $cardShell }} flex flex-col gap-3 p-4 sm:flex-row sm:items-end sm:p-5">
+                <div class="min-w-0 flex-1">
+                    {{ $this->whitelistForm }}
+                </div>
+
+                <x-filament::button
+                    color="gray"
+                    icon="tabler-user-check"
+                    wire:click="addToWhitelist"
+                    :disabled="! $canSend"
+                    wire:loading.attr="disabled"
+                    wire:target="addToWhitelist"
+                >
+                    {{ trans('minecraft-toolkit::pages.players.whitelist_add.button') }}
+                </x-filament::button>
+            </div>
 
             {{-- ----------------------------------------------
                  Player cards grid
@@ -210,9 +226,11 @@
                             $isOnline = (bool) $row['online'];
                         @endphp
 
+                        {{-- @js(): the id lands inside a JS expression, so it is emitted as a
+                             JSON-escaped literal (HTML escaping alone would be undone by the browser) --}}
                         <button type="button"
                                 wire:key="player-{{ md5(strval($row['uuid'].$row['name'])) }}"
-                                wire:click="selectPlayer('{{ strtolower(strval($row['uuid'])) }}')"
+                                wire:click="selectPlayer(@js(strtolower(strval($row['uuid']))))"
                                 aria-pressed="{{ $isSelected ? 'true' : 'false' }}"
                                 class="{{ $cardShell }} group flex h-full w-full flex-col items-start gap-3 p-4 text-start transition duration-75 hover:bg-gray-50 dark:hover:bg-white/5 {{
                                     $isSelected ? 'ring-2 ring-primary-500' : ''
@@ -378,27 +396,14 @@
                             @endforeach
                         </datalist>
 
-                        {{-- THE Controls/Give schema: whitelist name, gamemode toggle buttons,
-                             XP levels, give item + count — Filament form components only --}}
+                        {{-- THE Controls/Give schema: gamemode toggle buttons, XP levels,
+                             give item + count — Filament form components only --}}
                         {{ $this->form }}
-
-                        {{-- whitelist add trigger (field lives in the schema above) --}}
-                        <x-filament::button
-                            :color="'secondary'"
-                            size="sm"
-                            icon="tabler-user-check"
-                            wire:click="addToWhitelist"
-                            :disabled="! $canSend"
-                            wire:loading.attr="disabled"
-                            wire:target="addToWhitelist()"
-                        >
-                            {{ trans('minecraft-toolkit::pages.players.controls.whitelisted') }}
-                        </x-filament::button>
 
                         {{-- XP stepper actions: − Set + (value itself lives in the schema) --}}
                         <div class="flex flex-wrap items-center gap-x-2 gap-y-2">
                             <x-filament::button
-                                :color="'secondary'"
+                                color="gray"
                                 size="sm"
                                 wire:click="bumpXp(-1)"
                                 :disabled="! $canSend"
@@ -417,7 +422,7 @@
                             </x-filament::button>
 
                             <x-filament::button
-                                :color="'secondary'"
+                                color="gray"
                                 size="sm"
                                 wire:click="bumpXp(1)"
                                 :disabled="! $canSend"
@@ -443,14 +448,15 @@
 
                         {{-- state toggles: Operator / Whitelisted / Banned --}}
                         <div class="grid gap-2 sm:grid-cols-3">
+                            {{-- method names are fixed literals; the uuid argument goes through @js() --}}
                             @foreach ([
-                                'operator' => ['on' => $selectedRow['op'], 'wire' => 'toggleOperator(\''.strtolower(strval($selectedRow['uuid'])).'\')', 'lang' => trans('minecraft-toolkit::pages.players.controls.operator')],
-                                'whitelisted' => ['on' => $selectedRow['whitelisted'], 'wire' => 'toggleWhitelisted(\''.strtolower(strval($selectedRow['uuid'])).'\')', 'lang' => trans('minecraft-toolkit::pages.players.controls.whitelisted')],
-                                'banned' => ['on' => $selectedRow['banned'], 'wire' => 'toggleBanned(\''.strtolower(strval($selectedRow['uuid'])).'\')', 'lang' => trans('minecraft-toolkit::pages.players.controls.banned')],
+                                'operator' => ['on' => $selectedRow['op'], 'method' => 'toggleOperator', 'lang' => trans('minecraft-toolkit::pages.players.controls.operator')],
+                                'whitelisted' => ['on' => $selectedRow['whitelisted'], 'method' => 'toggleWhitelisted', 'lang' => trans('minecraft-toolkit::pages.players.controls.whitelisted')],
+                                'banned' => ['on' => $selectedRow['banned'], 'method' => 'toggleBanned', 'lang' => trans('minecraft-toolkit::pages.players.controls.banned')],
                             ] as $key => $toggle)
                                 <button type="button"
                                         wire:key="toggle-{{ $key }}-{{ md5(strtolower(strval($selectedRow['uuid']))) }}"
-                                        wire:click="{{ $toggle['wire'] }}"
+                                        wire:click="{{ $toggle['method'] }}(@js(strtolower(strval($selectedRow['uuid']))))"
                                         class="flex w-full items-center justify-between gap-x-2 rounded-lg bg-white px-3 py-2 text-sm font-medium shadow-sm ring-1 transition duration-75 {{
                                             $toggle['on']
                                                 ? 'ring-success-600/30 text-success-700 dark:ring-success-400/40 dark:text-success-300'

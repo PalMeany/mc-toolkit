@@ -22,33 +22,37 @@ use Throwable;
  * this as their own first-party helper.
  *
  * Mechanics:
- *  - DISTINCT tracked rows collapse into project-level probes keyed
- *    `<registry>|<project_id>`; modpack child rows therefore share ONE probe with
- *    their umbrella row instead of tripling upstream calls.
+ *  - DISTINCT tracked rows collapse into project-level probes keyed by
+ *    {@see self::keyFor()} (`<registry>|<project_id>`, project ids keep their case —
+ *    Modrinth ids and Hangar slugs are case-sensitive); modpack child rows therefore
+ *    share ONE probe with their umbrella row instead of tripling upstream calls.
  *  - Each probe resolves the newest upstream release TIMESTAMP per adapter:
  *
  *      registry    | source of truth                                   | guard
  *      ------------|---------------------------------------------------|------------------
  *      modrinth    | GET /v2/project/{id}/version → max(date_published)| existing adapter
- *      spigotmc    | SpigetService::resource() → updateDate unix       | existing adapter
- *      hangar      | HangarService::versions() → best-effort date key  | needs Bearer key
+ *      spigotmc    | GET /v2/resources/{id} → updateDate unix          | existing adapter
+ *      hangar      | HangarService::versions() → max(createdAt)        | public API
  *      curseforge  | GET /v1/mods/{id}/files → max(fileDate)           | needs x-api-key
  *
  *  - Foreign rows are skipped gracefully BY CONSTRUCTION (only tracked_by_toolkit
  *    rows feed the probe list); unknown registries just never get probed.
  *  - Availability itself is NOT decided here — the cache must stay independent of
  *    any single row's install time, so scan() returns per-project timestamps and the
- *    page concern compares `latest_ts > row.updated_at` to light the indicator dot.
- *  - Whole-server results cache under mctoolkit.updates.<uuid_short> for the page
- *    session TTL below, keeping repeated renders cheap and dot state stable.
+ *    page concern compares `latest_ts > row.updated_at` to light the indicator dot
+ *    (the installer bumps updated_at on every (re)install, so acting on a dot clears it).
+ *  - Whole-server results cache under mctoolkit.updates.<uuid_short>; {@see self::forget()}
+ *    drops it whenever content changes or the user hits Refresh.
  */
 final class UpdateScanner
 {
     /** Cache TTL — aligns with the detection window so dots and banner refresh together. */
     private const CACHE_TTL_SECONDS = 900;
 
-    /** Best-effort ISO/datetime keys observed inside Hangar version payloads. */
-    private const HANGAR_TS_KEYS = ['createDateTime', 'dateCreated', 'created_at', 'lastUpdated', 'created'];
+    /** Timestamp keys inside Hangar version payloads (createdAt is the live one). */
+    private const HANGAR_TS_KEYS = ['createdAt', 'lastUpdated'];
+
+    private const PROBEABLE_REGISTRIES = ['modrinth', 'spigotmc', 'hangar', 'curseforge'];
 
     public function __construct(
         private readonly ModrinthService $modrinth,
@@ -57,10 +61,25 @@ final class UpdateScanner
     ) {}
 
     /**
+     * Canonical scan-map key for one registry project. Registry tokens are lowercased
+     * ('spigot' aliases 'spigotmc'); project ids are only trimmed, never case-folded.
+     */
+    public static function keyFor(?string $registry, ?string $projectId): string
+    {
+        $registry = strtolower(trim((string) $registry));
+
+        if ($registry === 'spigot') {
+            $registry = 'spigotmc';
+        }
+
+        return $registry.'|'.trim((string) $projectId);
+    }
+
+    /**
      * Newest-release snapshot for every probeable project tracked on $server.
      *
      * @return array<string, array{latest_ts: ?int, latest_version: ?string}>
-     *               keys are "<registry-lowercase>|<project_id>"
+     *               keys are {@see self::keyFor()}
      */
     public function scan(Server $server): array
     {
@@ -72,10 +91,9 @@ final class UpdateScanner
             return $cached;
         }
 
-        $probes = $this->collectProbes($server);
         $map = [];
 
-        foreach ($probes as [$registry, $projectId]) {
+        foreach ($this->collectProbes($server) as [$registry, $projectId]) {
             try {
                 $snapshot = $this->probe($registry, $projectId);
             } catch (Throwable) {
@@ -83,7 +101,7 @@ final class UpdateScanner
             }
 
             if ($snapshot !== null) {
-                $map[strtolower($registry).'|'.$projectId] = $snapshot;
+                $map[self::keyFor($registry, $projectId)] = $snapshot;
             }
         }
 
@@ -92,7 +110,7 @@ final class UpdateScanner
         return $map;
     }
 
-    /** Force-refreshed variant used when the user clicks Update (dot should re-check soon). */
+    /** Drop the cached snapshot so the next render re-probes (installs, updates, Refresh). */
     public function forget(Server $server): void
     {
         cache()->forget(CacheKeys::ns('updates', $server));
@@ -119,14 +137,12 @@ final class UpdateScanner
         $probes = [];
 
         foreach ($rows as $row) {
-            $registry = strtolower(trim((string) ($row->registry ?? '')));
-            $projectId = trim((string) ($row->project_id ?? ''));
+            $pairKey = self::keyFor($row->registry, $row->project_id);
+            [$registry, $projectId] = explode('|', $pairKey, 2);
 
-            if ($registry === '' || $projectId === '' || ! in_array($registry, self::PROBEABLE_REGISTRIES, true)) {
+            if ($projectId === '' || !in_array($registry, self::PROBEABLE_REGISTRIES, true)) {
                 continue; // foreign rows + unprobeable registries skip gracefully
             }
-
-            $pairKey = $registry.'|'.$projectId;
 
             if (isset($seen[$pairKey])) {
                 continue;
@@ -140,25 +156,20 @@ final class UpdateScanner
         return $probes;
     }
 
-    private const PROBEABLE_REGISTRIES = ['modrinth', 'spigot', 'spigotmc', 'hangar', 'curseforge'];
-
     /**
      * One adapter lookup translated into a normalized snapshot (null ⇒ no usable data).
      *
-     * @param  string  $registry  lowercase registry token ('spigot'/'spigotmc' alias both)
      * @return array{latest_ts: ?int, latest_version: ?string}|null
      */
     private function probe(string $registry, string $projectId): ?array
     {
-        $snapshot = match ($registry) {
+        return match ($registry) {
             'modrinth' => $this->probeModrinth($projectId),
-            'spigot', 'spigotmc' => $this->probeSpiget($projectId),
+            'spigotmc' => $this->probeSpiget($projectId),
             'hangar' => $this->probeHangar($projectId),
             'curseforge' => $this->probeCurseForge($projectId),
             default => null,
         };
-
-        return $snapshot;
     }
 
     /**
@@ -169,22 +180,11 @@ final class UpdateScanner
      */
     private function probeModrinth(string $projectId): ?array
     {
-        $rows = $this->modrinth->versions($projectId);
-
-        if ($rows === []) {
-            return null;
-        }
-
         $bestTs = null;
         $bestVersion = null;
 
-        foreach ($rows as $row) {
-            if (! is_array($row)) {
-                continue;
-            }
-
-            $published = is_string($row['date_published'] ?? null) ? strtotime($row['date_published']) : false;
-            $ts = is_int($published) ? $published : null;
+        foreach ($this->modrinth->versions($projectId) as $row) {
+            $ts = is_string($row['date_published'] ?? null) ? self::isoToTs($row['date_published']) : null;
 
             if ($ts !== null && ($bestTs === null || $ts > $bestTs)) {
                 $bestTs = $ts;
@@ -192,11 +192,7 @@ final class UpdateScanner
             }
         }
 
-        if ($bestTs === null && $bestVersion === null) {
-            return null;
-        }
-
-        return ['latest_ts' => $bestTs, 'latest_version' => $bestVersion];
+        return $bestTs === null ? null : ['latest_ts' => $bestTs, 'latest_version' => $bestVersion];
     }
 
     /**
@@ -206,15 +202,13 @@ final class UpdateScanner
      */
     private function probeSpiget(string $resourceId): ?array
     {
-        // Direct resource read through the shared cached JSON channel keeps parity with
-        // SpigetService::resource() while returning EXACTLY what we need without extra fields.
         $payload = HttpJsonCache::get(
             'https://api.spiget.org/v2/resources/'.rawurlencode($resourceId),
             120,
             ['fields' => implode(',', ['name', 'updateDate'])],
         );
 
-        if (! is_array($payload)) {
+        if (!is_array($payload)) {
             return null;
         }
 
@@ -226,55 +220,29 @@ final class UpdateScanner
             default => null,
         };
 
-        $title = is_string($payload['name'] ?? null) ? $payload['name'] : null;
-
-        return $ts === null ? null : ['latest_ts' => $ts, 'latest_version' => $title];
+        return $ts === null ? null : ['latest_ts' => $ts, 'latest_version' => null];
     }
 
     /**
-     * Hangar version listings are keyed by platform with nested payload objects;
-     * timestamp extraction stays defensive because upstream field names drift
-     * between API versions (documented unknown in handoff notes).
+     * Hangar versions carry an ISO `createdAt`; the newest published one wins.
      *
      * @return array{latest_ts: ?int, latest_version: ?string}|null
      */
-    private function probeHangar(string $ownerSlug): ?array
+    private function probeHangar(string $slug): ?array
     {
-        if ($this->hangar->apiKey() === '') {
-            return null;
-        }
-
-        $rows = $this->hangar->versions($ownerSlug);
-
-        if ($rows === []) {
-            return null;
-        }
-
         $bestTs = null;
         $bestVersion = null;
 
-        foreach ($rows as $row) {
-            if (! is_array($row)) {
-                continue;
-            }
-
+        foreach ($this->hangar->versions($slug) as $row) {
             $ts = null;
 
             foreach (self::HANGAR_TS_KEYS as $keyName) {
                 $candidate = $row[$keyName] ?? null;
 
-                if (is_int($candidate) || is_float($candidate)) {
-                    $ts = (int) $candidate;
-
-                    break;
-                }
-
                 if (is_string($candidate) && $candidate !== '') {
-                    $parsed = self::isoToTs($candidate);
+                    $ts = self::isoToTs($candidate);
 
-                    if ($parsed !== null) {
-                        $ts = $parsed;
-
+                    if ($ts !== null) {
                         break;
                     }
                 }
@@ -286,16 +254,11 @@ final class UpdateScanner
             }
         }
 
-        if ($bestTs === null && $bestVersion === null) {
-            return null;
-        }
-
-        return ['latest_ts' => $bestTs, 'latest_version' => $bestVersion];
+        return $bestTs === null ? null : ['latest_ts' => $bestTs, 'latest_version' => $bestVersion];
     }
 
     /**
-     * CurseForge file listing — no loader filter needed to find the NEWEST upload,
-     * deliberately sidestepping the installer's loader mapping entirely.
+     * CurseForge file listing — the newest upload of any flavour.
      *
      * @return array{latest_ts: ?int, latest_version: ?string}|null
      */
@@ -305,26 +268,11 @@ final class UpdateScanner
             return null;
         }
 
-        $payload = HttpJsonCache::get(
-            'https://api.curseforge.com/v1/mods/'.rawurlencode($modId).'/files',
-            120,
-            ['pageSize' => 10],
-            ['x-api-key' => $this->curseForge->apiKey()],
-        );
-
-        if (! is_array($payload) || ! is_array($payload['data'] ?? null)) {
-            return null;
-        }
-
         $bestTs = null;
         $bestVersion = null;
 
-        foreach ($payload['data'] as $file) {
-            if (! is_array($file)) {
-                continue;
-            }
-
-            $ts = self::isoToTs(is_string($file['fileDate'] ?? null) ? $file['fileDate'] : '');
+        foreach ($this->curseForge->files($modId, ['pageSize' => 10]) as $file) {
+            $ts = is_string($file['fileDate'] ?? null) ? self::isoToTs($file['fileDate']) : null;
 
             if ($ts !== null && ($bestTs === null || $ts > $bestTs)) {
                 $bestTs = $ts;
@@ -332,11 +280,7 @@ final class UpdateScanner
             }
         }
 
-        if ($bestTs === null && $bestVersion === null) {
-            return null;
-        }
-
-        return ['latest_ts' => $bestTs, 'latest_version' => $bestVersion];
+        return $bestTs === null ? null : ['latest_ts' => $bestTs, 'latest_version' => $bestVersion];
     }
 
     /** ISO-8601-ish strings → unix seconds; null when unusable. */
@@ -357,9 +301,12 @@ final class UpdateScanner
         // Some registries answer microsecond-heavy stamps that strtotime rejects outright.
         $normalized = preg_replace('/(\.\d+)\s*(Z|[+-]\d{2}:?\d{2})?$/i', '', $trimmed) ?? $trimmed;
 
-        $fallback = Carbon::hasFormat($normalized, Carbon::ATOM) ? Carbon::createFromFormat(Carbon::ATOM, $normalized) : null;
-        $ts = $fallback?->getTimestamp();
+        if (!Carbon::hasFormat($normalized, Carbon::ATOM)) {
+            return null;
+        }
 
-        return $ts ?? null;
+        $parsed = Carbon::createFromFormat(Carbon::ATOM, $normalized);
+
+        return $parsed instanceof Carbon ? $parsed->getTimestamp() : null;
     }
 }

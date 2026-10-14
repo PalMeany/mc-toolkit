@@ -37,7 +37,9 @@ use Symfony\Component\HttpKernel\Exception\HttpException;
  *       fields render em-dash placeholders exactly like the original demo does.
  *
  * COMMAND MAP — every mutation funnels through CommandBus->send(), gated by
- * `minecraft-toolkit.players` + `minecraft-toolkit.manage`:
+ * `minecraft-toolkit.players` + `minecraft-toolkit.manage`, and only for player names
+ * matching {@see PlayerRegistry::PLAYER_NAME_PATTERN} (names come from the server's own
+ * files / status ping, so they are re-validated before landing in a console line):
  *
  *      op            -> op <name>
  *      deop          -> deop <name>
@@ -59,24 +61,34 @@ use Symfony\Component\HttpKernel\Exception\HttpException;
  * own error text back through the danger toast.
  *
  * @property \Filament\Schemas\Schema $form
+ * @property \Filament\Schemas\Schema $whitelistForm
  */
 final class PlayersPage extends Page
 {
     use InteractsWithForms;
 
     /**
-     * Form state container backing every Controls / Give input
+     * Form state container backing every per-player Controls / Give input
      * (schema names mirror the historic public props: gamemodeChoice,
-     * xpLevels, giveItem, giveCount, addWhitelistName).
+     * xpLevels, giveItem, giveCount).
      */
     public ?array $data = [];
 
-    /** Canonical blank-slate values used on mount and whenever a detail row opens. */
+    /**
+     * State of the stand-alone "add to whitelist" schema ({@see self::whitelistForm()}).
+     * Kept apart from $data because that field must stay usable with no player selected.
+     */
+    public ?array $whitelistData = [];
+
+    /**
+     * Canonical blank-slate values used on mount and whenever a detail row opens.
+     * `gamemodeChoice` starts EMPTY: the toggle is a radio group, so a pre-selected
+     * option could never be picked (no change event) — survival included.
+     */
     private function controlDefaults(): array
     {
         return [
-            'addWhitelistName' => '',
-            'gamemodeChoice' => 'survival',
+            'gamemodeChoice' => null,
             'xpLevels' => 0,
             'giveItem' => 'diamond',
             'giveCount' => 1,
@@ -89,6 +101,11 @@ final class PlayersPage extends Page
     protected static string|BackedEnum|null $navigationIcon = TablerIcon::UsersGroup;
 
     protected string $view = 'minecraft-toolkit::server.players';
+
+
+    /** Namespaced URL: /server/{uuid_short}/mc-toolkit/players (README "Feature pages"). */
+
+    protected static ?string $slug = 'mc-toolkit/players';
 
     /* ------------------------------------------------------------------ */
     /*  Livewire state                                                     */
@@ -125,9 +142,10 @@ final class PlayersPage extends Page
     ];
 
     /** Item charset guard for free-text Give entries ("lowercase underscore colon"). */
-    private const ITEM_PATTERN = '/^[a-z0-9_:]+$/';
+    private const ITEM_PATTERN = '/^[a-z0-9_:]+$/D';
 
-    private const PLAYER_NAME_PATTERN = '/^[A-Za-z0-9_]{3,16}$/';
+    /** Dashed, lowercase uuid as produced by {@see PlayerRegistry} rows. */
+    private const UUID_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/D';
 
     private const MAX_GIVE_COUNT = 576; // 36 stacks — comfortably below the wire limit
 
@@ -135,6 +153,12 @@ final class PlayersPage extends Page
     /*  Authorization                                                      */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * Single access gate. Filament runs it on mount AND on every later Livewire
+     * request (CanAuthorizeAccess::mount/hydrate hooks), so it carries the full rule:
+     * page toggle, core conflict-state lock (BlockAccessInConflict parity — that trait's
+     * own canAccess would be shadowed by this one) and both subuser permissions.
+     */
     public static function canAccess(): bool
     {
         // Page toggle from the admin settings slide-over rides alongside 'use'
@@ -143,40 +167,39 @@ final class PlayersPage extends Page
             return false;
         }
 
-        return parent::canAccess()
-            && user()?->can('minecraft-toolkit.use', Filament::getTenant());
-    }
+        $server = Filament::getTenant();
 
-    protected function authorizeAccess(): void
-    {
-        abort_unless(user()?->can('minecraft-toolkit.players', Filament::getTenant()), 403);
+        if (! $server instanceof Server || $server->isInConflictState()) {
+            return false;
+        }
+
+        $user = user();
+
+        return parent::canAccess()
+            && $user !== null
+            && $user->can('minecraft-toolkit.use', $server)
+            && $user->can('minecraft-toolkit.players', $server);
     }
 
     public function mount(): void
     {
-        $this->authorizeAccess();
-
         $this->form->fill($this->controlDefaults());
+        $this->whitelistForm->fill();
     }
 
     /**
-     * Schema powering every Controls / Give input on players.blade.php
+     * Schema powering every per-player Controls / Give input on players.blade.php
      * (IMPLEMENTATION-GUIDE §2.4: no raw HTML form controls on panel pages).
      *
      * The Gamemode field fires its command immediately through afterStateUpdated
-     * and snaps back to `survival` so re-picking the same option re-fires; XP and
-     * Give submit via their wire:click action buttons next to the schema.
+     * and snaps back to "nothing selected" so any option (survival included) can be
+     * picked again; XP and Give submit via their wire:click action buttons.
      */
     public function form(Schema $schema): Schema
     {
         return $schema
             ->statePath('data')
             ->components([
-                TextInput::make('addWhitelistName')
-                    ->label(trans('minecraft-toolkit::pages.players.controls.whitelisted'))
-                    ->required()
-                    ->maxLength(16),
-
                 ToggleButtons::make('gamemodeChoice')
                     ->label(trans('minecraft-toolkit::pages.players.controls.gamemode'))
                     ->inline()
@@ -204,6 +227,23 @@ final class PlayersPage extends Page
                     ->minValue(1)
                     ->maxValue(self::MAX_GIVE_COUNT)
                     ->default(1),
+            ]);
+    }
+
+    /**
+     * Stand-alone "add to whitelist" schema, rendered outside the detail panel so a
+     * name can be whitelisted with no player selected (e.g. nobody online yet).
+     * Resolved by method name like `form` (InteractsWithSchemas::cacheSchema()).
+     */
+    public function whitelistForm(Schema $schema): Schema
+    {
+        return $schema
+            ->statePath('whitelistData')
+            ->components([
+                TextInput::make('addWhitelistName')
+                    ->label(trans('minecraft-toolkit::pages.players.whitelist_add.label'))
+                    ->placeholder(trans('minecraft-toolkit::pages.players.whitelist_add.placeholder'))
+                    ->maxLength(17), // optional Floodgate "." prefix + 16
             ]);
     }
 
@@ -304,9 +344,10 @@ final class PlayersPage extends Page
 
     public function selectPlayer(string $uuid): void
     {
-        $clean = trim($uuid);
+        $clean = strtolower(trim($uuid));
 
-        $this->selected = $clean === '' ? null : strtolower($clean);
+        // Registry rows only ever carry canonical dashed uuids; anything else is noise.
+        $this->selected = preg_match(self::UUID_PATTERN, $clean) === 1 ? $clean : null;
 
         if ($this->selected === null) {
             return;
@@ -319,7 +360,7 @@ final class PlayersPage extends Page
         }
 
         // Reset the editable controls to sane defaults each time the panel opens.
-        $this->data['gamemodeChoice'] = 'survival';
+        $this->data['gamemodeChoice'] = null;
         $this->data['xpLevels'] = 0;
     }
 
@@ -392,8 +433,8 @@ final class PlayersPage extends Page
 
     /**
      * afterStateUpdated hook of the Gamemode ToggleButtons: applies the command
-     * immediately, then snaps back to the vanilla default so re-picking the same
-     * option next time still fires the change event.
+     * immediately, then clears the selection so every option — the one just used
+     * and survival included — fires a change event the next time it is picked.
      */
     private function applyGamemodeSelection(): void
     {
@@ -403,7 +444,7 @@ final class PlayersPage extends Page
             $this->applyGamemode($mode);
         }
 
-        $this->data['gamemodeChoice'] = 'survival';
+        $this->data['gamemodeChoice'] = null;
     }
 
     /* ------------------------------------------------------------------ */
@@ -545,10 +586,10 @@ final class PlayersPage extends Page
         $item = mb_strtolower(trim(strval($this->data['giveItem'] ?? '')));
         $count = max(1, min(self::MAX_GIVE_COUNT, intval($this->data['giveCount'] ?? 1)));
 
-        if (! preg_match(self::ITEM_PATTERN, $item)) {
+        if (preg_match(self::ITEM_PATTERN, $item) !== 1) {
             Notification::make()
                 ->title(trans('minecraft-toolkit::common.buttons.give'))
-                ->body('Use lowercase letters, digits, underscores or colons for the item id.') // lang gap (EN literal)
+                ->body(trans('minecraft-toolkit::pages.players.errors.invalid_item'))
                 ->danger()
                 ->send();
 
@@ -567,33 +608,26 @@ final class PlayersPage extends Page
         );
     }
 
-    /** Quick add-player-to-whitelist (name rides $data.addWhitelistName, demo parity). */
+    /** Quick add-player-to-whitelist (name rides $whitelistData.addWhitelistName, demo parity). */
     public function addToWhitelist(): void
     {
-        $name = trim(strval($this->data['addWhitelistName'] ?? ''));
-
-        if (! preg_match(self::PLAYER_NAME_PATTERN, $name)) {
-            Notification::make()
-                ->title(trans('minecraft-toolkit::common.buttons.search')) // lang gap placeholder
-                ->body('Player names are 3-16 letters, digits or underscores.') // lang gap (EN literal)
-                ->danger()
-                ->send();
-
-            return;
-        }
+        $name = trim(strval($this->whitelistData['addWhitelistName'] ?? ''));
 
         // Unknown until the server joins them into its own registry files —
         // a pseudo-row feeds only the audit properties of the shared funnel.
+        // The name itself is validated inside dispatchCommand().
         $player = $this->freshPlaceholderPlayer('', $name);
 
-        $this->dispatchCommand(
+        $sent = $this->dispatchCommand(
             template: 'whitelist add {name}',
             vars: ['{name}' => $name],
             actionKey: 'whitelist.add',
             player: $player,
         );
 
-        $this->data['addWhitelistName'] = '';
+        if ($sent) {
+            $this->whitelistData['addWhitelistName'] = null;
+        }
     }
 
     /* ------------------------------------------------------------------ */
@@ -645,18 +679,34 @@ final class PlayersPage extends Page
     }
 
     /**
-     * Shared funnel: permission double-gate -> CommandBus send -> activity log ->
-     * targeted registry invalidation -> toast feedback (no abort() outside
-     * authorizeAccess per the wave task contract).
+     * Shared funnel: permission double-gate -> player-name check -> CommandBus send ->
+     * activity log -> targeted registry invalidation -> toast feedback (no abort()
+     * here per the wave task contract; access itself is enforced by canAccess()).
      *
      * @param  array<string, mixed>  $player
+     * @return bool true once the command reached the daemon
      */
-    private function dispatchCommand(string $template, array $vars, string $actionKey, array $player): void
+    private function dispatchCommand(string $template, array $vars, string $actionKey, array $player): bool
     {
         $server = $this->getRecord();
 
         if (! $this->ensureCanMutate($server)) {
-            return;
+            return false;
+        }
+
+        // Names come from the server's own files or its status ping (or the whitelist
+        // field): anything outside the Java/Floodgate name shape — spaces, line breaks,
+        // a leading "/" or decorative sample lines — never reaches the console.
+        $name = is_string($player['name'] ?? null) ? $player['name'] : '';
+
+        if (preg_match(PlayerRegistry::PLAYER_NAME_PATTERN, $name) !== 1) {
+            Notification::make()
+                ->title(trans('minecraft-toolkit::common.badges.unsupported'))
+                ->body(trans('minecraft-toolkit::pages.players.errors.invalid_name'))
+                ->danger()
+                ->send();
+
+            return false;
         }
 
         $command = strtr($template, $vars);
@@ -670,7 +720,7 @@ final class PlayersPage extends Page
                 ->danger()
                 ->send();
 
-            return;
+            return false;
         } catch (HttpException $exception) {
             Notification::make()
                 ->title($command)
@@ -680,7 +730,7 @@ final class PlayersPage extends Page
                 ->danger()
                 ->send();
 
-            return;
+            return false;
         }
 
         // Domain-specific audit trail; CommandBus already logs mc-toolkit:console.command.
@@ -688,23 +738,27 @@ final class PlayersPage extends Page
             ->subject($server)
             ->property([
                 'action' => $actionKey,
-                'player' => $player['name'],
+                'player' => $name,
             ])
             ->log();
 
         // Targeted registry cache drop — next poll/re-render re-reads the vanilla files.
         app(PlayerRegistry::class)->invalidate($server);
 
+        // ->toString(): Notification::body() takes string|Closure|null and this file is
+        // strict_types, so handing it the Stringable itself would be a TypeError.
         Notification::make()
             ->title($command)
             ->body(
                 str(trans('minecraft-toolkit::activity.mc-toolkit.players.action', [
                     'action' => $actionKey,
-                    'player' => $player['name'],
-                ]))->stripTags(),
+                    'player' => $name,
+                ]))->stripTags()->toString(),
             )
             ->success()
             ->send();
+
+        return true;
     }
 
     private function ensureCanMutate(Server $server): bool

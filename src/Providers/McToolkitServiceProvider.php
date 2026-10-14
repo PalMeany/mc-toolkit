@@ -65,7 +65,10 @@ class McToolkitServiceProvider extends ServiceProvider
         // namespace. Appending the same path to the default group makes
         // lang/en/activity.php's ['mc-toolkit' => ...] tree resolve without touching
         // existing minecraft-toolkit::* namespace usage (FileLoader merges appends).
-        $this->app->afterResolving('translator', function ($translator): void {
+        // callAfterResolving() also covers the usual case where another provider's boot()
+        // already resolved the translator: a plain afterResolving() hook never fires for
+        // an instance that exists before it is registered.
+        $this->callAfterResolving('translator', function ($translator): void {
             if (method_exists($translator, 'addPath')) {
                 $translator->addPath(plugin_path('minecraft-toolkit', 'lang'));
             }

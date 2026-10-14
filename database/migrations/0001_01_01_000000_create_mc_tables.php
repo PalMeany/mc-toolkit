@@ -12,7 +12,8 @@ use Illuminate\Support\Facades\Schema;
 |   keyed on (server_id, file_name).
 | - mc_map_markers: user-drawn map pins per server.
 |
-| server_id keeps an index plus a real FK with cascadeOnDelete so rows die with
+| server_id is an unsigned INT (servers.id is `increments`, MySQL/MariaDB reject a
+| BIGINT foreign key onto it) and keeps an index plus a real FK with cascadeOnDelete so rows die with
 | their server (mirrors the panel's own pivot migrations, e.g.
 | database/migrations/2026_01_16_081858_create_backup_hosts_table.php). No
 | migrations touch core tables in v1.
@@ -25,9 +26,16 @@ return new class extends Migration
      */
     public function up(): void
     {
+        // v1.0.0-1.0.3 declared server_id as BIGINT, which MySQL/MariaDB refuse to point at
+        // servers.id (INT UNSIGNED). DDL is not transactional there, so the failed run left
+        // mc_installed_content behind without being recorded as migrated. This migration has
+        // not run when we get here, so whatever exists under these names is that leftover.
+        Schema::dropIfExists('mc_map_markers');
+        Schema::dropIfExists('mc_installed_content');
+
         Schema::create('mc_installed_content', function (Blueprint $table) {
             $table->id();
-            $table->unsignedBigInteger('server_id');
+            $table->unsignedInteger('server_id');
             $table->foreign('server_id')->references('id')->on('servers')->cascadeOnDelete();
 
             // plugin | mod | modpack (constants live on McToolkit\Models\InstalledContent)
@@ -57,7 +65,7 @@ return new class extends Migration
 
         Schema::create('mc_map_markers', function (Blueprint $table) {
             $table->id();
-            $table->unsignedBigInteger('server_id');
+            $table->unsignedInteger('server_id');
             $table->foreign('server_id')->references('id')->on('servers')->cascadeOnDelete();
 
             $table->string('label', 255);

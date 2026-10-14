@@ -10,7 +10,7 @@ declare(strict_types=1);
 | read everywhere as config('minecraft-toolkit.*').
 |
 | Env precedence: MC_TOOLKIT_* keys written by the admin settings slide-over win
-| over bare upstream names (CURSEFORGE_KEY / HANGAR_KEY) so other tooling can
+| over the bare upstream name (CURSEFORGE_KEY) so other tooling can
 | pre-define them.
 */
 
@@ -26,26 +26,22 @@ $pages = [
     'performance',
 ];
 
-// Comma-separated enabled slug list; blank, missing or the literal "all" turn on everything.
-$rawEnabledPages = trim((string) env('MC_TOOLKIT_ENABLED_PAGES', ''));
+// Comma-separated enabled slug list; blank, missing or the literal "all" turn on everything,
+// "none" (written by the settings form when every box is unticked) turns everything off.
+$rawEnabledPages = strtolower(trim((string) env('MC_TOOLKIT_ENABLED_PAGES', '')));
+$listedPages = array_map('trim', explode(',', $rawEnabledPages));
+$allPagesEnabled = $rawEnabledPages === '' || in_array('all', $listedPages, true);
 
 $enabledPages = [];
 foreach ($pages as $page) {
-    if ($rawEnabledPages === '' || str_contains($rawEnabledPages, 'all')) {
-        $enabledPages[$page] = true;
-        continue;
-    }
-
-    $enabledPages[$page] = str_contains($rawEnabledPages, $page);
+    $enabledPages[$page] = $allPagesEnabled || in_array($page, $listedPages, true);
 }
 
 $curseforgeKey = env('MC_TOOLKIT_CURSEFORGE_KEY') ?? env('CURSEFORGE_KEY');
-$hangarKey = env('MC_TOOLKIT_HANGAR_KEY') ?? env('HANGAR_KEY');
 
 return [
     // ---- Catalog credentials -------------------------------------------------
     'curseforge_key' => $curseforgeKey,
-    'hangar_key' => $hangarKey,
 
     // ---- Versions catalog ----------------------------------------------------
     'mcjars_base' => 'https://mcjars.app',
@@ -57,7 +53,8 @@ return [
             'spigot' => true,
             // Key-gated sources stay disabled while their credential is missing —
             // adapters themselves also return null without keys (belt and braces).
-            'hangar' => ($hangarKey !== null && trim((string) $hangarKey) !== '') ? true : false,
+            // Hangar's read API is public; no key involved.
+            'hangar' => true,
             'curseforge' => ($curseforgeKey !== null && trim((string) $curseforgeKey) !== '') ? true : false,
         ],
     ],

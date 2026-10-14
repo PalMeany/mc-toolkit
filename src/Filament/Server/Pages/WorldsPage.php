@@ -14,12 +14,13 @@ use Filament\Facades\Filament;
 use Filament\Forms\Components\TextInput;
 use Filament\Notifications\Notification;
 use Filament\Pages\Page;
+use Livewire\Attributes\Locked;
 use Livewire\Attributes\On;
 use McToolkit\Http\Controllers\WorldDownloadController;
 use McToolkit\Services\DetectionService;
 use McToolkit\Services\Properties\PropertiesParser;
-use McToolkit\Support\Activity;
 use McToolkit\Services\Worlds\WorldsService;
+use McToolkit\Support\Activity;
 
 /**
  * Worlds — dimension-grouped listing with download / reset / import and the
@@ -34,8 +35,10 @@ use McToolkit\Services\Worlds\WorldsService;
  *  - per-row actions Download / Reset (+ Play-on secondary for non-default);
  *  - community maps header action opening Modrinth externally.
  *
- * All interactivity is server-side Livewire state + wire:click handlers per the
- * build-contract UI conventions; no bespoke SPA routing, no polling.
+ * Authorization: page access needs `minecraft-toolkit.use` + `.worlds` on a server that
+ * is not in a conflict state (re-checked by Filament on every Livewire request);
+ * download / Play-on additionally need `.manage`, reset / import `.administer`, and
+ * every mutation only targets folders the world listing itself returns.
  */
 final class WorldsPage extends Page
 {
@@ -45,20 +48,29 @@ final class WorldsPage extends Page
 
     protected string $view = 'minecraft-toolkit::server.worlds';
 
+
+    /** Namespaced URL: /server/{uuid_short}/mc-toolkit/worlds (README "Feature pages"). */
+
+    protected static ?string $slug = 'mc-toolkit/worlds';
+
     /** Community-maps external target: observed Modrinth discover URL shape. */
     private const MAPS_BROWSE_URL = 'https://modrinth.com/discover/datapacks?q=world';
 
     /** @var list<array<string, mixed>> service-shaped world rows */
+    #[Locked]
     public array $worlds = [];
 
     /** DetectionService::detect() payload feeding the pinned banner. */
+    #[Locked]
     public array $detection = [];
 
     /**
      * Reset confirmation model: ['name' => string, 'paths' => list<string>].
+     * Display only — doReset() re-derives the paths server-side.
      *
      * @var array{name:string,paths:list<string>}|null
      */
+    #[Locked]
     public ?array $pendingReset = null;
 
     /**
@@ -67,6 +79,7 @@ final class WorldsPage extends Page
      *
      * @var array{level:string}|null
      */
+    #[Locked]
     public ?array $pendingRestart = null;
 
     /** Two-click arming guard for the suggested restart power action. */
@@ -78,19 +91,14 @@ final class WorldsPage extends Page
 
     public static function canAccess(): bool
     {
-        // Admin "Enabled pages" toggle (same guard every other toolkit page applies).
-        if (! (bool) config('minecraft-toolkit.pages.enabled.worlds', true)) {
-            return false;
-        }
+        $tenant = Filament::getTenant();
 
         return parent::canAccess()
-            && user()?->can('minecraft-toolkit.use', Filament::getTenant());
-    }
-
-    protected function authorizeAccess(): void
-    {
-        // Contract matrix: worlds domain gate (read surface).
-        abort_unless(user()?->can('minecraft-toolkit.worlds', Filament::getTenant()), 403);
+            && (bool) config('minecraft-toolkit.pages.enabled.worlds', true)
+            && $tenant instanceof Server
+            && ! $tenant->isInConflictState()
+            && (bool) user()?->can('minecraft-toolkit.use', $tenant)
+            && (bool) user()?->can('minecraft-toolkit.worlds', $tenant);
     }
 
     /* ------------------------------------------------------------------ */
@@ -99,7 +107,7 @@ final class WorldsPage extends Page
 
     public function mount(): void
     {
-        $this->authorizeAccess();
+        abort_unless(static::canAccess(), 403);
 
         $this->loadData();
     }
@@ -135,8 +143,6 @@ final class WorldsPage extends Page
 
     protected function getHeaderActions(): array
     {
-        $server = $this->getRecord();
-
         return [
             Action::make('refresh')
                 ->label(trans('minecraft-toolkit::common.buttons.refresh'))
@@ -151,22 +157,22 @@ final class WorldsPage extends Page
                 ->url(self::MAPS_BROWSE_URL)
                 ->openUrlInNewTab(true),
 
-            // Import runs through a mounted Filament Action modal (IMPLEMENTATION-GUIDE
-            // §2.4: schema-backed fields replace the previous bespoke fixed dialog).
+            // Import replaces/creates world folders: same strength as reset (administer).
             Action::make('import')
                 ->label(trans('minecraft-toolkit::pages.worlds.import_link'))
                 ->color('primary')
                 ->icon(TablerIcon::CloudUpload)
-                ->authorize(fn () => user()?->can('minecraft-toolkit.worlds', $server) && user()?->can('minecraft-toolkit.manage', $server))
+                ->authorize(fn (): bool => $this->allows('administer'))
                 ->schema([
                     TextInput::make('importUrl')
-                        ->label('Archive URL (.zip)')
+                        ->label(trans('minecraft-toolkit::pages.worlds.import_url'))
                         ->placeholder('https://example.com/world.zip')
                         ->url()
                         ->required()
                         ->maxLength(2048),
                     TextInput::make('importTargetName')
-                        ->label('Name of the imported world (optional)'),
+                        ->label(trans('minecraft-toolkit::pages.worlds.import_target'))
+                        ->maxLength(100),
                 ])
                 ->modalSubmitActionLabel(__('minecraft-toolkit::common.buttons.import'))
                 ->action(function (array $data): void {
@@ -209,6 +215,13 @@ final class WorldsPage extends Page
 
         try {
             $this->detection = app(DetectionService::class)->detect($server);
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            $this->detection = [];
+        }
+
+        try {
             $this->worlds = app(WorldsService::class)->listWorlds($server);
         } catch (\Throwable $exception) {
             report($exception);
@@ -228,19 +241,22 @@ final class WorldsPage extends Page
     /* ------------------------------------------------------------------ */
 
     /**
-     * Signed direct-download redirect; WorldDownloadController owns the exact
-     * `world` + `token` query contract and re-checks worlds+manage itself.
+     * Signed redirect to WorldDownloadController, which compresses the world set and
+     * forwards the browser to the node's own download endpoint.
      */
     public function downloadWorld(string $name): void
     {
         $server = $this->gate('manage');
 
-        $url = route(
-            'mc-toolkit.download.world',
-            [...WorldDownloadController::makeQuery($server, basename($name)), 'uuid_short' => $server->uuid_short, 'world' => basename($name)],
-        );
+        if (! $this->isKnownWorld($server, $name)) {
+            return;
+        }
 
-        $this->redirect($url);
+        $this->redirect(route('mc-toolkit.download.world', [
+            ...WorldDownloadController::makeQuery($server, $name),
+            'uuid_short' => $server->uuid_short,
+            'world' => $name,
+        ]));
     }
 
     /** Opens the confirmation sheet listing every affected directory first. */
@@ -250,22 +266,20 @@ final class WorldsPage extends Page
 
         try {
             $paths = app(WorldsService::class)->affectedPaths($server, $name);
-        } catch (\Throwable) {
-            $paths = [basename($name)];
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            $paths = [];
         }
 
         if ($paths === []) {
-            Notification::make()
-                ->title(trans('minecraft-toolkit::common.buttons.reset'))
-                ->body(trans('minecraft-toolkit::errors.statuses.permission_denied'))
-                ->danger()
-                ->send();
+            $this->notifyUnknownWorld();
 
             return;
         }
 
         $this->pendingRestart = null;
-        $this->pendingReset = ['name' => basename($name), 'paths' => array_values(array_map('strval', $paths))];
+        $this->pendingReset = ['name' => $name, 'paths' => array_values(array_map('strval', $paths))];
     }
 
     public function cancelReset(): void
@@ -277,30 +291,30 @@ final class WorldsPage extends Page
     {
         $target = $this->pendingReset;
 
-        if ($target === null || ($target['name'] ?? '') === '') {
+        if ($target === null || strval($target['name'] ?? '') === '') {
             return;
         }
 
-        $this->gate('administer');
-
-        $server = $this->getRecord();
+        $server = $this->gate('administer');
+        $name = strval($target['name']);
 
         try {
-            app(WorldsService::class)->reset($server, strval($target['name']));
+            // Service re-validates the name against the listing and requires a stopped server.
+            app(WorldsService::class)->reset($server, $name);
+        } catch (\DomainException $exception) {
+            $this->notifyFailure(trans('minecraft-toolkit::common.buttons.reset'), $exception->getMessage());
+
+            return;
         } catch (\Throwable $exception) {
             report($exception);
 
-            Notification::make()
-                ->title(trans('minecraft-toolkit::common.buttons.reset'))
-                ->body(trans('minecraft-toolkit::errors.statuses.wings_502'))
-                ->danger()
-                ->send();
+            $this->notifyFailure(trans('minecraft-toolkit::common.buttons.reset'), trans('minecraft-toolkit::errors.statuses.wings_502'));
 
             return;
         }
 
         $this->pendingReset = null;
-        $this->suggestRestart(strval($target['name']));
+        $this->suggestRestart($name);
         $this->loadData();
 
         Notification::make()
@@ -314,14 +328,15 @@ final class WorldsPage extends Page
     {
         $server = $this->gate('manage');
 
-        $value = basename(trim($name));
+        $value = trim($name);
 
-        if ($value === '' || preg_match('/^[A-Za-z0-9][A-Za-z0-9._\- ]*$/', $value) !== 1) {
-            Notification::make()
-                ->title(trans('minecraft-toolkit::errors.statuses.permission_denied'))
-                ->danger()
-                ->send();
+        if (! WorldsService::isSafeDirectoryName($value) || preg_match('/^[A-Za-z0-9][A-Za-z0-9._\- ]*$/', $value) !== 1) {
+            $this->notifyFailure(trans('minecraft-toolkit::common.buttons.save'), trans('minecraft-toolkit::pages.worlds.import_name_invalid'));
 
+            return;
+        }
+
+        if (! $this->isKnownWorld($server, $value)) {
             return;
         }
 
@@ -330,11 +345,7 @@ final class WorldsPage extends Page
         } catch (\Throwable $exception) {
             report($exception);
 
-            Notification::make()
-                ->title(trans('minecraft-toolkit::common.buttons.save'))
-                ->body(trans('minecraft-toolkit::errors.statuses.wings_502'))
-                ->danger()
-                ->send();
+            $this->notifyFailure(trans('minecraft-toolkit::common.buttons.save'), trans('minecraft-toolkit::errors.statuses.wings_502'));
 
             return;
         }
@@ -359,37 +370,33 @@ final class WorldsPage extends Page
     /* ------------------------------------------------------------------ */
 
     /**
-     * Schema-validated import payload handler; carries over the historic
-     * submitImport() behavior minus the bespoke dialog plumbing.
+     * Schema-validated import payload handler. The service pulls into a staging folder,
+     * never overwrites an existing world and needs the server stopped.
      */
     private function runImport(string $url, ?string $targetName): void
     {
+        $server = $this->gate('administer');
+
         if (! filter_var($url, FILTER_VALIDATE_URL)) {
-            Notification::make()
-                ->title(trans('minecraft-toolkit::pages.worlds.import_link'))
-                ->body(trans('minecraft-toolkit::errors.statuses.download_failed'))
-                ->danger()
-                ->send();
+            $this->notifyFailure(trans('minecraft-toolkit::pages.worlds.import_link'), trans('minecraft-toolkit::errors.statuses.download_failed'));
 
             return;
         }
 
-        $server = $this->gate('administer');
-
         try {
-            app(WorldsService::class)->import(
-                $server,
-                $url,
-                filled($targetName) ? $targetName : null,
-            );
+            $imported = app(WorldsService::class)->import($server, $url, filled($targetName) ? $targetName : null);
+        } catch (\DomainException $exception) {
+            if ($exception->getPrevious() !== null) {
+                report($exception->getPrevious());
+            }
+
+            $this->notifyFailure(trans('minecraft-toolkit::pages.worlds.import_link'), $exception->getMessage());
+
+            return;
         } catch (\Throwable $exception) {
             report($exception);
 
-            Notification::make()
-                ->title(trans('minecraft-toolkit::pages.worlds.import_link'))
-                ->body(filled($exception->getMessage()) ? $exception->getMessage() : trans('minecraft-toolkit::errors.statuses.download_failed'))
-                ->danger()
-                ->send();
+            $this->notifyFailure(trans('minecraft-toolkit::pages.worlds.import_link'), trans('minecraft-toolkit::errors.statuses.download_failed'));
 
             return;
         }
@@ -398,6 +405,7 @@ final class WorldsPage extends Page
 
         Notification::make()
             ->title(trans('minecraft-toolkit::pages.worlds.import_link'))
+            ->body(trans('minecraft-toolkit::pages.worlds.import_done', ['world' => $imported]))
             ->success()
             ->send();
     }
@@ -407,7 +415,7 @@ final class WorldsPage extends Page
     /* ------------------------------------------------------------------ */
 
     /** Inline, two-click confirmed restart suggestion after level-name changes. */
-    public function suggestRestart(string $levelName): void
+    private function suggestRestart(string $levelName): void
     {
         $this->pendingRestart = ['level' => $levelName];
         $this->restartArmed = false;
@@ -459,6 +467,17 @@ final class WorldsPage extends Page
     /*  View helpers                                                       */
     /* ------------------------------------------------------------------ */
 
+    /** Permission probe for the view and action visibility (no abort). */
+    public function allows(string $strength): bool
+    {
+        $server = $this->getRecord();
+
+        return ! $server->isInConflictState()
+            && (bool) user()?->can('minecraft-toolkit.use', $server)
+            && (bool) user()?->can('minecraft-toolkit.worlds', $server)
+            && (bool) user()?->can('minecraft-toolkit.'.$strength, $server);
+    }
+
     /**
      * Central mutation gate — every mutating handler calls it before touching the
      * node so the permission matrix stays in ONE place.
@@ -469,10 +488,41 @@ final class WorldsPage extends Page
     {
         $server = $this->getRecord();
 
-        abort_unless(user()?->can('minecraft-toolkit.worlds', $server), 403);
-        abort_unless(user()?->can('minecraft-toolkit.'.$strength, $server), 403);
+        abort_unless($this->allows($strength), 403);
 
         return $server;
+    }
+
+    /** Fresh (uncached) check that `$name` is a world row; notifies when it is not. */
+    private function isKnownWorld(Server $server, string $name): bool
+    {
+        try {
+            $known = in_array($name, app(WorldsService::class)->knownWorldNames($server), true);
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            $known = false;
+        }
+
+        if (! $known) {
+            $this->notifyUnknownWorld();
+        }
+
+        return $known;
+    }
+
+    private function notifyUnknownWorld(): void
+    {
+        $this->notifyFailure(trans('minecraft-toolkit::pages.worlds.title'), trans('minecraft-toolkit::pages.worlds.unknown_world'));
+    }
+
+    private function notifyFailure(string $title, string $body): void
+    {
+        Notification::make()
+            ->title($title)
+            ->body($body)
+            ->danger()
+            ->send();
     }
 
     public function getRecord(): Server

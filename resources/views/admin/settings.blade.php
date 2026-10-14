@@ -67,7 +67,7 @@
         <x-slot name="description">
             <span class="block space-y-1 text-sm leading-6 text-info-700 dark:text-info-300">
                 <span class="block"><b>Versions</b> — mcjars.app catalog, no key needed.</span>
-                <span class="block"><b>{{ __('minecraft-toolkit::pages.plugins.title') }}</b> — Modrinth · SpigetMC always on; Hangar and CurseForge appear once their keys are set here.</span>
+                <span class="block"><b>{{ __('minecraft-toolkit::pages.plugins.title') }}</b> — Modrinth · Hangar · SpigotMC always on; CurseForge appears once its key is set here.</span>
                 <span class="block"><b>{{ __('minecraft-toolkit::pages.mods.title') }}</b> — Modrinth always on; CurseForge appears once its key is set.</span>
                 <span class="block"><b>{{ __('minecraft-toolkit::pages.modpacks.title') }}</b> — Modrinth only, no key needed.</span>
                 <span class="block text-xs">Sources without a configured key are skipped gracefully — same behavior as the original addon hiding its source chip.</span>
@@ -95,7 +95,7 @@
         <p class="mt-3 text-xs leading-5 text-gray-500 dark:text-gray-400">
             Blank key fields never wipe existing .env values — to remove a key entirely, edit
             <code>.env</code> directly. Values are stored as
-            <code>MC_TOOLKIT_CURSEFORGE_KEY</code>, <code>MC_TOOLKIT_HANGAR_KEY</code> and
+            <code>MC_TOOLKIT_CURSEFORGE_KEY</code> and
             <code>MC_TOOLKIT_ENABLED_PAGES</code>.
         </p>
     </div>

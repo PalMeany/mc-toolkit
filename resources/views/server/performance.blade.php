@@ -8,7 +8,7 @@
       - Polling cadence: wire:poll.visible.20s on a single wrapper ("visible only").
       - Bridge-absent truthfulness: wing-level CPU/memory/uptime stay live; every
         game-side figure degrades to an em-dash placeholder — nothing invented.
-      - Sparklines ride <x-minecraft-toolkit::components.sparkline> (plugin-namespaced
+      - Sparklines ride <x-minecraft-toolkit::sparkline> (plugin-namespaced
         blade component, same resolution family as the detection-banner tag form).
 
     Lang gaps accepted (A1 may fold these into lang/en/pages.php later — tracked in handoff):
@@ -76,19 +76,20 @@
 <x-filament-panels::page>
 
     {{-- ---- Detection banner (pinned top, parity across all toolkit pages) ------- --}}
-    <x-dynamic-component :component="'minecraft-toolkit::components.detection-banner'" :software="$detected"/>
+    <x-dynamic-component :component="'minecraft-toolkit::detection-banner'" :software="$detected"/>
 
     {{-- ---- Bridge-absent callout ------------------------------------------------ --}}
     @unless ($bridgePresent)
         <x-filament::callout color="warning" :icon="'tabler-plug-connected'">
             <x-slot name="heading">
-                {{ __('minecraft-toolkit::common.badges.unsupported') }}
+                {{ __('minecraft-toolkit::pages.performance.bridge.heading') }}
             </x-slot>
             <x-slot name="description">
                 <span class="flex flex-col gap-y-1">
                     <span>{{ __('minecraft-toolkit::pages.performance.bridge.unavailable') }}</span>
-                    {{-- Companion-plugin pointer; wording mirrors README.md limitations section (lang gap, documented) --}}
-                    <span class="text-xs opacity-75">Install the companion Minecraft Toolkit bridge plugin on your server &mdash; see its README, &ldquo;Bridge&rdquo;.</span>
+                    {{-- Where the data would come from (PerformanceSampler::bridgePayload()); no
+                         install pointer — README lists the bridge as a future companion. --}}
+                    <span class="text-xs opacity-75">{{ __('minecraft-toolkit::pages.performance.bridge.hint') }}</span>
                 </span>
             </x-slot>
         </x-filament::callout>
@@ -133,7 +134,7 @@
                 </span>
 
                 <div class="relative mt-3">
-                    <x-minecraft-toolkit::components.sparkline
+                    <x-minecraft-toolkit::sparkline
                         :series="$this->series('tps')"
                         height-classes="h-9"
                         aria-label="TPS history"
@@ -160,7 +161,7 @@
                 <span class="{{ $statSub }}">Milliseconds per tick, 50 at most</span>
 
                 <div class="relative mt-3">
-                    <x-minecraft-toolkit::components.sparkline
+                    <x-minecraft-toolkit::sparkline
                         :series="$this->series('mspt')"
                         height-classes="h-9"
                         aria-label="MSPT history"
@@ -187,7 +188,7 @@
                 <span class="{{ $statSub }}">Of the whole server</span>
 
                 <div class="relative mt-3">
-                    <x-minecraft-toolkit::components.sparkline
+                    <x-minecraft-toolkit::sparkline
                         :series="$this->series('cpu')"
                         height-classes="h-9"
                         aria-label="CPU percent history"
@@ -215,7 +216,7 @@
                 </span>
 
                 <div class="relative mt-3">
-                    <x-minecraft-toolkit::components.sparkline
+                    <x-minecraft-toolkit::sparkline
                         :series="$this->series('memory')"
                         height-classes="h-9"
                         aria-label="Memory history"
@@ -230,7 +231,7 @@
             <div class="{{ $card }}">
                 <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">Ticks per second</h3>
                 <div class="relative">
-                    <x-minecraft-toolkit::components.sparkline :series="$this->series('tps')" height-classes="h-24" aria-label="Ticks per second"/>
+                    <x-minecraft-toolkit::sparkline :series="$this->series('tps')" height-classes="h-24" aria-label="Ticks per second"/>
                     @unless ($bridgePresent)
                         <div class="{{ $overlayShell }}">
                             <span class="{{ $overlayChip }}">Live TPS needs the companion bridge</span>
@@ -242,7 +243,7 @@
             <div class="{{ $card }}">
                 <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">Milliseconds per tick</h3>
                 <div class="relative">
-                    <x-minecraft-toolkit::components.sparkline :series="$this->series('mspt')" height-classes="h-24" aria-label="Milliseconds per tick"/>
+                    <x-minecraft-toolkit::sparkline :series="$this->series('mspt')" height-classes="h-24" aria-label="Milliseconds per tick"/>
                     @unless ($bridgePresent)
                         <div class="{{ $overlayShell }}">
                             <span class="{{ $overlayChip }}">Live MSPT needs the companion bridge</span>
@@ -253,12 +254,12 @@
 
             <div class="{{ $card }}">
                 <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">CPU %</h3>
-                <x-minecraft-toolkit::components.sparkline :series="$this->series('cpu')" height-classes="h-24" aria-label="CPU percent"/>
+                <x-minecraft-toolkit::sparkline :series="$this->series('cpu')" height-classes="h-24" aria-label="CPU percent"/>
             </div>
 
             <div class="{{ $card }}">
                 <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">Memory of the server</h3>
-                <x-minecraft-toolkit::components.sparkline :series="$this->series('memory')" height-classes="h-24" aria-label="Memory of the server"/>
+                <x-minecraft-toolkit::sparkline :series="$this->series('memory')" height-classes="h-24" aria-label="Memory of the server"/>
             </div>
         </div>
 

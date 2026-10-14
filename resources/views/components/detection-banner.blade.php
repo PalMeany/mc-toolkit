@@ -6,9 +6,8 @@
                        java:?int, detected_by:'files', proxy:bool, ...})
         canRedetect(bool) — optional, defaults true; gates the re-detect control.
 
-    Usage (core-compatible paths):
-        <x-minecraft-toolkit::components.detection-banner :software="$software"/>
-        {{-- or --}} {{ view('minecraft-toolkit::components.detection-banner', ['software' => $software])->render() }}
+    Usage (the view lives in components/, so the tag drops that segment):
+        <x-minecraft-toolkit::detection-banner :software="$software"/>
 
     Emits the Livewire event 'mc-toolkit.redetect' for hosting pages to catch:
         #[On('mc-toolkit.redetect')] public function redetect(): void { /* refresh detection cache */ }
@@ -20,7 +19,7 @@
     $label = ucfirst((string) ($software['software'] ?? 'unknown'));
     $version = filled($software['version'] ?? null) ? (string) $software['version'] : null;
     $java = isset($software['java']) && $software['java'] !== null ? (int) $software['java'] : null;
-    $proxy = filled($software['proxy'] ?? false);
+    $proxy = (bool) ($software['proxy'] ?? false);
 
     $chip = 'inline-flex items-center justify-center rounded-md bg-gray-50 px-2 py-0.5 '
         .'text-xs font-medium text-gray-600 ring-1 ring-inset ring-gray-600/10 '

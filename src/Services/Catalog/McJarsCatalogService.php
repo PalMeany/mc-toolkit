@@ -18,7 +18,8 @@ use McToolkit\Support\HttpJsonCache;
  *   buildUrlOf(step)                         → convenience url extraction
  *
  * Endpoint facts verified live on 2026-10-14 (see .research/mcjars-api.md):
- *  - GET  https://mcjars.app/api/v2/types                       -> {"success":bool,"types":{bucket:{TYPE:{...}}}}
+ *  (origin: config `minecraft-toolkit.mcjars_base`, default https://mcjars.app)
+ *  - GET  /api/v2/types                                         -> {"success":bool,"types":{bucket:{TYPE:{...}}}}
  *  - GET  /api/v3/builds/types/{TYPE}/versions?...&fields=...   -> {"versions":{"total","per_page","page","data":[...]}}
  *    (`fields=all` returns empty objects upstream — explicit field names are REQUIRED)
  *  - GET  /api/v3/builds/types/{TYPE}/versions/{VERSION}/latest -> {"build":{...}|null}
@@ -30,12 +31,43 @@ final class McJarsCatalogService
     /** Ordered buckets as shown by the demo UI tabs (missing upstream buckets are skipped). */
     public const BUCKETS = ['recommended', 'established', 'experimental', 'miscellaneous', 'limbo'];
 
-    private const TYPES_URL = 'https://mcjars.app/api/v2/types';
+    private const DEFAULT_BASE = 'https://mcjars.app';
 
     public function __construct(
         private readonly int $cacheSeconds = 21600, // 6h for the (slow-changing) types tree
         private readonly int $listCacheSeconds = 900, // 15m for version pages
     ) {}
+
+    /**
+     * Canonical type id (e.g. "PAPER") or null when the value cannot be an MCJars type.
+     * Type ids are interpolated into URL paths, so anything outside [A-Z0-9_] is refused.
+     */
+    public static function normalizeType(string $type): ?string
+    {
+        $type = Str::upper(trim($type));
+
+        return preg_match('/^[A-Z0-9_]{1,40}$/', $type) === 1 ? $type : null;
+    }
+
+    /**
+     * Whether the catalog currently lists this type id in any bucket.
+     */
+    public function hasType(string $type): bool
+    {
+        $type = self::normalizeType($type);
+
+        if ($type === null) {
+            return false;
+        }
+
+        foreach ($this->types() as $types) {
+            if (isset($types[$type])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /**
      * Grouped software types keyed by category bucket then uppercased type id.
@@ -47,10 +79,13 @@ final class McJarsCatalogService
      */
     public function types(): array
     {
-        $payload = HttpJsonCache::get(self::TYPES_URL, $this->cacheSeconds);
+        $payload = HttpJsonCache::get(
+            $this->base().'/api/v2/types',
+            (int) config('minecraft-toolkit.cache_ttl.types', $this->cacheSeconds),
+        );
 
         /** @var array<string, mixed> $raw */
-        $raw = is_array($payload) ? ($payload['types'] ?? []) : [];
+        $raw = is_array($payload) && is_array($payload['types'] ?? null) ? $payload['types'] : [];
 
         $grouped = [];
 
@@ -61,16 +96,18 @@ final class McJarsCatalogService
             }
 
             foreach ($raw[$bucket] as $typeId => $meta) {
-                if (!is_array($meta)) {
+                $id = self::normalizeType((string) $typeId);
+
+                if (!is_array($meta) || $id === null) {
                     continue;
                 }
 
                 $entry = [
-                    'id' => Str::upper((string) $typeId),
+                    'id' => $id,
                     'bucket' => (string) $bucket,
                 ] + $meta;
 
-                $grouped[(string) $bucket][(string) $typeId] = $entry;
+                $grouped[(string) $bucket][$id] = $entry;
             }
         }
 
@@ -83,15 +120,23 @@ final class McJarsCatalogService
      * @param  string  $type  e.g. 'VANILLA', 'PAPER', 'FABRIC'
      * @param  string  $search  substring filter on the version id
      * @param  bool  $snapshotsIn  false hides SNAPSHOT/BETA rows from the result set
-     * @return array{total:int, page:int, data:list<array{id:string, type:string, java:?int, builds:?int, created:?string}>}
+     * @return array{total:int, page:int, per_page:int, has_more:bool, data:list<array{id:string, type:string, java:?int, builds:?int, created:?string}>}
+     *         `total` / `has_more` describe the UPSTREAM (unfiltered) pagination — the
+     *         snapshot filter runs on each page afterwards, so a page may hold fewer rows.
      */
     public function versions(string $type, int $page = 1, int $perPage = 50, string $search = '', bool $snapshotsIn = true): array
     {
-        $type = Str::upper(trim($type));
+        $type = self::normalizeType($type);
+        $page = max(1, $page);
+        $perPage = min(200, max(1, $perPage));
+
+        if ($type === null) {
+            return ['total' => 0, 'page' => $page, 'per_page' => $perPage, 'has_more' => false, 'data' => []];
+        }
 
         $query = [
-            'page' => max(1, $page),
-            'per_page' => min(200, max(1, $perPage)),
+            'page' => $page,
+            'per_page' => $perPage,
             'fields' => ['type', 'supported', 'created', 'java', 'builds', 'project_version_id', 'version_id'],
         ];
 
@@ -100,25 +145,30 @@ final class McJarsCatalogService
         }
 
         $payload = HttpJsonCache::get(
-            "https://mcjars.app/api/v3/builds/types/{$type}/versions",
+            $this->base().'/api/v3/builds/types/'.rawurlencode($type).'/versions',
             $this->listCacheSeconds,
             $query,
         );
 
         /** @var array<int|string, mixed> $wrapper */
-        $wrapper = is_array($payload) ? ($payload['versions'] ?? []) : [];
+        $wrapper = is_array($payload) && is_array($payload['versions'] ?? null) ? $payload['versions'] : [];
         /** @var list<array<string, mixed>> $rows */
         $rows = is_array($wrapper['data'] ?? null) ? $wrapper['data'] : [];
 
         $data = [];
         foreach ($rows as $row) {
-            $versionType = strtoupper(trim((string) ($row['type'] ?? '')));
+            if (!is_array($row)) {
+                continue;
+            }
+
+            $versionType = is_string($row['type'] ?? null) ? strtoupper(trim($row['type'])) : '';
 
             if (!$snapshotsIn && in_array($versionType, ['SNAPSHOT', 'BETA'], true)) {
                 continue;
             }
 
-            $id = (string) ($row['id'] ?? $row['version_id'] ?? '');
+            $id = $row['id'] ?? $row['version_id'] ?? '';
+            $id = is_string($id) || is_int($id) ? trim((string) $id) : '';
 
             if ($id === '') {
                 continue;
@@ -133,9 +183,14 @@ final class McJarsCatalogService
             ];
         }
 
+        $total = is_numeric($wrapper['total'] ?? null) ? (int) $wrapper['total'] : null;
+
         return [
-            'total' => is_int($wrapper['total'] ?? null) ? $wrapper['total'] : (int) ($wrapper['total'] ?? count($data)),
-            'page' => is_int($wrapper['page'] ?? null) ? $wrapper['page'] : max(1, $page),
+            'total' => $total ?? count($data),
+            'page' => $page,
+            'per_page' => $perPage,
+            // Without an upstream total, a full raw page is the only hint that more exist.
+            'has_more' => $total !== null ? ($page * $perPage) < $total : count($rows) >= $perPage,
             'data' => $data,
         ];
     }
@@ -148,15 +203,15 @@ final class McJarsCatalogService
      */
     public function latestBuild(string $type, string $version): ?array
     {
-        $type = Str::upper(trim($type));
-        $version = rawurlencode(trim($version));
+        $type = self::normalizeType($type);
+        $version = trim($version);
 
-        if ($type === '' || $version === '') {
+        if ($type === null || $version === '') {
             return null;
         }
 
         $payload = HttpJsonCache::get(
-            "https://mcjars.app/api/v3/builds/types/{$type}/versions/{$version}/latest",
+            $this->base().'/api/v3/builds/types/'.rawurlencode($type).'/versions/'.rawurlencode($version).'/latest',
             120,
         );
 
@@ -186,6 +241,14 @@ final class McJarsCatalogService
         return is_string($url) && $url !== '' ? $url : null;
     }
 
+    /** API origin (config `minecraft-toolkit.mcjars_base`), without trailing slash. */
+    private function base(): string
+    {
+        $base = rtrim(trim((string) config('minecraft-toolkit.mcjars_base', self::DEFAULT_BASE)), '/');
+
+        return str_starts_with($base, 'https://') || str_starts_with($base, 'http://') ? $base : self::DEFAULT_BASE;
+    }
+
     /**
      * Defensive shape-forcing so callers never face loose scalars where arrays are expected.
      *
@@ -207,7 +270,7 @@ final class McJarsCatalogService
                 }
 
                 $steps[] = array_filter([
-                    'type' => (string) ($step['type'] ?? ''),
+                    'type' => is_string($step['type'] ?? null) ? $step['type'] : '',
                     'url' => is_string($step['url'] ?? null) ? $step['url'] : null,
                     'file' => is_string($step['file'] ?? null) ? $step['file'] : null,
                     'location' => is_string($step['location'] ?? null) ? $step['location'] : null,

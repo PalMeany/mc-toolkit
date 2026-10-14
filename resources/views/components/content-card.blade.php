@@ -13,8 +13,10 @@
 
     Extension points:
         slot          — replaces the whole footer area (custom page-owned action button).
-        $attributes   — extra attributes land on the DEFAULT CTA only (wire:click="install('..')",
-                        :disabled=..., class="..." etc.), so pages can wire actions without a slot.
+        $attributes   — extra attributes land on the DEFAULT CTA only (wire:click="install(..)",
+                        class="..." etc.), so pages can wire actions without a slot. A bag
+                        built in PHP is printed RAW: callers must encode every value they
+                        put in it (Js::from for wire-call arguments).
                         The outer card intentionally stays attribute-free; wrap it in your own
                         layout container instead.
 
@@ -32,7 +34,10 @@
     $author = filled($item['author'] ?? null) ? (string) $item['author'] : null;
     $description = filled($item['description'] ?? null) ? (string) $item['description'] : null;
     $icon = filled($item['icon_url'] ?? null) ? (string) $item['icon_url'] : null;
-    $updated = filled($item['updated'] ?? null) ? (string) $item['updated'] : null;
+    // Pages pass a formatted 'updated_human' ("Oct 14, 2026"); the raw ISO stamp is the fallback.
+    $updated = filled($item['updated_human'] ?? null)
+        ? (string) $item['updated_human']
+        : (filled($item['updated'] ?? null) ? (string) $item['updated'] : null);
 
     $actionLabel = filled($pendingActionName ?? null)
         ? (string) $pendingActionName
