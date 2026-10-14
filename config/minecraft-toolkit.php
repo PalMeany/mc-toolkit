@@ -85,6 +85,18 @@ return [
         'region_fetch_max_bytes' => 8388608,
     ],
 
+    // ---- Background installs (queued jobs) -------------------------------------
+    'tasks' => [
+        // Upper bound of one queued software/modpack install, in seconds. Laravel's worker
+        // honours a job's own timeout over its --timeout flag; a run that outlives it is
+        // stopped and marked failed.
+        'timeout' => (int) env('MC_TOOLKIT_TASK_TIMEOUT', 3600),
+        // A task still queued after this many seconds hints that no queue worker is running.
+        'stalled_after' => 120,
+        // A running task without a heartbeat for this long counts as dead and can be dismissed.
+        'dead_after' => 600,
+    ],
+
     // ---- Companion bridge ------------------------------------------------------
     'bridge' => [
         // Directory inside each server's files where the future companion mod writes state.

@@ -17,7 +17,6 @@ use Filament\Forms\Concerns\InteractsWithForms;
 use Filament\Notifications\Notification;
 use Filament\Pages\Concerns\InteractsWithFormActions;
 use Filament\Pages\Page;
-use Filament\Schemas\Components\Actions;
 use Filament\Schemas\Components\Section;
 use Filament\Schemas\Schema;
 use Illuminate\Http\Client\ConnectionException;
@@ -406,7 +405,8 @@ final class PropertiesPage extends Page
 
             if ($motdMatches) {
                 $matched = true;
-                $fields[] = $this->motdToolbar();
+                // The formatting buttons sit on the field's label row (hint actions); as a
+                // separate grid item the toolbar landed in its own column, far from the field.
                 $fields[] = $this->motdField();
             }
         }
@@ -513,19 +513,24 @@ final class PropertiesPage extends Page
         }
     }
 
-    /** MOTD toolbar rendered as a compact icon-button row above the textarea. */
-    private function motdToolbar(): Actions
+    /**
+     * MOTD formatting buttons (§l §o §n §m, reset), shown on the MOTD label row.
+     *
+     * @return list<Action>
+     */
+    private function motdToolbar(): array
     {
-        return Actions::make([
+        return [
             $this->motdWrapAction('l'),
             $this->motdWrapAction('o'),
             $this->motdWrapAction('n'),
             $this->motdWrapAction('m'),
             Action::make('motd_reset')
                 ->label(trans('minecraft-toolkit::common.buttons.reset'))
+                ->link()
                 ->color('gray')
                 ->alpineClickHandler(self::motdJs('r')),
-        ]);
+        ];
     }
 
     private function motdField(): Textarea
@@ -533,6 +538,8 @@ final class PropertiesPage extends Page
         return Textarea::make('motd')
             ->id(self::MOTD_FIELD_ID)
             ->label('MOTD')
+            ->hintActions($this->motdToolbar())
+            ->columnSpan(['default' => 1, 'sm' => 2, 'md' => 2])
             ->autosize()
             ->rows(3)
             ->live()
@@ -578,7 +585,7 @@ final class PropertiesPage extends Page
             . ' if(!t){return;}'
             . ' var s=t.selectionStart||0,e=t.selectionEnd||0,v=t.value,c=' . $openCode . ';'
             . ' v=(s===e)?(v.slice(0,s)+c+v.slice(s)):(v.slice(0,s)+c+v.slice(s,e)+' . $closeCode . '+v.slice(e));'
-            . ' t.value=v;t.dispatchEvent(new Event("input",{bubbles:true}));t.focus();'
+            . ' t.value=v;t.dispatchEvent(new Event(\'input\',{bubbles:true}));t.focus();'
             . ' requestAnimationFrame(function(){try{t.setSelectionRange(Math.min(v.length,s+c.length),Math.min(v.length,s+c.length));}catch(err){}});'
             . ' })()';
     }
@@ -587,7 +594,7 @@ final class PropertiesPage extends Page
     {
         return Action::make('save_' . $groupKey)
             ->label(trans('minecraft-toolkit::common.buttons.save'))
-            ->color('gray')
+            ->color('primary')
             ->icon(\App\Enums\TablerIcon::DeviceFloppy)
             // Filament re-evaluates this when the action is mounted, so it gates the
             // request server-side too; saveGroup() checks again for direct calls.

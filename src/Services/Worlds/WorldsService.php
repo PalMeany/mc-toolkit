@@ -10,21 +10,28 @@ use Illuminate\Http\Client\ConnectionException;
 use McToolkit\Services\FileBridge;
 use McToolkit\Services\Nbt\NbtReader;
 use McToolkit\Support\Activity;
+use McToolkit\Support\WorldLayout;
 
 /**
  * World-set discovery and lifecycle orchestration for the Worlds and Map pages.
  *
- * Detection model — BOTH layout conventions are supported side by side:
+ * Detection model — ALL layout conventions are supported side by side:
  *
- *  a) vanilla/Fabric/Forge: one folder holds `region/` (overworld) plus nested
- *     `DIM-1/region` and `DIM1/region` for nether/end;
- *  b) Bukkit/Paper split worlds: sibling directories `world`, `world_nether`
+ *  a) vanilla/Fabric/Forge up to 1.21.x: one folder holds `region/` (overworld) plus
+ *     nested `DIM-1/region` and `DIM1/region` for nether/end;
+ *  b) Bukkit/Paper split worlds up to 1.21.x: sibling directories `world`, `world_nether`
  *     (`DIM-1/region` inside), `world_the_end` (`DIM1/region` inside) are grouped
- *     into one logical world set.
+ *     into one logical world set;
+ *  c) Minecraft 26.1+ (vanilla AND Paper/Folia): one folder holds every dimension under
+ *     `dimensions/minecraft/{overworld,the_nether,the_end}` — a single row whose `maps`
+ *     lists all three, no members ({@see WorldLayout}).
  *
  * A directory counts as a world candidate when it directly contains `region/`,
- * or nests DIM-1/DIM1 folders. Suffix members (`*_nether`, `*_the_end`) link to the
- * base directory stripped of the suffix (case-insensitively) whenever it exists.
+ * nests DIM-1/DIM1 folders, or has the 26.1+ `dimensions/` folder next to `level.dat`
+ * (or with vanilla dimension folders inside). Suffix members (`*_nether`, `*_the_end`) link
+ * to the base directory stripped of the suffix (case-insensitively) whenever it exists —
+ * on a 26.x world that only happens to pre-upgrade leftovers, which then ride along with
+ * download/reset like before.
  *
  * Rows expose `maps`: the dimensions the map can draw for that folder, and `members`:
  * the linked sibling folders downloaded/reset together with a primary world.
@@ -44,11 +51,17 @@ final class WorldsService
     /** Directory listings allowed to ONE structure-probe pass. */
     private const MAX_PROBE_LISTINGS = 40;
 
-    /** Listings allowed to the size estimate of ONE world folder. */
-    public const MAX_SIZE_LISTINGS = 20;
+    /**
+     * Listings allowed to the size estimate of ONE world folder. A 26.1+ folder holds all
+     * three dimensions (~25 folders on a played world) where a classic one held one.
+     */
+    public const MAX_SIZE_LISTINGS = 32;
 
-    /** Recursion depth cap for size sums below each world root. */
-    public const MAX_SIZE_RECURSION_LEVELS = 3;
+    /**
+     * Recursion depth cap for size sums below each world root: 4 reaches
+     * `dimensions/minecraft/<dim>/region/*.mca` (26.1+), the deepest place the bulk lives.
+     */
+    public const MAX_SIZE_RECURSION_LEVELS = 4;
 
     /** Bytes cap handed to FileBridge so corrupted gzip payloads die before inflate. */
     private const LEVEL_DAT_TRANSFER_CAP = 16_777_216;
@@ -81,8 +94,13 @@ final class WorldsService
      */
     private const DOWNLOAD_ARCHIVE_PATTERN = '/^(?:mctk-download-[a-z0-9-]{1,40}-[0-9a-f]{8}|mctk-world-[0-9a-f]{8})\.zip$/';
 
-    /** Download archives older than this are deleted (node tokens live 15 minutes). */
-    private const DOWNLOAD_ARCHIVE_TTL_SECONDS = 1800;
+    /**
+     * Download archives older than this are deleted. Fallback only: WorldDownloadController
+     * queues a DiscardWorldArchiveJob right after its ~3-minute single-use node token
+     * expired; this sweep catches archives of `sync`-driver panels and lost jobs. An
+     * archive still being streamed is safe to delete (wings holds the open file).
+     */
+    private const DOWNLOAD_ARCHIVE_TTL_SECONDS = 600;
 
     /** Leftover import staging folders older than this are deleted. */
     private const STAGING_TTL_SECONDS = 21_600;
@@ -93,10 +111,10 @@ final class WorldsService
     /** How deep below the staging folder a world folder is searched for. */
     private const MAX_IMPORT_DEPTH = 3;
 
-    /** Sub-folders of a world that are never candidates for "the world folder". */
+    /** Sub-folders of a world (classic and 26.1+) that are never candidates for "the world folder". */
     private const WORLD_INTERNALS = [
         'region', 'DIM-1', 'DIM1', 'data', 'playerdata', 'entities', 'poi', 'stats',
-        'advancements', 'datapacks', '__MACOSX',
+        'advancements', 'datapacks', WorldLayout::DIMENSIONS_DIR, 'players', '__MACOSX',
     ];
 
     public function __construct(
@@ -197,9 +215,12 @@ final class WorldsService
     }
 
     /**
-     * One directory's structural capability flags.
+     * One directory's structural capability flags. `has_region` / `dim_nether` / `dim_end`
+     * mean "this folder holds that dimension": `region/`, `DIM-1/`, `DIM1/` in the classic
+     * layout, `dimensions/minecraft/{overworld,the_nether,the_end}/` in the 26.1+ one
+     * (`modern`), which costs one extra listing.
      *
-     * @return array{name:string,candidate:bool,has_region:bool,dim_nether:bool,dim_end:bool}
+     * @return array{name:string,candidate:bool,has_region:bool,dim_nether:bool,dim_end:bool,modern:bool}
      */
     private function probeDirectory(Server $server, string $name, Budget $budget): array
     {
@@ -209,20 +230,42 @@ final class WorldsService
             'has_region' => false,
             'dim_nether' => false,
             'dim_end' => false,
+            'modern' => false,
         ];
 
         $subdirs = [];
+        $hasLevelDat = false;
 
         foreach ($this->probeList($server, $name, $budget) as $entry) {
             if (($entry['directory'] ?? false) === true) {
                 $subdirs[strval($entry['name'])] = true;
+            } elseif (($entry['file'] ?? false) === true && strval($entry['name']) === 'level.dat') {
+                $hasLevelDat = true;
             }
         }
 
         $result['has_region'] = isset($subdirs['region']);
         $result['dim_nether'] = isset($subdirs['DIM-1']);
         $result['dim_end'] = isset($subdirs['DIM1']);
-        $result['candidate'] = $result['has_region'] || $result['dim_nether'] || $result['dim_end'];
+
+        if (isset($subdirs[WorldLayout::DIMENSIONS_DIR])) {
+            $vanilla = [];
+
+            foreach ($this->probeList($server, $name.'/'.WorldLayout::VANILLA_NAMESPACE_DIR, $budget) as $entry) {
+                if (($entry['directory'] ?? false) === true) {
+                    $vanilla[strval($entry['name'])] = true;
+                }
+            }
+
+            // level.dat (or a vanilla dimension folder) tells a 26.x level from some
+            // unrelated folder that merely has a `dimensions/` child.
+            $result['modern'] = $hasLevelDat || $vanilla !== [];
+            $result['has_region'] = $result['has_region'] || isset($vanilla[WorldLayout::VANILLA_DIMENSIONS['overworld']]);
+            $result['dim_nether'] = $result['dim_nether'] || isset($vanilla[WorldLayout::VANILLA_DIMENSIONS['nether']]);
+            $result['dim_end'] = $result['dim_end'] || isset($vanilla[WorldLayout::VANILLA_DIMENSIONS['end']]);
+        }
+
+        $result['candidate'] = $result['has_region'] || $result['dim_nether'] || $result['dim_end'] || $result['modern'];
 
         return $result;
     }
@@ -236,7 +279,7 @@ final class WorldsService
      * world first, then every other primary group alphabetically, each group
      * immediately followed by its linked dimension members (nether, then end).
      *
-     * @param  array<string, array{name:string,candidate:bool,has_region:bool,dim_nether:bool,dim_end:bool}>  $probes
+     * @param  array<string, array{name:string,candidate:bool,has_region:bool,dim_nether:bool,dim_end:bool,modern:bool}>  $probes
      * @return list<array<string, mixed>>
      */
     private function assembleRows(Server $server, array $probes, string $levelName, ?SizeCache $sizes, bool $enrich): array
@@ -325,7 +368,7 @@ final class WorldsService
                 false,
                 $members,
                 $this->mapDimensions($primary, null),
-                $enrich ? $this->readLevelDatMeta($server, $name) : self::emptyMeta(),
+                $enrich ? $this->readLevelDatMeta($server, $name, $primary['modern']) : self::emptyMeta(),
                 $sizes,
             );
 
@@ -340,7 +383,7 @@ final class WorldsService
                     true,
                     [],
                     $this->mapDimensions($probe, $dimensionId),
-                    $enrich ? $this->readLevelDatMeta($server, $member) : self::emptyMeta(),
+                    $enrich ? $this->readLevelDatMeta($server, $member, $probe['modern']) : self::emptyMeta(),
                     $sizes,
                 );
             }
@@ -483,11 +526,51 @@ final class WorldsService
 
     /**
      * Level.dat metadata; every failure quietly produces the all-null shape so one
-     * corrupt world cannot take down the listing.
+     * corrupt world cannot take down the listing. A 26.1+ (`$modern`) level.dat carries no
+     * seed any more: it is read from `world_gen_settings.dat` instead (one or two extra
+     * small reads, only for those folders).
      *
      * @return array{version:?string,data_version:?int,level_name:?string,game_type:?int,hardcore:bool,last_played:?string,seed:?string,spawn_x:?int,spawn_y:?int,spawn_z:?int}
      */
-    private function readLevelDatMeta(Server $server, string $directory): array
+    private function readLevelDatMeta(Server $server, string $directory, bool $modern = false): array
+    {
+        $meta = $this->readLevelDat($server, $directory);
+
+        if ($modern && $meta['seed'] === null && $meta['data_version'] !== null) {
+            $meta['seed'] = $this->readWorldGenSeed($server, $directory);
+        }
+
+        return $meta;
+    }
+
+    /**
+     * Seed of a 26.1+ level from the first {@see WorldLayout::WORLD_GEN_SETTINGS_FILES}
+     * entry that exists and parses; null otherwise. Never throws.
+     */
+    private function readWorldGenSeed(Server $server, string $directory): ?string
+    {
+        foreach (WorldLayout::WORLD_GEN_SETTINGS_FILES as $relative) {
+            try {
+                $bytes = $this->bridge->read($server, '/'.$directory.'/'.$relative, self::LEVEL_DAT_TRANSFER_CAP);
+                $seed = $bytes === null || $bytes === '' ? null : NbtReader::parseWorldGenSeed($bytes);
+            } catch (\Throwable) {
+                $seed = null;
+            }
+
+            if ($seed !== null) {
+                return $seed;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Raw level.dat interest keys of one folder (all-null shape on any failure).
+     *
+     * @return array{version:?string,data_version:?int,level_name:?string,game_type:?int,hardcore:bool,last_played:?string,seed:?string,spawn_x:?int,spawn_y:?int,spawn_z:?int}
+     */
+    private function readLevelDat(Server $server, string $directory): array
     {
         $emptyShape = self::emptyMeta();
 
@@ -606,9 +689,10 @@ final class WorldsService
 
     /**
      * Compresses the linked set of `$world` into a temporary zip in the server root and
-     * returns its file name, for the node's own signed download endpoint. The archive
-     * is removed by {@see self::sweepStaleArchives()} once older than
-     * {@see self::DOWNLOAD_ARCHIVE_TTL_SECONDS}.
+     * returns its file name, for the node's own signed download endpoint. The caller
+     * schedules its removal ({@see self::discardArchive()} via DiscardWorldArchiveJob once
+     * the download token expired); {@see self::sweepStaleArchives()} removes leftovers
+     * older than {@see self::DOWNLOAD_ARCHIVE_TTL_SECONDS}.
      *
      * @throws \DomainException when `$world` is not a known world
      * @throws ConnectionException|\RuntimeException
@@ -717,7 +801,8 @@ final class WorldsService
      *  2. the archive is unpacked THERE (never in the server root, so nothing live can
      *     be overwritten) and deleted;
      *  3. the world folder is located (shallowest folder holding `level.dat`, else
-     *     `region/`; flat archives make the staging folder itself the world);
+     *     `region/` or the 26.1+ `dimensions/`; flat archives make the staging folder
+     *     itself the world);
      *  4. it is moved to `$targetName` — or the current `level-name` — under a name that
      *     is free at the root (`<name>-imported-<hex>` otherwise); Bukkit-style
      *     `<world>_nether` / `<world>_the_end` siblings follow as `<dest>_nether` /
@@ -828,8 +913,8 @@ final class WorldsService
     /**
      * Breadth-first search below the staging folder for the world folder: the first
      * folder holding `level.dat` that is not itself a `_nether`/`_the_end` member wins;
-     * otherwise the first folder holding `level.dat` or `region/`. World folders are
-     * not searched further (their sub-folders are world internals).
+     * otherwise the first folder holding `level.dat`, `region/` or the 26.1+ `dimensions/`.
+     * World folders are not searched further (their sub-folders are world internals).
      */
     private function locateWorld(Server $server, string $staging): ?string
     {
@@ -853,7 +938,7 @@ final class WorldsService
                 }
 
                 if (($entry['directory'] ?? false) === true) {
-                    $hasRegion = $hasRegion || $name === 'region';
+                    $hasRegion = $hasRegion || $name === 'region' || $name === WorldLayout::DIMENSIONS_DIR;
 
                     if (! in_array($name, self::WORLD_INTERNALS, true)) {
                         $children[] = $name;

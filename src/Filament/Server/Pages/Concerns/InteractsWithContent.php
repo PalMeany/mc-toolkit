@@ -209,8 +209,15 @@ trait InteractsWithContent
     public function compatLoaderTokens(): array
     {
         $detected = $this->contentDetection();
+        $loader = (string) ($detected['loader'] ?? 'vanilla');
 
-        return match ((string) ($detected['loader'] ?? 'vanilla')) {
+        // A modpack brings (and now installs) its own loader, so on a plugin or vanilla server
+        // the compat filter only narrows by Minecraft version — plugin loaders match no pack.
+        if ($this->contentKind() === 'modpacks' && ! in_array($loader, ['fabric', 'forge'], true)) {
+            return [];
+        }
+
+        return match ($loader) {
             'bukkit' => ['paper', 'spigot', 'bukkit', 'purpur', 'folia'],
             'fabric' => ['fabric', 'quilt'],
             'forge' => ['forge', 'neoforge'],

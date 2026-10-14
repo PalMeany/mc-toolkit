@@ -198,6 +198,17 @@ final class FakeWings
 
     public string $state = 'running';
 
+    /**
+     * files/decompress support: URL regex => [relative path => content] unpacked next to a
+     * pulled archive (pulled files hold "PULLED <url>").
+     *
+     * @var array<string, array<string, string>>
+     */
+    public array $archives = [];
+
+    /** Optional hook run after every files/pull: fn (FakeWings $wings, string $url, string $path). */
+    public $onPull = null;
+
     public function put(string $path, string $content): void
     {
         $path = trim($path, '/');
@@ -310,6 +321,10 @@ final class FakeWings
                 $this->pulls[] = ['url' => $url, 'path' => ltrim($path, '/'), 'foreground' => (bool) ($request['foreground'] ?? false)];
                 $this->put($path, 'PULLED '.$url);
 
+                if (is_callable($this->onPull)) {
+                    ($this->onPull)($this, $url, ltrim($path, '/'));
+                }
+
                 return Http::response($this->row($name, false, strlen('PULLED '.$url)), 200, $headers);
             })(),
             $base.'/files/rename' => (function () use ($request, $headers) {
@@ -330,6 +345,23 @@ final class FakeWings
                 }
 
                 return Http::response('', 204, $headers);
+            })(),
+            $base.'/files/decompress' => (function () use ($request, $headers) {
+                $root = trim((string) $request['root'], '/');
+                $archive = ltrim($root.'/'.trim((string) $request['file'], '/'), '/');
+                $content = $this->files[$archive] ?? '';
+                $url = str_starts_with($content, 'PULLED ') ? substr($content, 7) : '';
+                foreach ($this->archives as $pattern => $entries) {
+                    if ($url !== '' && preg_match($pattern, $url) === 1) {
+                        foreach ($entries as $entry => $data) {
+                            $this->put(ltrim($root.'/'.$entry, '/'), $data);
+                        }
+
+                        return Http::response('', 204, $headers);
+                    }
+                }
+
+                return Http::response(['error' => 'unsupported archive'], 400, $headers);
             })(),
             $base.'/files/compress' => (function () use ($request, $headers) {
                 $name = ((string) ($request['name'] ?? '') ?: 'archive').'.'.((string) ($request['extension'] ?? '') ?: 'tar.gz');
@@ -665,3 +697,831 @@ it('hands a world download to the node only for an authorised, signed request', 
     $this->actingAs(User::factory()->create());
     $this->get($url.'?'.http_build_query(['world' => 'world'] + \McToolkit\Http\Controllers\WorldDownloadController::makeQuery($server, 'world')))->assertForbidden();
 });
+
+/* ================================================================== */
+/*  Minecraft 26.x world layout — BEGIN                                */
+/*  One level folder: dimensions/minecraft/<dim>/region, players/,     */
+/*  seed in world_gen_settings.dat, string block-state palettes.       */
+/*  Shapes mirror a real Paper 26.3 world (DataVersion 5023).          */
+/* ================================================================== */
+
+/** 26.x level.dat: no WorldGenSettings, `hardcore` under difficulty_settings. */
+function mct26LevelDat(): string
+{
+    $data = nbtCompound([
+        nbtTag(10, 'difficulty_settings', nbtCompound([nbtTag(1, 'locked', nbtI8(0)), nbtTag(8, 'difficulty', nbtS('hard')), nbtTag(1, 'hardcore', nbtI8(1))])),
+        nbtTag(8, 'Bukkit.Version', nbtS('Paper/26.3-143-ff3655a (MC: 26.3)/26.3.build.143-beta')),
+        nbtTag(10, 'spawn', nbtCompound([nbtTag(11, 'pos', nbtIntArray([700, 85, -300])), nbtTag(5, 'pitch', pack('G', 0.0)), nbtTag(8, 'dimension', nbtS('minecraft:overworld'))])),
+        nbtTag(4, 'LastPlayed', nbtI64(1791113721483)),
+        nbtTag(3, 'GameType', nbtI32(1)),
+        nbtTag(10, 'DataPacks', nbtCompound([nbtTag(9, 'Enabled', nbtList(8, [nbtS('vanilla'), nbtS('paper')]))])),
+        nbtTag(3, 'DataVersion', nbtI32(5023)),
+        nbtTag(8, 'LevelName', nbtS('Armikan')),
+        nbtTag(9, 'version_history', nbtList(3, [nbtI32(5023)])),
+        nbtTag(10, 'Version', nbtCompound([nbtTag(8, 'Name', nbtS('26.3')), nbtTag(8, 'Series', nbtS('main')), nbtTag(3, 'Id', nbtI32(5023))])),
+    ]);
+
+    return gzencode(nbtTag(10, '', nbtCompound([nbtTag(10, 'Data', $data)])));
+}
+
+/** 26.x saved-data file that took the seed over from level.dat. */
+function mct26WorldGenSettings(int $seed): string
+{
+    return gzencode(nbtTag(10, '', nbtCompound([
+        nbtTag(3, 'DataVersion', nbtI32(5023)),
+        nbtTag(10, 'data', nbtCompound([
+            nbtTag(1, 'generate_structures', nbtI8(1)),
+            nbtTag(10, 'dimensions', nbtCompound([nbtTag(10, 'minecraft:overworld', nbtCompound([nbtTag(8, 'type', nbtS('minecraft:overworld'))]))])),
+            nbtTag(4, 'seed', nbtI64($seed)),
+        ])),
+    ])));
+}
+
+/**
+ * One 26.x chunk (blocks as in buildChunk(): stone up to y=4, a surface block at y=5).
+ * Plain palettes are TAG_String lists; a palette mixing states with and without properties
+ * is a compound list of `{id, properties}` and `{"": id}` entries.
+ */
+function mct26Chunk(bool $mixed): string
+{
+    $blocks = [];
+    for ($i = 0; $i < 4096; $i++) {
+        $y = intdiv($i, 256);
+        $blocks[$i] = $y <= 4 ? 2 : ($y === 5 ? 1 : 0);
+    }
+
+    $palette = $mixed
+        ? nbtList(10, [
+            nbtCompound([nbtTag(8, '', nbtS('minecraft:air'))]),
+            nbtCompound([nbtTag(8, 'id', nbtS('minecraft:water')), nbtTag(10, 'properties', nbtCompound([nbtTag(8, 'level', nbtS('0'))]))]),
+            nbtCompound([nbtTag(8, '', nbtS('minecraft:sand'))]),
+        ])
+        : nbtList(8, [nbtS('minecraft:air'), nbtS('minecraft:grass_block'), nbtS('minecraft:stone')]);
+
+    $section = nbtCompound([
+        nbtTag(1, 'Y', nbtI8(0)),
+        nbtTag(10, 'biomes', nbtCompound([nbtTag(9, 'palette', nbtList(8, [nbtS('minecraft:plains')]))])),
+        nbtTag(10, 'block_states', nbtCompound([
+            nbtTag(12, 'data', nbtLongArray(packLongs($blocks, 4, 256))),
+            nbtTag(9, 'palette', $palette),
+        ])),
+    ]);
+
+    $air = fn (int $y) => nbtCompound([
+        nbtTag(1, 'Y', nbtI8($y)),
+        nbtTag(10, 'block_states', nbtCompound([nbtTag(9, 'palette', nbtList(8, [nbtS('minecraft:air')]))])),
+    ]);
+
+    return nbtTag(10, '', nbtCompound([
+        nbtTag(3, 'xPos', nbtI32(0)),
+        nbtTag(3, 'yPos', nbtI32(-4)),
+        nbtTag(9, 'sections', nbtList(10, [$air(-4), $section, $air(1)])),
+        nbtTag(8, 'Status', nbtS('minecraft:full')),
+        nbtTag(3, 'DataVersion', nbtI32(5023)),
+    ]));
+}
+
+/** Region with a string-palette chunk at local (0,0) and a mixed-palette chunk at (1,0). */
+function mct26Region(): string
+{
+    $locations = str_repeat("\0", 4096);
+    $body = '';
+    $sector = 2;
+
+    foreach ([0 => false, 1 => true] as $index => $mixed) {
+        $chunk = gzcompress(mct26Chunk($mixed));
+        $record = pack('N', strlen($chunk) + 1).chr(2).$chunk;
+        $sectors = (int) ceil(strlen($record) / 4096);
+        $body .= str_pad($record, $sectors * 4096, "\0");
+        $locations = substr_replace($locations, pack('N', ($sector << 8) | $sectors), $index * 4, 4);
+        $sector += $sectors;
+    }
+
+    return $locations.str_repeat("\0", 4096).$body;
+}
+
+/** Same server as mctWorld(), but its `world` is a 26.x level folder (no world_nether/world_the_end). */
+function mct26World(FakeWings $wings): void
+{
+    mctWorld($wings);
+
+    foreach (array_keys($wings->files) as $path) {
+        if (str_starts_with($path, 'world')) {
+            unset($wings->files[$path]);
+        }
+    }
+
+    foreach (array_keys($wings->dirs) as $path) {
+        if (str_starts_with($path, 'world')) {
+            unset($wings->dirs[$path]);
+        }
+    }
+
+    $uuid = '069a79f4-44e9-4726-a5be-fca90e38aaf5';
+    $dims = 'world/dimensions/minecraft';
+
+    $wings->put('world/level.dat', mct26LevelDat());
+    $wings->put('world/level.dat_old', mct26LevelDat());
+    $wings->put('world/session.lock', 'x');
+    $wings->put('world/data/minecraft/scoreboard.dat', gzencode(nbtTag(10, '', nbtCompound([nbtTag(3, 'DataVersion', nbtI32(5023))]))));
+    $wings->put('world/datapacks/limbo.zip', 'PK');
+    $wings->put($dims.'/overworld/region/r.0.0.mca', mct26Region());
+    $wings->put($dims.'/overworld/entities/r.0.0.mca', str_repeat("\0", 8192));
+    $wings->put($dims.'/overworld/data/minecraft/world_gen_settings.dat', mct26WorldGenSettings(-9132444186617892091));
+    $wings->put($dims.'/overworld/paper-world.yml', "_version: 31\n");
+    $wings->put($dims.'/the_nether/region/r.0.0.mca', mct26Region());
+    $wings->put($dims.'/the_end/region/r.-1.0.mca', mct26Region());
+    $wings->put('world/players/data/'.$uuid.'.dat', gzencode(nbtTag(10, '', nbtCompound([nbtTag(3, 'DataVersion', nbtI32(5023))]))));
+    $wings->put('world/players/stats/'.$uuid.'.json', '{"stats":{},"DataVersion":5023}');
+    $wings->put('world/players/advancements/'.$uuid.'.json', '{"DataVersion":5023}');
+}
+
+it('reads a 26.x level.dat and the seed that moved to world_gen_settings.dat', function () {
+    expect(NbtReader::parseLevelDat(mct26LevelDat()))->toMatchArray([
+        'version' => '26.3',
+        'data_version' => 5023,
+        'level_name' => 'Armikan',
+        'game_type' => 1,
+        'hardcore' => true,
+        'last_played' => '2026-10-04T11:35:21Z',
+        'seed' => null,
+        'spawn_x' => 700,
+        'spawn_y' => 85,
+        'spawn_z' => -300,
+    ])
+        ->and(NbtReader::parseWorldGenSeed(mct26WorldGenSettings(-9132444186617892091)))->toBe('-9132444186617892091')
+        ->and(NbtReader::parseLevelDat(buildLevelDat()))->toMatchArray(['hardcore' => false, 'seed' => '-123456789012345']);
+});
+
+it('lists a 26.x world as one row that maps all three dimensions, next to a classic world', function () {
+    $wings = new FakeWings();
+    mct26World($wings);
+    $wings->put('legacy/level.dat', buildLevelDat());
+    $wings->put('legacy/region/r.0.0.mca', buildRegion());
+    [, $server] = mctServer($wings);
+
+    $service = app(\McToolkit\Services\Worlds\WorldsService::class);
+    $rows = collect($service->listWorlds($server))->keyBy('name');
+
+    expect($rows->keys()->all())->toBe(['world', 'legacy'])
+        ->and($rows['world'])->toMatchArray([
+            'default' => true,
+            'dimension' => 'overworld',
+            'linked' => false,
+            'members' => [],
+            'maps' => ['overworld', 'nether', 'end'],
+            'seed' => '-9132444186617892091',
+            'game_mode' => 'creative',
+            'hardcore' => true,
+            'title' => 'Armikan',
+            'version' => '26.3',
+            'spawn' => ['x' => 700, 'y' => 85, 'z' => -300],
+            'approximate' => false,
+        ])
+        // the size walk reaches dimensions/minecraft/<dim>/region/*.mca
+        ->and($rows['world']['size'])->toBeGreaterThan(3 * strlen(mct26Region()))
+        ->and($rows['legacy'])->toMatchArray(['maps' => ['overworld'], 'version' => '1.21.4', 'seed' => '-123456789012345', 'hardcore' => false])
+        ->and($service->affectedPaths($server, 'world'))->toBe(['world'])
+        ->and($service->knownWorldNames($server))->toBe(['world', 'legacy']);
+});
+
+it('keeps pre-upgrade split-world leftovers linked to a 26.x world', function () {
+    $wings = new FakeWings();
+    mct26World($wings);
+    $wings->put('world_nether/DIM-1/region/r.0.0.mca', buildRegion());
+    [, $server] = mctServer($wings);
+
+    $service = app(\McToolkit\Services\Worlds\WorldsService::class);
+
+    expect(collect($service->listWorlds($server, false))->map(fn ($r) => [$r['name'], $r['maps'], $r['linked']])->all())->toBe([
+        ['world', ['overworld', 'nether', 'end'], false],
+        ['world_nether', ['nether'], true],
+    ])->and($service->affectedPaths($server, 'world'))->toBe(['world', 'world_nether']);
+});
+
+it('draws every dimension of a 26.x world on the map, string palettes included', function () {
+    $wings = new FakeWings();
+    mct26World($wings);
+    $wings->put('legacy/region/r.0.0.mca', buildRegion());
+    $wings->put('.toolkit/map.json', json_encode(['players' => [
+        ['name' => 'Notch', 'x' => 10, 'y' => 70, 'z' => 10, 'dimension' => 'minecraft:the_nether', 'world' => 'world_nether'],
+        ['name' => 'Steve', 'x' => 1, 'y' => 70, 'z' => 1, 'dimension' => 'minecraft:overworld', 'world' => 'world'],
+        ['name' => 'Alex', 'x' => 1, 'y' => 70, 'z' => 1, 'dimension' => 'minecraft:the_nether', 'world' => 'other_nether'],
+    ], 'time' => 1000]));
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    $regionsOf = fn ($c) => collect($c->get('regionMeta')['regions'])->map(fn ($r) => [$r['rx'], $r['rz']])->all();
+
+    $c = livewire(MapPage::class)->assertOk();
+    expect(collect($c->get('worlds'))->pluck('key')->all())->toBe(['world', 'world@nether', 'world@end', 'legacy'])
+        ->and($c->get('selectedWorld'))->toBe('world')
+        ->and($regionsOf($c))->toBe([[0, 0]])
+        ->and(collect($c->get('pins'))->pluck('name')->all())->toBe(['Steve']);
+
+    // Paper 26.x still names its nether level `world_nether`, now stored inside `world/`.
+    $c->call('selectWorld', 'world@nether');
+    expect(collect($c->get('pins'))->pluck('name')->all())->toBe(['Notch']);
+
+    $c->call('selectWorld', 'world@end');
+    expect($regionsOf($c))->toBe([[-1, 0]]);
+
+    $tile = fn (string $world, string $dim, int $rx = 0): string => base64_decode((string) $this->getJson(
+        "/server/{$server->uuid_short}/mc-toolkit/map/tile?world={$world}&dim={$dim}&rx={$rx}&rz=0&v=1760090400"
+    )->assertOk()->json('tile.pixels'));
+
+    $overworld = $tile('world', 'overworld');
+
+    // String palette renders exactly like the classic {Name: …} palette of the same blocks.
+    expect(substr($overworld, 0, 4))->toBe(substr($tile('legacy', 'overworld'), 0, 4))
+        ->and(bin2hex(substr($overworld, 0, 3)))->not->toBe('0b0e14')
+        // mixed {id, properties} / {"": id} palette (chunk 1 starts at pixel 8 at coarse 2)
+        ->and(bin2hex(substr($overworld, 4 * 8, 3)))->not->toBe('0b0e14')
+        ->and(substr($overworld, 4 * 8, 3))->not->toBe(substr($overworld, 0, 3))
+        ->and(bin2hex(substr($overworld, 4 * 16, 3)))->toBe('0b0e14')
+        ->and(bin2hex(substr($tile('world', 'nether'), 0, 3)))->not->toBe('0b0e14')
+        ->and(bin2hex(substr($tile('world', 'end', -1), 0, 3)))->not->toBe('0b0e14');
+});
+
+it('finds a 26.x world inside an unpacked import archive', function () {
+    $wings = new FakeWings();
+    [, $server] = mctServer($wings);
+
+    $wings->put('.toolkit/import-abc/pack/README.txt', 'hi');
+    $wings->put('.toolkit/import-abc/pack/MyWorld/level.dat', mct26LevelDat());
+    $wings->put('.toolkit/import-abc/pack/MyWorld/dimensions/minecraft/overworld/region/r.0.0.mca', 'x');
+    $wings->put('.toolkit/import-abc/pack/MyWorld/players/data/x.dat', 'x');
+
+    $service = app(\McToolkit\Services\Worlds\WorldsService::class);
+    $locate = (new ReflectionClass($service))->getMethod('locateWorld');
+
+    expect($locate->invoke($service, $server, '.toolkit/import-abc'))->toBe('.toolkit/import-abc/pack/MyWorld');
+
+    // Without level.dat the dimensions/ folder alone still marks the world folder.
+    unset($wings->files['.toolkit/import-abc/pack/MyWorld/level.dat']);
+    expect($locate->invoke($service, $server, '.toolkit/import-abc'))->toBe('.toolkit/import-abc/pack/MyWorld');
+});
+
+it('badges Paper 26.x bridge levels that have no folder of their own', function () {
+    $wings = new FakeWings();
+    mct26World($wings);
+    $wings->put('.toolkit/performance.json', json_encode(['tps' => 20, 'worlds' => [
+        ['name' => 'world', 'players' => 1, 'chunks' => 100],
+        ['name' => 'world_nether', 'players' => 0, 'chunks' => 10],
+        ['name' => 'world_the_end', 'players' => 0, 'chunks' => 5],
+    ]]));
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    $badges = collect(livewire(PerformancePage::class)->assertOk()->get('worlds'))->pluck('badge', 'name')->all();
+
+    expect($badges)->toBe(['world' => 'Default', 'world_nether' => 'Nether', 'world_the_end' => 'End']);
+});
+
+it('mounts the world-facing pages on a 26.x world', function (string $page) {
+    $wings = new FakeWings();
+    mct26World($wings);
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    livewire($page)->assertOk();
+})->with([
+    'players' => PlayersPage::class,
+    'worlds' => WorldsPage::class,
+    'map' => MapPage::class,
+    'performance' => PerformancePage::class,
+]);
+
+/* ================================================================== */
+/*  Minecraft 26.x world layout — END                                  */
+/* ================================================================== */
+
+/* ================================================================== */
+/*  v1.0.5 UI regressions (stylesheet, Livewire hooks, wire args) — START */
+/* ================================================================== */
+
+it('keeps the Map page alive across Livewire updates (no private hydrate{Prop} hooks)', function () {
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    // Every update after mount runs Livewire's hydrate{Property}() hooks; a private
+    // hydrateWorlds() made each of them throw BadMethodCallException.
+    livewire(MapPage::class)->assertOk()->call('$refresh')->assertOk();
+});
+
+it('has no non-public method named like a Livewire property hook on any page', function () {
+    $pages = [VersionsPage::class, PluginsPage::class, ModsPage::class, ModpacksPage::class, PropertiesPage::class,
+        PlayersPage::class, WorldsPage::class, MapPage::class, PerformancePage::class, McAdminSettingsPage::class];
+
+    $offenders = [];
+
+    foreach ($pages as $page) {
+        $class = new ReflectionClass($page);
+        $props = array_map(fn (ReflectionProperty $p): string => ucfirst($p->getName()), $class->getProperties(ReflectionProperty::IS_PUBLIC));
+
+        foreach ($class->getMethods() as $method) {
+            if ($method->isPublic()) {
+                continue;
+            }
+
+            foreach (['hydrate', 'dehydrate', 'updating', 'updated'] as $prefix) {
+                if (str_starts_with($method->getName(), $prefix) && in_array(substr($method->getName(), strlen($prefix)), $props, true)) {
+                    $offenders[] = $page.'::'.$method->getName();
+                }
+            }
+        }
+    }
+
+    expect($offenders)->toBe([]);
+});
+
+it('ships a prebuilt stylesheet and inlines it as one closed style element', function () {
+    $css = base_path('plugins/minecraft-toolkit/resources/dist/toolkit.css');
+
+    expect(is_file($css))->toBeTrue()
+        ->and(filesize($css))->toBeGreaterThan(10_000);
+
+    $tag = (new ReflectionMethod(McToolkit\McToolkitPlugin::class, 'stylesheetTag'))->invoke(null);
+
+    expect($tag)->toStartWith('<style id="mc-toolkit-styles">')
+        ->and($tag)->toEndWith('</style>')
+        ->and(substr_count($tag, '</style'))->toBe(1)
+        // utilities the views rely on, incl. the Filament palette mapping
+        ->and($tag)->toContain('.grid')
+        ->and($tag)->toContain('var(--primary-600)');
+});
+
+it('renders wire arguments the browser can parse on every page', function (string $page) {
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    $html = livewire($page)->assertOk()->html();
+
+    // Blade directives are not compiled inside <x-…> component attributes: an @js(...)
+    // reached the browser verbatim and every such button threw a SyntaxError.
+    expect($html)->not->toContain('@js(')
+        // A raw double quote inside an Alpine handler closes the attribute early.
+        ->and($html)->not->toContain('new Event("input"');
+})->with('pages');
+
+/* ================================================================== */
+/*  v1.0.5 UI regressions — END                                        */
+/* ================================================================== */
+
+/* ================================================================== */
+/*  Background installs (queued jobs) — START                          */
+/*  Fully qualified names only, so this section needs no imports.      */
+/* ================================================================== */
+
+/** Fake Modrinth project `mctkpack` (one .mrpack version) + its archive contents in FakeWings. */
+function mctqPack(FakeWings $wings, string $loaderKey = 'fabric-loader', string $loaderVersion = '0.16.10', string $mc = '1.20.1'): string
+{
+    $id = 'mctkpack';
+    $mrpack = 'https://cdn.modrinth.com/data/mctkpack/versions/1.0.0/Test-Pack-1.0.0.mrpack';
+
+    Http::fake(function (Request $request) use ($id, $mrpack, $mc) {
+        if (parse_url($request->url(), PHP_URL_HOST) !== 'api.modrinth.com') {
+            return null;
+        }
+
+        return match (parse_url($request->url(), PHP_URL_PATH)) {
+            "/v2/project/{$id}/version" => Http::response([[
+                'id' => 'v1', 'version_number' => '1.0.0', 'version_type' => 'release',
+                'loaders' => ['fabric'], 'game_versions' => [$mc], 'dependencies' => [],
+                'files' => [['filename' => 'Test-Pack-1.0.0.mrpack', 'url' => $mrpack, 'primary' => true, 'size' => 1234, 'hashes' => ['sha1' => str_repeat('a', 40)]]],
+            ]], 200),
+            "/v2/project/{$id}" => Http::response(['id' => $id, 'slug' => 'test-pack', 'title' => 'Test Pack'], 200),
+            default => null,
+        };
+    });
+
+    $wings->archives['#^'.preg_quote($mrpack, '#').'$#'] = [
+        'modrinth.index.json' => json_encode([
+            'formatVersion' => 1, 'game' => 'minecraft', 'versionId' => '1.0.0', 'name' => 'Test Pack',
+            'files' => [
+                ['path' => 'mods/sodium.jar', 'downloads' => ['https://cdn.modrinth.com/data/AANobbMI/versions/x/sodium.jar'], 'env' => ['server' => 'required', 'client' => 'required'], 'fileSize' => 10],
+                ['path' => 'mods/client-only.jar', 'downloads' => ['https://cdn.modrinth.com/data/x/versions/y/client.jar'], 'env' => ['server' => 'unsupported', 'client' => 'required'], 'fileSize' => 10],
+            ],
+            'dependencies' => ['minecraft' => $mc, $loaderKey => $loaderVersion],
+        ]),
+        'overrides/config/test.toml' => "a = 1\n",
+    ];
+
+    return $id;
+}
+
+function mctqNotes(Server $server): string
+{
+    return implode("\n", \McToolkit\Support\ServerTask::get($server)['notes'] ?? []);
+}
+
+it('tracks one task per server: start, begin, progress, cancel, stale and dead states', function () {
+    [$user, $server] = mctServer(new FakeWings());
+    $T = \McToolkit\Support\ServerTask::class;
+
+    $token = $T::start($server, 'software', 'Paper 1.21.4', $user->id);
+    expect($token)->toBeString()
+        ->and($T::start($server, 'modpack', 'Other', $user->id))->toBeNull()
+        ->and($T::present($server))->toMatchArray(['state' => 'queued', 'active' => true, 'can_cancel' => true, 'queue_stalled' => false])
+        ->and($T::present($server))->not->toHaveKey('id');
+
+    // Queued for more than two minutes: the worker is probably not running.
+    \Illuminate\Support\Carbon::setTestNow(now()->addMinutes(3));
+    expect($T::present($server)['queue_stalled'])->toBeTrue()
+        ->and($T::cancel($server))->toBeTrue()
+        ->and($T::get($server))->toBeNull()
+        ->and($T::begin($server, $token))->toBeFalse(); // the cancelled job bails out
+
+    $token = $T::start($server, 'software', 'Paper 1.21.4', $user->id);
+    expect($T::begin($server, $token))->toBeTrue()
+        ->and($T::begin($server, $token))->toBeFalse() // second delivery
+        ->and($T::cancel($server))->toBeFalse()
+        ->and($T::step($server, $token, 'download', 1, 4))->toBeTrue()
+        ->and($T::present($server))->toMatchArray(['state' => 'running', 'step' => 'download', 'done' => 1, 'total' => 4, 'percent' => 25])
+        ->and($T::step($server, 'not-the-token', 'swap'))->toBeFalse()
+        ->and($T::dismiss($server))->toBeFalse();
+
+    // No heartbeat for over ten minutes: dead, dismissable, no longer blocking.
+    \Illuminate\Support\Carbon::setTestNow(now()->addMinutes(11));
+    expect($T::present($server))->toMatchArray(['dead' => true, 'active' => false, 'can_dismiss' => true]);
+
+    $next = $T::start($server, 'software', 'Fabric 1.20.1', $user->id);
+    expect($next)->toBeString()
+        ->and($T::step($server, $token, 'swap'))->toBeFalse() // the old run lost its entry
+        ->and($T::begin($server, $next))->toBeTrue()
+        ->and($T::note($server, $next, 'first note'))->toBeTrue()
+        ->and($T::finish($server, $next, true, 'Done', true))->toBeTrue()
+        ->and($T::present($server))->toMatchArray(['state' => 'done', 'warning' => true, 'message' => 'Done', 'notes' => ['first note'], 'can_dismiss' => true])
+        ->and($T::dismiss($server))->toBeTrue()
+        ->and($T::get($server))->toBeNull();
+
+    // A page opened while a task waits shows it (whatever its kind) and blocks installs.
+    $T::start($server, 'modpack', 'Test Pack', $user->id);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    livewire(VersionsPage::class)->assertSet('task.state', 'queued')->assertSet('busy', true)
+        ->assertSee('Test Pack')->assertSeeHtml('wire:poll.2s="pollTask"');
+});
+
+it('ignores a duplicate delivery of a running job but fails it on timeout or when it went silent', function () {
+    [$user, $server] = mctServer(new FakeWings());
+    $T = \McToolkit\Support\ServerTask::class;
+
+    $token = $T::start($server, 'software', 'Paper 1.21.4', $user->id);
+    $T::begin($server, $token);
+    $job = new \McToolkit\Jobs\InstallSoftwareJob($server->id, $user->id, $token, 'PAPER', '1.21.4');
+
+    expect($job->tries)->toBe(1)->and($job->timeout)->toBe(3600)->and($job->failOnTimeout)->toBeTrue();
+
+    $job->failed(new \Illuminate\Queue\MaxAttemptsExceededException('second delivery'));
+    expect($T::get($server)['state'])->toBe('running');
+
+    $job->failed(new \Illuminate\Queue\TimeoutExceededException('timed out'));
+    expect($T::get($server))->toMatchArray(['state' => 'failed'])
+        ->and($T::get($server)['message'])->toContain('60 minutes')
+        ->and(\Illuminate\Notifications\DatabaseNotification::query()->where('notifiable_id', $user->id)->count())->toBe(1);
+
+    // A duplicate delivery after the run went silent marks it failed too.
+    $token = $T::start($server, 'software', 'Paper 1.21.4', $user->id);
+    $T::begin($server, $token);
+    \Illuminate\Support\Carbon::setTestNow(now()->addMinutes(11));
+    (new \McToolkit\Jobs\InstallSoftwareJob($server->id, $user->id, $token, 'PAPER', '1.21.4'))
+        ->failed(new \Illuminate\Queue\MaxAttemptsExceededException('second delivery'));
+    expect($T::get($server)['state'])->toBe('failed');
+});
+
+it('queues a Versions install, shows and polls the task, refuses a second one and cancels it', function () {
+    config()->set('queue.default', 'database');
+    \Illuminate\Support\Facades\Queue::fake();
+
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    $c = livewire(VersionsPage::class)->assertOk()->set('search', '1.21.4');
+    $c->call('askInstall', '1.21.4')->assertSet('pending.version', '1.21.4')->call('runInstall');
+
+    \Illuminate\Support\Facades\Queue::assertPushed(\McToolkit\Jobs\InstallSoftwareJob::class, fn ($job) => $job->type === 'PAPER'
+        && $job->version === '1.21.4' && $job->java === 21 && $job->serverId === $server->id && $job->userId === $user->id);
+
+    $c->assertSet('busy', true)->assertSet('task.state', 'queued')->assertSeeHtml('wire:poll.2s="pollTask"');
+
+    // A second install while one is queued is refused.
+    $c->call('askInstall', '1.21.4')->call('runInstall');
+    \Illuminate\Support\Facades\Queue::assertPushed(\McToolkit\Jobs\InstallSoftwareJob::class, 1);
+
+    // Stuck in the queue: the page hints at the missing worker.
+    \Illuminate\Support\Carbon::setTestNow(now()->addMinutes(3));
+    $c->call('pollTask')->assertSet('task.queue_stalled', true)->assertSee('queue:work');
+
+    $c->call('cancelTask')->assertSet('task', null)->assertSet('busy', false)->assertDontSeeHtml('wire:poll.2s');
+
+    // The worker finally picks the cancelled job up: it does nothing.
+    \Illuminate\Support\Facades\Queue::pushed(\McToolkit\Jobs\InstallSoftwareJob::class)->first()->handle();
+    expect($wings->pulls)->toBe([])->and($wings->power)->toBe([]);
+});
+
+it('runs a queued software install like the worker would: actor, Java image, notification', function () {
+    config()->set('queue.default', 'database');
+    \Illuminate\Support\Facades\Queue::fake();
+
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings);
+    $server->forceFill(['image' => 'ghcr.io/pelican-eggs/yolks:java_17'])->save();
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    $c = livewire(VersionsPage::class)->set('search', '1.21.4');
+    $c->call('askInstall', '1.21.4')->set('startAfter', false)->call('runInstall');
+
+    // Worker context: nobody is logged in.
+    auth()->forgetUser();
+    \Illuminate\Support\Facades\Exceptions::fake();
+    \Illuminate\Support\Facades\Queue::pushed(\McToolkit\Jobs\InstallSoftwareJob::class)->first()->handle();
+    \Illuminate\Support\Facades\Exceptions::assertNothingReported();
+
+    $task = \McToolkit\Support\ServerTask::get($server);
+    $server->refresh();
+
+    expect($task['state'])->toBe('done')
+        ->and($wings->power)->toBe(['stop'])
+        ->and($wings->files)->toHaveKey('bungeecord.jar')
+        ->and($wings->files)->not->toHaveKey('paper-1.21.4-232.jar')
+        ->and(json_decode($wings->files['.mctoolkit-install.json'], true))->toMatchArray(['software' => 'PAPER', 'version' => '1.21.4'])
+        ->and($server->image)->toBe('ghcr.io/pelican-eggs/yolks:java_21')
+        ->and(mctqNotes($server))->toContain('Java 21')
+        ->and(\App\Models\ActivityLog::query()->where('event', 'mc-toolkit:versions.install')->value('actor_id'))->toBe($user->id)
+        ->and(\App\Models\ActivityLog::query()->where('event', 'server:startup.image')->value('actor_id'))->toBe($user->id);
+
+    // Filament's database notification is itself queued (the queue is faked here).
+    \Illuminate\Support\Facades\Queue::assertPushed(\Illuminate\Notifications\SendQueuedNotifications::class, fn ($job) => $job->notifiables->first()?->is($user)
+        && str_contains((string) ($job->notification->data['title'] ?? ''), 'Paper 1.21.4'));
+
+    // The page notices the end of the run on its next poll.
+    $this->actingAs($user);
+    $c->call('pollTask')->assertSet('task.state', 'done')->assertSet('busy', false)->call('dismissTask')->assertSet('task', null);
+});
+
+it('re-checks permissions when a queued install finally runs', function () {
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings, ['minecraft-toolkit.use']);
+    $T = \McToolkit\Support\ServerTask::class;
+
+    $token = $T::start($server, 'software', 'Paper 1.21.4', $user->id);
+    (new \McToolkit\Jobs\InstallSoftwareJob($server->id, $user->id, $token, 'PAPER', '1.21.4'))->handle();
+
+    expect($T::get($server)['state'])->toBe('failed')
+        ->and($T::get($server)['message'])->toBe(trans('minecraft-toolkit::errors.statuses.permission_denied'))
+        ->and($wings->pulls)->toBe([]);
+});
+
+it('installs an archive build: launcher renamed to SERVER_JARFILE, unix_args.txt gone, image and startup aligned', function () {
+    $wings = new FakeWings();
+    mctWorld($wings);
+    $wings->state = 'offline';
+    $wings->put('unix_args.txt', '-cp libraries/old.jar');
+    $wings->put('libraries/old/old.jar', 'old');
+    $wings->archives['#^https://files\.mcjars\.app/forge/#'] = [
+        'server.jar' => 'FORGE LAUNCHER',
+        'libraries/net/minecraftforge/forge/forge.jar' => 'lib',
+    ];
+    [$user, $server] = mctServer($wings);
+
+    $server->egg->forceFill(['startup_commands' => ['Forge args' => 'java @unix_args.txt', 'Default' => 'java -Xms128M -jar {{SERVER_JARFILE}}']])->save();
+    $server->forceFill(['startup' => 'java @unix_args.txt', 'image' => 'ghcr.io/pelican-eggs/yolks:java_8'])->save();
+    $server = $server->fresh(['egg', 'node']);
+
+    $result = app(\McToolkit\Services\Catalog\SoftwareInstallerService::class)->install($server, $user, 'FORGE', '1.20.1', ['build' => '47.2.0']);
+    $server->refresh();
+
+    expect($result->buildName)->toBe('47.2.0')
+        ->and($result->java)->toBe(17)
+        ->and($wings->files)->not->toHaveKey('unix_args.txt')
+        ->and($wings->files)->not->toHaveKey('server.jar')
+        ->and($wings->files)->not->toHaveKey('mcvapi.server.jar.zip')
+        ->and($wings->files)->not->toHaveKey('libraries/old/old.jar')
+        ->and($wings->files['bungeecord.jar'])->toBe('FORGE LAUNCHER')
+        ->and($wings->files)->toHaveKey('libraries/net/minecraftforge/forge/forge.jar')
+        ->and(json_decode($wings->files['.mctoolkit-install.json'], true)['files'])->toBe(['bungeecord.jar' => strlen('FORGE LAUNCHER')])
+        ->and($server->image)->toBe('ghcr.io/pelican-eggs/yolks:java_17')
+        ->and($server->startup)->toBe('java -Xms128M -jar {{SERVER_JARFILE}}')
+        ->and(implode("\n", $result->notes))->toContain('bungeecord.jar')->toContain('unix_args.txt')->toContain('"Default"')
+        ->and($result->attention)->toBeFalse();
+
+    $detected = app(\McToolkit\Services\DetectionService::class)->detect($server, true);
+    expect($detected['software'])->toBe('forge')->and($detected['version'])->toBe('1.20.1');
+});
+
+it('leaves image and startup alone without Startup permissions and notes it', function () {
+    $wings = new FakeWings();
+    mctWorld($wings);
+    $wings->state = 'offline';
+    [$user, $server] = mctServer($wings, ['minecraft-toolkit.use', 'minecraft-toolkit.versions', 'minecraft-toolkit.manage']);
+    $server->forceFill(['image' => 'ghcr.io/pelican-eggs/yolks:java_17'])->save();
+
+    $result = app(\McToolkit\Services\Catalog\SoftwareInstallerService::class)
+        ->install($server->fresh(['egg', 'node']), $user, 'FABRIC', '1.20.1', ['build' => '9.9.9-not-a-build']);
+
+    expect($server->fresh()->image)->toBe('ghcr.io/pelican-eggs/yolks:java_17') // 1.20.1 needs 17: nothing to do
+        ->and($result->buildName)->not->toBe('9.9.9-not-a-build')
+        ->and(implode("\n", $result->notes))->toContain('9.9.9-not-a-build')->toContain('startup command')
+        ->and($result->attention)->toBeTrue();
+
+    $result = app(\McToolkit\Services\Catalog\SoftwareInstallerService::class)
+        ->install($server->fresh(['egg', 'node']), $user, 'PAPER', '1.21.4');
+
+    expect($server->fresh()->image)->toBe('ghcr.io/pelican-eggs/yolks:java_17')
+        ->and(implode("\n", $result->notes))->toContain('Java 21')->toContain('Startup page');
+});
+
+it('maps Minecraft versions and egg images to Java majors', function () {
+    $S = \McToolkit\Services\Catalog\SoftwareInstallerService::class;
+
+    expect($S::fallbackJava('1.16.5'))->toBe(8)
+        ->and($S::fallbackJava('1.17.1'))->toBe(16)
+        ->and($S::fallbackJava('1.18.2'))->toBe(17)
+        ->and($S::fallbackJava('1.20.4'))->toBe(17)
+        ->and($S::fallbackJava('1.20.5'))->toBe(21)
+        ->and($S::fallbackJava('1.21.11'))->toBe(21)
+        ->and($S::fallbackJava('26.3'))->toBe(25)
+        ->and($S::fallbackJava('3.4.0'))->toBeNull()
+        ->and($S::javaMajorOf('ghcr.io/pelican-eggs/yolks:java_21'))->toBe(21)
+        ->and($S::javaMajorOf('Java 8'))->toBe(8)
+        ->and($S::javaMajorOf('eclipse-temurin JRE 17'))->toBe(17)
+        ->and($S::javaMajorOf('ghcr.io/x/y:latest'))->toBeNull()
+        ->and($S::pickImage(['Java 8' => 'a', 'Java 21' => 'c', 'Java 17' => 'b'], 16)['image'])->toBe('b')
+        ->and($S::pickImage(['Java 8' => 'a', 'Java 17' => 'b'], 21))->toBeNull()
+        ->and($S::launchesJar('java -jar {{SERVER_JARFILE}}'))->toBeTrue()
+        ->and($S::launchesJar('java @unix_args.txt'))->toBeFalse();
+});
+
+it('installs a modpack in the background together with its loader and keeps the server stopped', function () {
+    $wings = new FakeWings();
+    mctWorld($wings); // a Paper server with plugins
+    $wings->state = 'offline';
+    [$user, $server] = mctServer($wings);
+    $id = mctqPack($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    $c = livewire(ModpacksPage::class)->assertOk()->assertDontSee(trans('minecraft-toolkit::pages.mods.blocker.bukkit_message'));
+    expect($c->instance()->blockedNotice())->toBeNull();
+
+    $c->call('install', 'modrinth', $id)
+        ->assertSet('pendingPack.title', 'Test Pack')
+        ->assertSet('pendingPack.loader', 'fabric')
+        ->assertSet('pendingPack.game_version', '1.20.1')
+        ->assertSet('pendingPack.switches', true)
+        ->assertSet('packInstallLoader', true)
+        ->assertSet('packStartAfter', false)
+        ->assertSee('Also install Fabric for Minecraft 1.20.1');
+
+    \Illuminate\Support\Facades\Exceptions::fake();
+    $c->call('confirmPack'); // sync driver: the job runs once the request terminated
+    \Illuminate\Support\Facades\Exceptions::assertNothingReported();
+
+    $task = \McToolkit\Support\ServerTask::get($server);
+    $marker = json_decode($wings->files['.mctoolkit-install.json'] ?? 'null', true);
+
+    expect($task['state'])->toBe('done')
+        ->and($task['kind'])->toBe('modpack')
+        ->and($wings->files)->toHaveKey('mods/sodium.jar')
+        ->and($wings->files)->not->toHaveKey('mods/client-only.jar')
+        ->and($wings->files)->toHaveKey('config/test.toml')
+        ->and($wings->files)->toHaveKey('modrinth.index.json')
+        ->and($wings->files['bungeecord.jar'] ?? '')->toContain('fabric/1.20.1/0.16.10')
+        ->and($marker)->toMatchArray(['software' => 'FABRIC', 'version' => '1.20.1', 'build' => '0.16.10'])
+        ->and($wings->power)->not->toContain('start')
+        ->and(mctqNotes($server))->toContain('Fabric 0.16.10 for Minecraft 1.20.1')->toContain('plugins')
+        ->and(collect(array_keys($wings->files))->filter(fn ($f) => str_starts_with($f, '.mctoolkit-staging'))->all())->toBe([])
+        ->and(\App\Models\ActivityLog::query()->where('event', 'mc-toolkit:content.install')->value('actor_id'))->toBe($user->id)
+        ->and(\Illuminate\Notifications\DatabaseNotification::query()->where('notifiable_id', $user->id)->count())->toBe(1);
+
+    $row = \McToolkit\Models\InstalledContent::query()->where('server_id', $server->id)->where('kind', 'modpack')->first();
+    expect($row->dependencies['summary']['requires']['matches_server'])->toBeTrue();
+
+    // The next poll notices the end of the run and shows the installed list.
+    $c->call('pollTask')->assertSet('task.state', 'done')->assertSet('tab', 'installed');
+});
+
+it('skips the loader without the Versions permission and points to the Versions page', function () {
+    $wings = new FakeWings();
+    mctWorld($wings);
+    $wings->state = 'offline';
+    [$user, $server] = mctServer($wings, ['minecraft-toolkit.use', 'minecraft-toolkit.content', 'minecraft-toolkit.manage']);
+    $id = mctqPack($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    $c = livewire(ModpacksPage::class)->call('install', 'modrinth', $id);
+    expect($c->instance()->canInstallLoader())->toBeFalse();
+    $c->set('packStartAfter', true)->call('confirmPack');
+
+    $task = \McToolkit\Support\ServerTask::get($server);
+
+    expect($task['state'])->toBe('done')
+        ->and($task['warning'])->toBeTrue()
+        ->and($wings->files)->toHaveKey('mods/sodium.jar')
+        ->and(collect($wings->pulls)->contains(fn ($p) => str_contains($p['url'], 'mcjars')))->toBeFalse()
+        ->and($wings->power)->toBe([]) // never started on the wrong software
+        ->and(mctqNotes($server))->toContain('Versions page')->toContain('not started');
+});
+
+it('aborts a modpack cleanly when the server was started while its files downloaded', function () {
+    $wings = new FakeWings();
+    mctWorld($wings);
+    $wings->state = 'offline';
+    $wings->onPull = function (FakeWings $w, string $url): void {
+        if (str_contains($url, 'sodium.jar')) {
+            $w->state = 'running'; // somebody pressed Start meanwhile
+        }
+    };
+    [$user, $server] = mctServer($wings);
+    $id = mctqPack($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    livewire(ModpacksPage::class)->call('install', 'modrinth', $id)->call('confirmPack');
+
+    $task = \McToolkit\Support\ServerTask::get($server);
+
+    expect($task['state'])->toBe('failed')
+        ->and($task['message'])->toContain(trans('minecraft-toolkit::errors.statuses.stopped_required'))
+        ->and($wings->files)->not->toHaveKey('mods/sodium.jar')
+        ->and($wings->files)->not->toHaveKey('config/test.toml')
+        ->and($wings->files)->not->toHaveKey('modrinth.index.json')
+        ->and(collect(array_keys($wings->files))->filter(fn ($f) => str_starts_with($f, '.mctoolkit-staging'))->all())->toBe([])
+        ->and(\McToolkit\Models\InstalledContent::query()->where('server_id', $server->id)->count())->toBe(0);
+});
+
+it('refuses to queue a modpack while the server runs', function () {
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings);
+    $id = mctqPack($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    livewire(ModpacksPage::class)->call('install', 'modrinth', $id)->call('confirmPack')->assertSet('task', null);
+
+    expect(\McToolkit\Support\ServerTask::get($server))->toBeNull()->and($wings->pulls)->toBe([]);
+});
+
+it('mints a short world download token and schedules the archive clean-up', function () {
+    config()->set('queue.default', 'database');
+    \Illuminate\Support\Facades\Queue::fake();
+
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+
+    $q = \McToolkit\Http\Controllers\WorldDownloadController::makeQuery($server, 'world');
+    $location = $this->get("/server/{$server->uuid_short}/mc-toolkit/download/world?".http_build_query(['world' => 'world'] + $q))
+        ->assertRedirect()->headers->get('Location');
+
+    parse_str((string) parse_url($location, PHP_URL_QUERY), $query);
+    $claims = json_decode(base64_decode(strtr(explode('.', $query['token'])[1], '-_', '+/')), true);
+    expect((int) $claims['exp'] - now()->getTimestamp())->toBeGreaterThanOrEqual(175)->toBeLessThanOrEqual(185);
+
+    $archive = collect(array_keys($wings->files))->first(fn ($f) => str_starts_with($f, 'mctk-download-'));
+    expect($archive)->not->toBeNull();
+
+    \Illuminate\Support\Facades\Queue::assertPushed(\McToolkit\Jobs\DiscardWorldArchiveJob::class, fn ($job) => $job->archive === $archive
+        && $job->delay->getTimestamp() === now()->addSeconds(240)->getTimestamp());
+
+    \Illuminate\Support\Facades\Queue::pushed(\McToolkit\Jobs\DiscardWorldArchiveJob::class)->first()->handle(app(\McToolkit\Services\Worlds\WorldsService::class));
+    expect($wings->files)->not->toHaveKey($archive);
+});
+
+it('does not schedule a delayed archive clean-up on the sync driver', function () {
+    \Illuminate\Support\Facades\Queue::fake();
+
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+
+    $q = \McToolkit\Http\Controllers\WorldDownloadController::makeQuery($server, 'world');
+    $this->get("/server/{$server->uuid_short}/mc-toolkit/download/world?".http_build_query(['world' => 'world'] + $q))->assertRedirect();
+
+    \Illuminate\Support\Facades\Queue::assertNotPushed(\McToolkit\Jobs\DiscardWorldArchiveJob::class);
+});
+
+/* ================================================================== */
+/*  Background installs (queued jobs) — END                            */
+/* ================================================================== */

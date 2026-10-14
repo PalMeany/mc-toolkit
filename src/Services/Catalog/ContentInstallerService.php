@@ -7,6 +7,7 @@ namespace McToolkit\Services\Catalog;
 use App\Enums\ContainerStatus;
 use App\Facades\Activity;
 use App\Models\Server;
+use App\Models\User;
 use Closure;
 use DomainException;
 use Illuminate\Http\Client\ConnectionException;
@@ -26,11 +27,14 @@ use Throwable;
 /**
  * Installs plugins / mods / modpacks onto a server through the panel's file bridge.
  *
- * Owner: A3. Public API frozen by the contract (the trailing $isUpdate flag is additive):
+ * Owner: A3. Public API frozen by the contract (the trailing $isUpdate flag, the progress
+ * callback and the two modpack helpers are additive):
  *
- *   installProject(Server $server, string $kind, array $project, array $versionMeta, bool $isUpdate = false): InstalledContent
+ *   installProject(Server $server, string $kind, array $project, array $versionMeta, bool $isUpdate = false, ?Closure $progress = null): InstalledContent
  *   installed(Server $server, string $kind): array           // ['tracked'=>…, 'foreign'=>names+sizes]
  *   forgetMissing(Server $server): void                      // parity with addon v1.1.8
+ *   modpackPreview(string $projectId): ?array                // loaders + game versions of the newest pack
+ *   recheckPackRequirements(Server $server, InstalledContent $row): ?array
  *
  * Behavioural rules (contract §installer + wave brief):
  *  - SAFETY GATE: never touch a server in a conflict state (suspended, transferring,
@@ -142,6 +146,21 @@ final class ContentInstallerService
         private readonly CurseForgeService $curseForge,
     ) {}
 
+    /** Explicit activity actor; null falls back to the authenticated user (web requests). */
+    private ?User $actor = null;
+
+    /**
+     * Copy of this installer that logs activity as `$actor` — queued jobs have no
+     * authenticated user, so their entries would otherwise carry no actor.
+     */
+    public function actingAs(?User $actor): self
+    {
+        $clone = clone $this;
+        $clone->actor = $actor;
+
+        return $clone;
+    }
+
     /**
      * Install ONE best-matching artifact of `$project` for this server.
      *
@@ -152,9 +171,11 @@ final class ContentInstallerService
      *               ['software' => 'purpur', 'loader' => 'bukkit', 'mc_version' => '1.21.3']
      *               (an explicit ['loaders' => [...]] list overrides the software mapping)
      * @param  bool  $isUpdate  log as an update (also implied when the project is already tracked)
+     * @param  (Closure(string, ?int, ?int, array<string, scalar>): void)|null  $progress  modpack runs
+     *               only: step key (pages.tasks.steps.pack_*), done, total, label params
      * @throws DomainException translation-backed whenever anything blocks or fails
      */
-    public function installProject(Server $server, string $kind, array $project, array $versionMeta = [], bool $isUpdate = false): InstalledContent
+    public function installProject(Server $server, string $kind, array $project, array $versionMeta = [], bool $isUpdate = false, ?Closure $progress = null): InstalledContent
     {
         $kindKey = strtolower(trim($kind));
         $kind = self::KIND_ALIASES[$kindKey] ?? throw new \InvalidArgumentException("Unsupported content kind [{$kindKey}].");
@@ -175,7 +196,7 @@ final class ContentInstallerService
         }
 
         if ($kind === 'modpack') {
-            return $this->installModpack($server, $source, $projectId, $title, $isUpdate);
+            return $this->installModpack($server, $source, $projectId, $title, $isUpdate, $progress);
         }
 
         $loaders = $this->loaderCandidates($kind, $versionMeta);
@@ -864,15 +885,21 @@ final class ContentInstallerService
      *      allow-list — a pack that breaks those rules fails as a whole;
      *   3. download every file into the staging folder (sequential foreground pulls —
      *      wings allows three at once per server);
-     *   4. only then move everything into place: downloads, then overrides/, then
-     *      server-overrides/ (later layers win; folders merge, same-named files are
-     *      replaced, a folder never replaces a file or the other way round);
+     *   4. re-check that the container is still fully stopped (somebody may have started
+     *      it while the files downloaded), then move everything into place: downloads,
+     *      then overrides/, then server-overrides/ (later layers win; folders merge,
+     *      same-named files are replaced, a folder never replaces a file or the other
+     *      way round);
      *   5. remove the staging folder in every outcome.
      *
-     * Installing the loader itself is the Versions page's job; the pack's requirement is
-     * recorded and compared with the detected software.
+     * The pack's loader requirement is recorded and compared with the detected software;
+     * installing the loader is the caller's job (InstallModpackJob runs the
+     * SoftwareInstallerService right after this). Progress is reported per stage through
+     * `$progress`: pack_archive, pack_unpack, pack_files (n/total), pack_moving.
+     *
+     * @param  (Closure(string, ?int, ?int, array<string, scalar>): void)|null  $progress
      */
-    private function installModpack(Server $server, string $source, string $projectId, string $title, bool $isUpdate): InstalledContent
+    private function installModpack(Server $server, string $source, string $projectId, string $title, bool $isUpdate, ?Closure $progress = null): InstalledContent
     {
         if ($source !== 'modrinth') {
             throw $this->fail('download_failed', 'Modpacks can only be installed from Modrinth (.mrpack).');
@@ -911,7 +938,7 @@ final class ContentInstallerService
         $staging = '/'.self::STAGING_PREFIX.Str::lower(Str::random(12));
 
         try {
-            $result = $this->assembleModpack($server, $pack['url'], $staging);
+            $result = $this->assembleModpack($server, $pack['url'], $staging, $progress);
         } finally {
             $this->removeStaging($server, $staging);
 
@@ -972,21 +999,32 @@ final class ContentInstallerService
     /**
      * Steps 1–4 of {@see self::installModpack()}.
      *
+     * @param  (Closure(string, ?int, ?int, array<string, scalar>): void)|null  $progress
      * @return array{files:list<string>, files_total:int, client_only:int, override_layers:int,
      *               conflicts:list<string>, requires:array{minecraft:?string, loader:?string, loader_version:?string}}
      */
-    private function assembleModpack(Server $server, string $archiveUrl, string $staging): array
+    private function assembleModpack(Server $server, string $archiveUrl, string $staging, ?Closure $progress = null): array
     {
         $extractDir = $staging.'/pack';
         $downloadDir = $staging.'/downloads';
 
+        $report = static function (string $step, ?int $done = null, ?int $total = null) use ($progress): void {
+            if ($progress !== null) {
+                $progress($step, $done, $total, []);
+            }
+        };
+
         // 1. Archive → staging. The explicit .zip name keeps wings' archive detection happy
         //    (it matches on name AND content) whatever the upstream file was called.
+        $report('pack_archive');
+
         try {
             $this->files->pull($server, $archiveUrl, $extractDir, 'pack.zip');
         } catch (Throwable $e) {
             throw $this->fail('download_failed', $this->nodeReason($e, 'The modpack archive could not be downloaded to the server.'), $e);
         }
+
+        $report('pack_unpack');
 
         try {
             $this->files->decompress($server, $extractDir, 'pack.zip');
@@ -1046,7 +1084,11 @@ final class ContentInstallerService
         }
 
         // 3. Everything lands in staging first — a failed download leaves the server untouched.
-        foreach ($plan as $item) {
+        $planned = count($plan);
+
+        foreach ($plan as $i => $item) {
+            $report('pack_files', $i, $planned);
+
             $directory = dirname($item['path']);
 
             try {
@@ -1061,7 +1103,20 @@ final class ContentInstallerService
             }
         }
 
-        // 4. Move into place: downloads, then overrides/, then server-overrides/.
+        // 4. Move into place: downloads, then overrides/, then server-overrides/. The
+        //    downloads can take many minutes; whoever started the server meanwhile must
+        //    not get its files swapped underneath it. Failing here leaves the live files
+        //    untouched (the caller removes staging).
+        $report('pack_files', $planned, $planned);
+
+        try {
+            $this->assertInstallSafe($server, true);
+        } catch (DomainException $e) {
+            throw new DomainException($e->getMessage().' '.trans('minecraft-toolkit::pages.tasks.notes.pack_untouched'), 0, $e);
+        }
+
+        $report('pack_moving');
+
         $conflicts = [];
         $layers = 0;
 
@@ -1234,6 +1289,100 @@ final class ContentInstallerService
         $versionOk = $requires['minecraft'] === null || $version === null || $version === $requires['minecraft'];
 
         return $loaderOk && $versionOk;
+    }
+
+    /**
+     * Loader + game versions the newest installable `.mrpack` of a Modrinth modpack
+     * declares (version payload `loaders` / `game_versions`), for the confirmation sheet.
+     * The authoritative requirement is read from modrinth.index.json during the install.
+     *
+     * @return array{version:?string, loader:?string, game_version:?string}|null null when nothing installable is published
+     */
+    public function modpackPreview(string $projectId): ?array
+    {
+        $projectId = trim($projectId);
+
+        if ($projectId === '') {
+            return null;
+        }
+
+        try {
+            $versions = self::releasesFirst($this->modrinth->versions($projectId));
+        } catch (Throwable) {
+            return null;
+        }
+
+        foreach ($versions as $version) {
+            $hasPack = false;
+
+            foreach (is_array($version['files'] ?? null) ? $version['files'] : [] as $file) {
+                if (is_array($file) && is_string($file['filename'] ?? null) && str_ends_with(mb_strtolower($file['filename']), '.mrpack')) {
+                    $hasPack = true;
+
+                    break;
+                }
+            }
+
+            if (!$hasPack) {
+                continue;
+            }
+
+            $loaders = array_map('strtolower', array_filter(is_array($version['loaders'] ?? null) ? $version['loaders'] : [], 'is_string'));
+            $loader = null;
+
+            foreach ($loaders as $candidate) {
+                if (in_array($candidate, self::MOD_LOADERS, true)) {
+                    $loader = $candidate;
+
+                    break;
+                }
+            }
+
+            $gameVersions = array_values(array_filter(is_array($version['game_versions'] ?? null) ? $version['game_versions'] : [], 'is_string'));
+
+            return [
+                'version' => is_string($version['version_number'] ?? null) ? $version['version_number'] : null,
+                'loader' => $loader,
+                'game_version' => $gameVersions === [] ? null : (string) end($gameVersions),
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * Re-compare a modpack umbrella row's recorded requirement with the (freshly detected)
+     * software — after the loader was installed — and store the result on the row.
+     *
+     * @return array{minecraft:?string, loader:?string, loader_version:?string, matches_server:bool}|null
+     */
+    public function recheckPackRequirements(Server $server, InstalledContent $row): ?array
+    {
+        $deps = is_array($row->dependencies) ? $row->dependencies : [];
+        $requires = $deps['summary']['requires'] ?? null;
+
+        if ($row->kind !== InstalledContent::KIND_MODPACK || !is_array($requires)) {
+            return null;
+        }
+
+        $requires = [
+            'minecraft' => is_string($requires['minecraft'] ?? null) ? $requires['minecraft'] : null,
+            'loader' => is_string($requires['loader'] ?? null) ? $requires['loader'] : null,
+            'loader_version' => is_string($requires['loader_version'] ?? null) ? $requires['loader_version'] : null,
+        ];
+
+        $requires['matches_server'] = $this->packMatchesServer($server, $requires);
+
+        $deps['summary']['requires'] = $requires;
+        $row->dependencies = $deps;
+
+        try {
+            $row->save();
+        } catch (Throwable) {
+            // the row note simply stays stale until the next install
+        }
+
+        return $requires;
     }
 
     /**
@@ -1486,6 +1635,10 @@ final class ContentInstallerService
 
             if ($fileCount > 0) {
                 $log->property('files_installed', $fileCount);
+            }
+
+            if ($this->actor !== null) {
+                $log->actor($this->actor);
             }
 
             $log->log();

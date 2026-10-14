@@ -25,19 +25,8 @@
         :software="$profile ?? []"
     />
 
-    {{-- ------------------------------------------------------- profile cluster --}}
-    <div class="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
-        <span class="{{ $chip }}">
-            <x-filament::icon :icon="'tabler-server'" class="size-3.5 shrink-0" />
-            {{ ucfirst((string) ($profile['software'] ?? 'unknown')) }}
-            @if (filled($profile['version'] ?? null)) {{ $profile['version'] }} @endif
-        </span>
-        @if ($profile['proxy'] ?? false)
-            <span class="inline-flex items-center justify-center rounded-md bg-info-50 px-2 py-0.5 text-xs font-medium text-info-700 ring-1 ring-inset ring-info-600/20 dark:bg-info-400/10 dark:text-info-300 dark:ring-info-400/30">
-                Proxy
-            </span>
-        @endif
-    </div>
+    {{-- ------------------------------------------------------- background install (queued job) --}}
+    <x-minecraft-toolkit::task-status :task="$task" :can-control="$this->canControlTask()" />
 
     {{-- ------------------------------------------------------- bucket tabs --}}
     <div class="flex flex-wrap items-center gap-x-2 gap-y-2">
@@ -102,15 +91,14 @@
         </div>
 
         <div class="w-full sm:w-64">
-            <div class="fi-input-wrp flex rounded-lg bg-white shadow-sm ring-1 ring-gray-950/10 focus-within:ring-2 focus-within:ring-primary-600 dark:bg-white/5 dark:ring-white/20 dark:focus-within:ring-primary-500">
-                <input
+            <x-filament::input.wrapper prefix-icon="tabler-search">
+                <x-filament::input
                     type="search"
                     wire:model.live.debounce.400ms="search"
-                    placeholder="{{ __('minecraft-toolkit::common.buttons.search') }}"
-                    aria-label="{{ __('minecraft-toolkit::common.buttons.search') }}"
-                    class="fi-input w-full border-none bg-transparent px-3 py-1.5 text-sm leading-6 text-gray-950 outline-none placeholder:text-gray-400 dark:text-white"
+                    :placeholder="__('minecraft-toolkit::common.buttons.search')"
+                    :aria-label="__('minecraft-toolkit::common.buttons.search')"
                 />
-            </div>
+            </x-filament::input.wrapper>
         </div>
     </div>
 
@@ -182,7 +170,7 @@
 
     {{-- ------------------------------------------------------- install sheet --}}
     @if (! is_null($pending))
-        <div class="fixed inset-0 z-40 bg-gray-900/50 dark:bg-gray-100/20" wire:click="closeAsk()"></div>
+        <div class="fixed inset-0 z-40 bg-gray-950/50 backdrop-blur-sm dark:bg-gray-950/75" wire:click="closeAsk()"></div>
 
         <div class="fixed inset-x-4 top-1/2 z-40 mx-auto -translate-y-1/2 sm:inset-x-0 sm:max-w-sm" role="dialog" aria-modal="true">
             <div class="w-full rounded-xl bg-white p-6 shadow-xl ring-1 ring-gray-950/5 dark:bg-gray-800 dark:ring-white/10">

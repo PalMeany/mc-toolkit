@@ -29,7 +29,8 @@ use McToolkit\Services\FileBridge;
  *    is skipped arithmetically, so deep chests or jigsaw structures can neither blow
  *    memory up nor cut the parse short.
  * 5. Section layouts: `sections[].block_states.{palette,data}` (>= 1.18) and
- *    `Level.Sections[].{Palette,BlockStates}` (1.13 – 1.17). A single-entry palette has
+ *    `Level.Sections[].{Palette,BlockStates}` (1.13 – 1.17); 26.1+ palette entries are
+ *    plain id strings or `{id, properties}` ({@see self::paletteEntryId()}). A single-entry palette has
  *    no data array (the whole section is that block). Bits per entry are
  *    `max(4, ceil(log2(palette size)))`; since 1.16 (DataVersion 2529) entries never
  *    span two longs, before that they do — the chunk's DataVersion picks the rule.
@@ -138,8 +139,9 @@ final class RegionParser
      * Renders one region as an S x S grid of packed "R G B" bytes (row-major,
      * north-west corner at [0]).
      *
-     * @param  string  $regionDir  server-relative region folder, e.g. `world/region` or
-     *                             `world_nether/DIM-1/region` (built by MapTileService)
+     * @param  string  $regionDir  server-relative region folder, e.g. `world/region`,
+     *                             `world_nether/DIM-1/region` or (26.1+)
+     *                             `world/dimensions/minecraft/the_nether/region` (built by MapTileService)
      * @param  int  $coarse  downscale factor: how many blocks one output pixel spans
      *                          along each axis (valid: 1, 2, 4, 8)
      * @param  int  $yTop    highest world Y considered while walking columns down
@@ -982,7 +984,7 @@ final class RegionParser
                 $names = [];
 
                 foreach ($palette as $block) {
-                    $names[] = $this->normalizeBlockName(is_array($block) && is_string($block['Name'] ?? null) ? $block['Name'] : '');
+                    $names[] = $this->normalizeBlockName(self::paletteEntryId($block));
                 }
 
                 $words = $this->flattenBitStates($data);
@@ -1005,6 +1007,37 @@ final class RegionParser
         }
 
         return [];
+    }
+
+    /**
+     * Block id of one block-state palette entry, whatever the encoding:
+     *
+     * - up to 1.21.x: compound `{Name: "minecraft:stone", Properties: {…}}`;
+     * - 26.1+: a plain string `"minecraft:stone"` for a state without stored properties,
+     *   `{id: "minecraft:water", properties: {…}}` otherwise. A palette mixing both is a list
+     *   of compounds in which the plain entries are wrapped as `{"": "minecraft:stone"}`
+     *   (NBT lists are homogeneous: vanilla's heterogeneous-list encoding).
+     *
+     * Verified on a Paper 26.3 world (DataVersion 5023): string-only palettes are the norm,
+     * mixed ones use exactly the two compound shapes above.
+     */
+    private static function paletteEntryId(mixed $entry): string
+    {
+        if (is_string($entry)) {
+            return $entry;
+        }
+
+        if (! is_array($entry)) {
+            return '';
+        }
+
+        foreach (['Name', 'id', ''] as $key) {
+            if (is_string($entry[$key] ?? null)) {
+                return $entry[$key];
+            }
+        }
+
+        return '';
     }
 
     /**

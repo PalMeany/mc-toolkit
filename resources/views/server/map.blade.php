@@ -6,9 +6,11 @@
         :software="$software"
     />
 
-    <p class="text-sm leading-6 text-gray-500 dark:text-gray-400">
-        {{ __('minecraft-toolkit::pages.map.render_note', ['world' => $this->selectedLabel()]) }}
-    </p>
+    @if (filled($this->selectedLabel()))
+        <p class="text-sm leading-6 text-gray-500 dark:text-gray-400">
+            {{ __('minecraft-toolkit::pages.map.render_note', ['world' => $this->selectedLabel()]) }}
+        </p>
+    @endif
 
     <div class="mt-4 grid items-start gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
         {{-- =========================================================== --}}
@@ -59,33 +61,33 @@
                 </div>
             </div>
 
-            {{-- Layer presets (Filament button toggles; state rides showSpawn/showWorldBorder
+            {{-- Layer presets (switch rows; state rides showSpawn/showWorldBorder
                  through MapPage::togglePreset() so the mirror datasets + canvas stay wired) --}}
             <div class="rounded-xl bg-white p-4 shadow-sm ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">
                 <p class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
                     {{ __('minecraft-toolkit::pages.map.layers.spawn') }} / {{ __('minecraft-toolkit::pages.map.layers.world_border') }}
                 </p>
 
-                <div class="mt-2 flex flex-col gap-2">
-                    <x-filament::button
-                        size="sm"
-                        :color="$showSpawn ? 'success' : 'gray'"
-                        :outlined="! $showSpawn"
-                        icon="tabler-map-pin"
-                        wire:click="togglePreset('spawn')"
-                    >
-                        {{ __('minecraft-toolkit::pages.map.layers.spawn') }}
-                    </x-filament::button>
+                <div class="mt-2 flex flex-col gap-1">
+                    @foreach ([
+                        ['spawn', $showSpawn, 'tabler-map-pin', __('minecraft-toolkit::pages.map.layers.spawn')],
+                        ['border', $showWorldBorder, 'tabler-square-rounded', __('minecraft-toolkit::pages.map.layers.world_border')],
+                    ] as [$layerKey, $layerOn, $layerIcon, $layerLabel])
+                        <button type="button"
+                                role="switch"
+                                aria-checked="{{ $layerOn ? 'true' : 'false' }}"
+                                wire:click="togglePreset('{{ $layerKey }}')"
+                                class="flex w-full items-center justify-between gap-3 rounded-lg px-2 py-1.5 text-sm font-medium text-gray-700 transition duration-75 hover:bg-gray-50 dark:text-gray-200 dark:hover:bg-white/5">
+                            <span class="flex items-center gap-x-2">
+                                <x-filament::icon :icon="$layerIcon" class="size-4 shrink-0 text-gray-400 dark:text-gray-500" />
+                                {{ $layerLabel }}
+                            </span>
 
-                    <x-filament::button
-                        size="sm"
-                        :color="$showWorldBorder ? 'success' : 'gray'"
-                        :outlined="! $showWorldBorder"
-                        icon="tabler-square-rounded"
-                        wire:click="togglePreset('border')"
-                    >
-                        {{ __('minecraft-toolkit::pages.map.layers.world_border') }}
-                    </x-filament::button>
+                            <span class="relative inline-flex h-5 w-9 shrink-0 rounded-full transition duration-150 {{ $layerOn ? 'bg-primary-600 dark:bg-primary-500' : 'bg-gray-200 dark:bg-gray-700' }}">
+                                <span class="absolute top-0.5 size-4 rounded-full bg-white shadow-sm transition-all duration-150 {{ $layerOn ? 'left-4.5' : 'left-0.5' }}"></span>
+                            </span>
+                        </button>
+                    @endforeach
                 </div>
             </div>
 
@@ -316,7 +318,9 @@
                                 {{ __('minecraft-toolkit::common.empty.nothing_here') }}
                             </p>
                             <p class="mt-2 text-sm leading-6 text-gray-500 dark:text-gray-400">
-                                {{ __('minecraft-toolkit::pages.map.render_note', ['world' => $this->selectedLabel()]) }}
+                                {{ filled($this->selectedLabel())
+                                    ? __('minecraft-toolkit::pages.map.no_regions', ['world' => $this->selectedLabel()])
+                                    : __('minecraft-toolkit::pages.map.no_world') }}
                             </p>
                         </div>
                     </div>

@@ -8,16 +8,19 @@ use App\Models\Server;
 use McToolkit\Services\FileBridge;
 use McToolkit\Services\Worlds\WorldsService;
 use McToolkit\Support\CacheKeys;
+use McToolkit\Support\WorldLayout;
 
 /**
  * Orchestration layer between the HTTP tile endpoint / Filament map page and
  * {@see RegionParser}.
  *
  * Responsibilities:
- * - resolve where one dimension of one world keeps its `.mca` files: overworld
- *   `<dir>/region`; nether `<dir>/DIM-1/region` (vanilla nested AND Paper's
- *   `<level>_nether/DIM-1/region`); end `<dir>/DIM1/region` — with a plain
- *   `<dir>/region` fallback for forks that flatten split worlds;
+ * - resolve where one dimension of one world keeps its `.mca` files: 26.1+
+ *   `<dir>/dimensions/minecraft/{overworld,the_nether,the_end}/region` first, then the
+ *   classic overworld `<dir>/region`; nether `<dir>/DIM-1/region` (vanilla nested AND
+ *   Paper's `<level>_nether/DIM-1/region`); end `<dir>/DIM1/region` — with a plain
+ *   `<dir>/region` fallback for forks that flatten split worlds
+ *   ({@see WorldLayout::REGION_CANDIDATES});
  * - enumerate the `r.<rx>.<rz>.mca` files there, nearest-to-spawn first, capped at
  *   {@see self::MAX_REGIONS_PER_SCAN} with a truncation flag;
  * - render ONE top-down region tile into packed RGBA + base64 JSON-ready payload,
@@ -71,12 +74,12 @@ final class MapTileService
 
     private const FOG_COLOR_HEX = RegionParser::FOG_COLOR_HEX;
 
-    /** Region folder candidates per dimension, relative to the world folder. */
-    private const REGION_CANDIDATES = [
-        'overworld' => ['region'],
-        'nether' => ['DIM-1/region', 'region'],
-        'end' => ['DIM1/region', 'region'],
-    ];
+    /**
+     * Region folder candidates per dimension, relative to the world folder, 26.1+ first.
+     * A classic world pays one 404 listing per region scan for it; tile renders use the
+     * resolved folder cached by {@see self::regionDirectory()}.
+     */
+    private const REGION_CANDIDATES = WorldLayout::REGION_CANDIDATES;
 
     /** How long a resolved region folder is remembered. */
     private const REGION_DIR_TTL_SECONDS = 600;
@@ -174,8 +177,9 @@ final class MapTileService
     }
 
     /**
-     * Server-relative region folder of one world dimension (e.g. `world_nether/DIM-1/region`),
-     * or null when none of the candidates exists.
+     * Server-relative region folder of one world dimension (e.g. `world_nether/DIM-1/region`
+     * or `world/dimensions/minecraft/the_nether/region`), or null when none of the
+     * candidates exists.
      */
     public function regionDirectory(Server $server, string $worldDir, string $dimension): ?string
     {

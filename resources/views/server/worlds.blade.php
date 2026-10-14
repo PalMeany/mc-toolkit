@@ -173,19 +173,19 @@
                                 {{ __('minecraft-toolkit::common.buttons.download') }}
                             </x-filament::button>
                         @else
-                            <x-filament::button color="primary" size="sm" icon="tabler-download" wire:click="downloadWorld(@js($world['name']))">
+                            <x-filament::button color="primary" size="sm" icon="tabler-download" wire:click="downloadWorld({{ \Illuminate\Support\Js::from($world['name']) }})">
                                 {{ __('minecraft-toolkit::common.buttons.download') }}
                             </x-filament::button>
                         @endunless
 
                         @if ($canAdminister)
-                            <x-filament::button color="danger" size="sm" icon="tabler-trash" wire:click="confirmReset(@js($world['name']))">
+                            <x-filament::button color="danger" size="sm" icon="tabler-trash" wire:click="confirmReset({{ \Illuminate\Support\Js::from($world['name']) }})">
                                 {{ __('minecraft-toolkit::common.buttons.reset') }}
                             </x-filament::button>
                         @endif
 
                         @if ($canManage && ! $isDefaultRow && ($world['linked'] ?? false) === false)
-                            <x-filament::button color="gray" size="sm" icon="tabler-player-play-filled" wire:click="playOn(@js($world['name']))">
+                            <x-filament::button color="gray" size="sm" icon="tabler-player-play-filled" wire:click="playOn({{ \Illuminate\Support\Js::from($world['name']) }})">
                                 Play on {{-- lang gap #worlds.actions.play_on --}}
                             </x-filament::button>
                         @endif
@@ -218,7 +218,7 @@
 
     {{-- Reset confirmation sheet --}}
     @if ($pendingReset)
-        <div class="fixed inset-0 z-40 bg-gray-950/50 dark:bg-gray-950/75" wire:click="cancelReset"></div>
+        <div class="fixed inset-0 z-40 bg-gray-950/50 backdrop-blur-sm dark:bg-gray-950/75" wire:click="cancelReset"></div>
 
         <div class="fixed inset-0 z-40 overflow-y-auto p-6">
             <div class="relative mx-auto mt-24 flex w-full max-w-lg flex-col gap-4 rounded-xl bg-white p-6 shadow-xl outline-none ring-1 ring-gray-950/5 dark:bg-gray-900 dark:ring-white/10">

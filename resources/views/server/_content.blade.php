@@ -76,6 +76,11 @@
 {{-- --------------------------------------------------------------- --}}
 <x-dynamic-component :component="'minecraft-toolkit::detection-banner'" :software="$detected" />
 
+{{-- Queued modpack install (Concerns\TracksServerTask) — same spot as on the Versions page --}}
+@if ($kind === 'modpacks')
+    <x-minecraft-toolkit::task-status :task="$task" :can-control="$this->canControlTask()" />
+@endif
+
 {{-- --------------------------------------------------------------- --}}
 {{-- 2. Loader-mismatch / unsupported callout                        --}}
 {{-- --------------------------------------------------------------- --}}
@@ -107,7 +112,7 @@
 {{-- 3. Modpack prerequisite: stopped-container reminder             --}}
 {{-- --------------------------------------------------------------- --}}
 @if ($kind === 'modpacks' && $this->containerRequiresStop())
-    <x-filament::callout color="info" icon="tabler-player-stop">
+    <x-filament::callout color="info" icon="tabler-info-circle">
         <x-slot name="description">
             <span class="text-sm leading-6">
                 {{ trans('minecraft-toolkit::pages.versions.install.stopped_note') }}
@@ -265,35 +270,34 @@
     @endphp
 
     {{-- Toolbar ------------------------------------------------------ --}}
-    <div class="flex flex-wrap items-end gap-x-3 gap-y-3">
-        <label class="fi-input-wrp flex min-w-52 flex-1 items-center gap-x-2 px-3 py-2 sm:max-w-md"
-               wire:target="runSearch">
-            <x-filament::icon :icon="'tabler-search'" class="size-4 shrink-0 text-gray-400 dark:text-gray-500" />
+    <div class="flex flex-wrap items-center gap-3">
+        <div class="min-w-52 flex-1 sm:max-w-md">
+            <x-filament::input.wrapper prefix-icon="tabler-search">
+                <x-filament::input
+                    type="search"
+                    name="query"
+                    autocomplete="off"
+                    wire:model.live.debounce.400ms="query"
+                    wire:keydown.enter="runSearch"
+                    :placeholder="trans('minecraft-toolkit::common.buttons.search')"
+                    :aria-label="trans('minecraft-toolkit::common.buttons.search')"
+                />
+            </x-filament::input.wrapper>
+        </div>
 
-            <input type="search"
-                   name="query"
-                   class="fi-input w-full border-0 bg-transparent px-0 py-0 text-sm leading-6 placeholder:text-gray-400 focus:outline-none focus:ring-0 dark:bg-transparent"
-                   placeholder="{{ trans('minecraft-toolkit::common.buttons.search') }}"
-                   wire:model.live.debounce.400ms="query"
-                   wire:keydown.enter="runSearch"
-                   autocomplete="off" />
-        </label>
+        <div class="w-44">
+            <x-filament::input.wrapper>
+                <x-filament::input.select wire:model.live="sortKey" aria-label="Sort results">
+                    @foreach ($this->sortOptions() as $sortOption)
+                        <option value="{{ $sortOption['value'] }}">{{ $sortOption['label'] }}</option>
+                    @endforeach
+                </x-filament::input.select>
+            </x-filament::input.wrapper>
+        </div>
 
-        <select wire:model.live.debounce.300ms="sortKey"
-                class="block rounded-lg border-0 bg-white py-2 pe-8 ps-3 text-sm leading-6 text-gray-950 shadow-sm ring-1 ring-gray-950/10 focus:ring-2 focus:ring-primary-600 dark:bg-white/5 dark:text-white dark:ring-white/20"
-                aria-label="Sort results">
-            @foreach ($this->sortOptions() as $sortOption)
-                <option value="{{ $sortOption['value'] }}" @selected($sortKey === $sortOption['value'])>{{ $sortOption['label'] }}</option>
-            @endforeach
-        </select>
-
-        <button type="button"
-                wire:click="runSearch"
-                class="{{ $segIdle }} lg:hidden"
-                wire:loading.attr="disabled"
-                wire:target="runSearch">
-            {{ trans('minecraft-toolkit::common.buttons.search') }}
-        </button>
+        <span class="text-gray-400 dark:text-gray-500" wire:loading wire:target="query, runSearch, sortKey, setSource, toggleCompat">
+            <x-filament::loading-indicator class="size-5" />
+        </span>
     </div>
 
     {{-- Source chips + compat filter ----------------------------------- --}}
@@ -322,26 +326,22 @@
             @endforeach
 
             {{-- Demo-parity compat checkbox: dynamic parenthesized loader tokens · MC version --}}
-            <label class="ms-auto flex cursor-pointer items-center gap-x-2 text-sm font-medium text-gray-700 dark:text-gray-300">
-                <input type="checkbox"
+            <label class="ms-auto flex cursor-pointer items-center gap-x-2 text-sm font-medium text-gray-700 dark:text-gray-300"
+                   title="{{ implode(', ', $compatLoaders) }}{{ is_null($mcVersion) ? '' : ' · '.$mcVersion }}">
+                <x-filament::input.checkbox
                        value="1"
-                       class="size-4 rounded border-0 text-primary-600 shadow-sm ring-1 ring-gray-950/10 checked:bg-primary-600 focus:outline-none focus:ring-2 focus:ring-primary-600 focus:ring-offset-2 focus:ring-offset-gray-100 dark:focus:ring-offset-gray-900"
-                       @checked($compatOnly)
+                       :checked="$compatOnly"
                        wire:click="toggleCompat" />
 
-                <span>{{ trans('minecraft-toolkit::pages.plugins.compat_filter_label', [
-                    'loaders' => count($compatLoaders) > 0 ? implode(', ', array_slice($compatLoaders, 0, 3)).(count($compatLoaders) > 3 ? ', …' : '') : '—',
-                    'version' => $mcVersion ?? '—',
-                ]) }}</span>
+                <span>{{ $compatLoaders === []
+                    ? trans('minecraft-toolkit::pages.plugins.compat_filter_version_label', ['version' => $mcVersion ?? '—'])
+                    : trans('minecraft-toolkit::pages.plugins.compat_filter_label', [
+                        'loaders' => implode(', ', array_slice($compatLoaders, 0, 3)).(count($compatLoaders) > 3 ? ', …' : ''),
+                        'version' => $mcVersion ?? '—',
+                    ]) }}</span>
             </label>
         </div>
 
-        {{-- Full token list visible under the condensed checkbox label -------------------- --}}
-        @if ($compatLoaders !== [] || ! is_null($mcVersion))
-            <p class="w-full text-xs text-gray-500 dark:text-gray-400">
-                {{ implode(', ', $compatLoaders) }}@if (! is_null($mcVersion)) &middot; {{ $mcVersion }}@endif
-            </p>
-        @endif
     </div>
 
     {{-- Results grid ---------------------------------------------------- --}}

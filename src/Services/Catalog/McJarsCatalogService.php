@@ -15,6 +15,8 @@ use McToolkit\Support\HttpJsonCache;
  *   types()                                  → grouped type metadata
  *   versions(type, page, perPage, search, snapshotsIn) → paginated version rows
  *   latestBuild(type, version)               → newest build incl. installation steps
+ *   buildByName(type, version, name)         → one exact build (additive: loader versions)
+ *   javaFor(type, version)                   → Java major of one version row (additive)
  *   buildUrlOf(step)                         → convenience url extraction
  *
  * Endpoint facts verified live on 2026-10-14 (see .research/mcjars-api.md):
@@ -223,6 +225,67 @@ final class McJarsCatalogService
         $build = $payload['build'];
 
         return ['build' => $this->normalizeBuild($build)];
+    }
+
+    /**
+     * The build of a type/version pair whose `name` is exactly `$name` — for loaders
+     * that is the loader version a modpack asks for (Fabric "0.16.10", Forge "47.2.0",
+     * NeoForge "21.1.77", Quilt "0.26.4-beta.1"). Null when MCJars lists no such build.
+     *
+     * Endpoint verified live on 2026-10-14:
+     *   GET /api/v3/builds/types/{TYPE}/versions/{VERSION}?search={name}&per_page=…
+     *   -> {"builds":{"total","per_page","page","data":[<same shape as /latest>]}}
+     * `search` matches substrings ("0.16.1" also finds "0.16.10"), hence the exact
+     * comparison over the returned page.
+     *
+     * @return array{build: array{name:string, installation:list<list<array{type:string, url?:string, file?:string, location?:string, size?:int}>>, changes:list<string>, project_version_id:?string, experimental:bool}}|null
+     */
+    public function buildByName(string $type, string $version, string $name): ?array
+    {
+        $type = self::normalizeType($type);
+        $version = trim($version);
+        $name = trim($name);
+
+        if ($type === null || $version === '' || $name === '') {
+            return null;
+        }
+
+        $payload = HttpJsonCache::get(
+            $this->base().'/api/v3/builds/types/'.rawurlencode($type).'/versions/'.rawurlencode($version),
+            $this->listCacheSeconds,
+            ['search' => $name, 'per_page' => 50],
+        );
+
+        $wrapper = is_array($payload) && is_array($payload['builds'] ?? null) ? $payload['builds'] : [];
+
+        foreach (is_array($wrapper['data'] ?? null) ? $wrapper['data'] : [] as $build) {
+            if (is_array($build) && is_string($build['name'] ?? null) && trim($build['name']) === $name) {
+                return ['build' => $this->normalizeBuild($build)];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Java major MCJars lists for one version row of a type (the `java` field of the
+     * versions listing), null when the row is missing or carries none.
+     */
+    public function javaFor(string $type, string $version): ?int
+    {
+        $version = trim($version);
+
+        if ($version === '') {
+            return null;
+        }
+
+        foreach ($this->versions($type, 1, 50, $version, true)['data'] as $row) {
+            if ($row['id'] === $version) {
+                return $row['java'] !== null && $row['java'] > 0 ? $row['java'] : null;
+            }
+        }
+
+        return null;
     }
 
     /**

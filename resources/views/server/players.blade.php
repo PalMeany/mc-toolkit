@@ -180,13 +180,16 @@
                     @endforeach
                 </div>
 
-                <label class="flex min-w-[14rem] flex-1 items-center gap-x-2 rounded-lg bg-white px-3 py-2 shadow-sm ring-1 ring-gray-950/10 focus-within:ring-2 focus-within:ring-primary-500 dark:bg-white/5 dark:ring-white/20 dark:focus-within:ring-primary-400">
-                    <x-filament::icon :icon="'tabler-search'" class="size-4 shrink-0 text-gray-400" />
-                    <input type="search"
-                           wire:model.live.debounce.300ms="search"
-                           placeholder="{{ trans('minecraft-toolkit::common.buttons.search') }}"
-                           class="w-full border-none bg-transparent text-sm leading-6 outline-none placeholder:text-gray-400" />
-                </label>
+                <div class="min-w-[14rem] flex-1">
+                    <x-filament::input.wrapper prefix-icon="tabler-search">
+                        <x-filament::input
+                            type="search"
+                            wire:model.live.debounce.300ms="search"
+                            :placeholder="trans('minecraft-toolkit::common.buttons.search')"
+                            :aria-label="trans('minecraft-toolkit::common.buttons.search')"
+                        />
+                    </x-filament::input.wrapper>
+                </div>
             </div>
 
             {{-- quick add-to-whitelist: its own schema (PlayersPage::whitelistForm), rendered

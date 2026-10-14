@@ -64,12 +64,6 @@
         default => '',
     };
 
-    $overlayShell = 'absolute inset-0 z-10 flex items-center justify-center overflow-hidden rounded-md bg-white/70 backdrop-blur-[1px] dark:bg-gray-900/70';
-    $overlayChip = 'inline-flex max-w-full items-center truncate rounded-md px-2 py-1 '
-        . 'text-xs font-medium shadow-sm ring-1 ring-inset '
-        . 'bg-white text-gray-700 ring-gray-950/10 '
-        . 'dark:bg-gray-800 dark:text-gray-200 dark:ring-white/20';
-
     $fmt = static fn (?float $v): ?string => $v === null ? null : number_format($v, 1);
 @endphp
 
@@ -96,12 +90,12 @@
     @endunless
 
     {{-- ---- Live zone ------------------------------------------------------------ --}}
-    <div wire:poll.visible.20s="tick">
+    <div wire:poll.visible.20s="tick" class="flex flex-col gap-6">
 
         {{-- ---- Wing-truth meta strip (state + uptime remain live regardless) ---- --}}
         <?php $uptimeText = $this->uptimeText(); ?>
         @if (! in_array($stateKey, ['', 'unknown'], true))
-            <div class="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-gray-400">
+            <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-gray-400">
                 <span class="{{ $chip }} {{ $stateAccent }}">{{ ucfirst($stateKey) }}</span>
 
                 @if ($uptimeMs !== null && $uptimeMs > 0 && filled($uptimeText))
@@ -124,7 +118,7 @@
                     @endif
                 </span>
 
-                <span class="{{ $statSub }}">
+                <span class="{{ $statSub }}" @unless ($bridgePresent) hidden @endunless>
                     {{-- demo copy: "1 min X · 5 min Y · 15 min Z" (lang gap, documented) --}}
                     1 min {!! (($fmt)($avgOne) ?? '&mdash;') !!}
                     <span aria-hidden="true">&middot;</span>
@@ -133,18 +127,20 @@
                     15 min {!! (($fmt)($avgFifteen) ?? '&mdash;') !!}
                 </span>
 
-                <div class="relative mt-3">
-                    <x-minecraft-toolkit::sparkline
-                        :series="$this->series('tps')"
-                        height-classes="h-9"
-                        aria-label="TPS history"
-                    />
-                    @unless ($bridgePresent)
-                        <div class="{{ $overlayShell }}">
-                            <span class="{{ $overlayChip }}">Live TPS needs the companion bridge</span>
-                        </div>
-                    @endunless
-                </div>
+                @if ($bridgePresent)
+                    <div class="mt-3">
+                        <x-minecraft-toolkit::sparkline
+                            :series="$this->series('tps')"
+                            height-classes="h-9"
+                            aria-label="TPS history"
+                        />
+                    </div>
+                @else
+                    <span class="mt-3 inline-flex w-fit items-center gap-x-1 rounded-md bg-warning-50 px-2 py-0.5 text-xs font-medium text-warning-700 ring-1 ring-inset ring-warning-600/20 dark:bg-warning-400/10 dark:text-warning-300 dark:ring-warning-400/30">
+                        <x-filament::icon :icon="'tabler-plug-connected-x'" class="size-3.5 shrink-0" />
+                        {{ __('minecraft-toolkit::pages.performance.bridge.needed') }}
+                    </span>
+                @endif
             </div>
 
             {{-- MSPT --}}
@@ -160,18 +156,20 @@
                 {{-- demo copy: "Milliseconds per tick, 50 at most" (lang gap, documented) --}}
                 <span class="{{ $statSub }}">Milliseconds per tick, 50 at most</span>
 
-                <div class="relative mt-3">
-                    <x-minecraft-toolkit::sparkline
-                        :series="$this->series('mspt')"
-                        height-classes="h-9"
-                        aria-label="MSPT history"
-                    />
-                    @unless ($bridgePresent)
-                        <div class="{{ $overlayShell }}">
-                            <span class="{{ $overlayChip }}">Live MSPT needs the companion bridge</span>
-                        </div>
-                    @endunless
-                </div>
+                @if ($bridgePresent)
+                    <div class="mt-3">
+                        <x-minecraft-toolkit::sparkline
+                            :series="$this->series('mspt')"
+                            height-classes="h-9"
+                            aria-label="MSPT history"
+                        />
+                    </div>
+                @else
+                    <span class="mt-3 inline-flex w-fit items-center gap-x-1 rounded-md bg-warning-50 px-2 py-0.5 text-xs font-medium text-warning-700 ring-1 ring-inset ring-warning-600/20 dark:bg-warning-400/10 dark:text-warning-300 dark:ring-warning-400/30">
+                        <x-filament::icon :icon="'tabler-plug-connected-x'" class="size-3.5 shrink-0" />
+                        {{ __('minecraft-toolkit::pages.performance.bridge.needed') }}
+                    </span>
+                @endif
             </div>
 
             {{-- CPU (wing-level truth stays live without any bridge) --}}
@@ -228,29 +226,19 @@
         {{-- ---- Charts (responsive 2-col grid) ----------------------------------- --}}
         <div class="grid gap-4 lg:grid-cols-2">
 
-            <div class="{{ $card }}">
-                <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">Ticks per second</h3>
-                <div class="relative">
+            @if ($bridgePresent)
+                <div class="{{ $card }}">
+                    <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">Ticks per second</h3>
                     <x-minecraft-toolkit::sparkline :series="$this->series('tps')" height-classes="h-24" aria-label="Ticks per second"/>
-                    @unless ($bridgePresent)
-                        <div class="{{ $overlayShell }}">
-                            <span class="{{ $overlayChip }}">Live TPS needs the companion bridge</span>
-                        </div>
-                    @endunless
                 </div>
-            </div>
+            @endif
 
-            <div class="{{ $card }}">
-                <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">Milliseconds per tick</h3>
-                <div class="relative">
+            @if ($bridgePresent)
+                <div class="{{ $card }}">
+                    <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">Milliseconds per tick</h3>
                     <x-minecraft-toolkit::sparkline :series="$this->series('mspt')" height-classes="h-24" aria-label="Milliseconds per tick"/>
-                    @unless ($bridgePresent)
-                        <div class="{{ $overlayShell }}">
-                            <span class="{{ $overlayChip }}">Live MSPT needs the companion bridge</span>
-                        </div>
-                    @endunless
                 </div>
-            </div>
+            @endif
 
             <div class="{{ $card }}">
                 <h3 class="mb-3 text-sm font-semibold text-gray-950 dark:text-white">CPU %</h3>

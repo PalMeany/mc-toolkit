@@ -13,7 +13,9 @@ use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use McToolkit\Jobs\DiscardWorldArchiveJob;
 use McToolkit\Services\Worlds\WorldsService;
+use McToolkit\Support\QueueMode;
 
 /**
  * Hands a world (plus its linked `_nether` / `_the_end` folders) to the browser.
@@ -22,12 +24,19 @@ use McToolkit\Services\Worlds\WorldsService;
  *
  * Same flow as the panel's own file downloads (FileController::download /
  * DownloadFiles page): wings compresses the world set into a temporary zip in the
- * server root, the panel mints a 15-minute `file-download` node JWT for exactly that
+ * server root, the panel mints a short-lived `file-download` node JWT for exactly that
  * file and the browser is redirected to `{node}/download/file?token=…`. The bytes
  * never pass through PHP, so world size and the daemon HTTP timeout do not matter.
- * Temporary archives are removed by WorldsService::sweepStaleArchives() once older
- * than half an hour (on the next download or Worlds page load), or right away when
- * the hand-over fails.
+ *
+ * Archive lifetime: wings' download token is single-use (router_download.go,
+ * token.IsUniqueRequest()) and the file is opened once and streamed without Range
+ * support, so once the token expired the archive is useless — and deleting it while a
+ * transfer still runs is safe on Linux (the open file handle keeps the data). The token
+ * therefore lives ~3 minutes and a DiscardWorldArchiveJob deletes the archive a minute
+ * after that. The `sync` driver ignores delays (it would delete the archive before the
+ * browser fetched it), so there — and for lost jobs — WorldsService::sweepStaleArchives()
+ * removes archives older than ten minutes on the next download or Worlds page load. A
+ * failed hand-over deletes the archive right away.
  *
  * The `token` query (minted by the Worlds page) binds world + server + user and expires
  * after ~5 minutes, so a cross-site GET cannot make the node build archives.
@@ -36,6 +45,12 @@ final class WorldDownloadController
 {
     /** Validity window of page-minted links, in seconds. */
     private const LINK_TTL_SECONDS = 300;
+
+    /** Lifetime of the node's file-download token: the browser follows the redirect at once. */
+    public const NODE_TOKEN_TTL_SECONDS = 180;
+
+    /** Grace after the token expired before the archive is deleted (a redirect in flight). */
+    private const DISCARD_GRACE_SECONDS = 60;
 
     public function __construct(
         private readonly WorldsService $worlds,
@@ -76,7 +91,7 @@ final class WorldDownloadController
             $archive = $this->worlds->prepareDownload($server, $world);
 
             $token = $this->jwt
-                ->setExpiresAt(CarbonImmutable::now()->addMinutes(15))
+                ->setExpiresAt(CarbonImmutable::now()->addSeconds(self::NODE_TOKEN_TTL_SECONDS))
                 ->setScopes(NodeJwtScope::FileDownload)
                 ->setUser($user)
                 ->setClaims([
@@ -106,12 +121,32 @@ final class WorldDownloadController
             return response()->json(['error' => trans('minecraft-toolkit::errors.statuses.download_failed')], 500);
         }
 
+        $this->scheduleDiscard($server, $archive);
+
         Activity::event('mc-toolkit:worlds.archive')
             ->subject($server)
             ->property('world', $world)
             ->log();
 
         return redirect()->away($target);
+    }
+
+    /**
+     * Delete the archive once its token can no longer be used. Skipped on the `sync`
+     * driver (a delayed job would run immediately); the sweep covers that case.
+     */
+    private function scheduleDiscard(Server $server, string $archive): void
+    {
+        if (QueueMode::isSync()) {
+            return;
+        }
+
+        try {
+            dispatch(new DiscardWorldArchiveJob((int) $server->getKey(), $archive))
+                ->delay(now()->addSeconds(self::NODE_TOKEN_TTL_SECONDS + self::DISCARD_GRACE_SECONDS));
+        } catch (\Throwable $exception) {
+            report($exception); // the sweep removes it later
+        }
     }
 
     /** Validates the `{expires}.{sign}` pair minted by {@see self::makeQuery()}. */

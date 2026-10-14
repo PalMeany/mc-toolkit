@@ -15,7 +15,7 @@
       - Line: <polyline> stroke primary-600 (dark: primary-400), stroke-width 2, fill none,
         vector-effect keeps the literal 2px even when stretched.
       - Area: <polygon> closed onto the bottom edge, color fill at opacity 10%.
-      - Last point: <circle r="1.2"> marker.
+      - No point markers: the viewBox stretches non-uniformly, so circles turn into smears.
 --}}
 @props([
     'series' => [],
@@ -32,8 +32,9 @@
 
     $count = count($values);
 
-    // Deterministic scale: floor 0, ceiling from the data itself.
-    $max = $count > 0 ? max($values) : 0.0;
+    // Deterministic scale: floor 0, ceiling 25% above the data's peak, so a steady series
+    // reads as a line with headroom instead of a solid block filling the card.
+    $max = $count > 0 ? max($values) * 1.25 : 0.0;
     $flat = $count === 0 || $max <= 0.000001;
 
     $padTop = 2.0;
@@ -60,6 +61,14 @@
 
         $pointsX[] = round($x, 3);
         $pointsY[] = round($y, 3);
+    }
+
+    // One sample is a level, not a peak: draw it across the whole width (a lone point
+    // closed onto the baseline rendered as a triangle).
+    if ($count === 1) {
+        $pointsX = [0.0, 100.0];
+        $pointsY = [$pointsY[0], $pointsY[0]];
+        $count = 2;
     }
 
     $segments = '';
@@ -97,13 +106,5 @@
             vector-effect="non-scaling-stroke"
             class="stroke-primary-600 dark:stroke-primary-400"
         />
-        @if (! is_null($lastX) && ! is_null($lastY))
-            <circle
-                cx="{{ $lastX }}"
-                cy="{{ $lastY }}"
-                r="1.2"
-                class="fill-primary-600 dark:fill-primary-400"
-            />
-        @endif
     @endif
 </svg>

@@ -23,7 +23,7 @@ the panel's native plugin system and Filament design system.
 Paste this URL into *Admin → Plugins → **Import from URL***:
 
 ```
-https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.4.zip
+https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.5.zip
 ```
 
 The panel verifies the SHA-256 from [update.json](update.json) and drops the plugin into
@@ -160,8 +160,11 @@ Cache lifetimes, registry toggles and limits are tuned in `config/minecraft-tool
   renders of actual resource-pack textures; treat it as an exploration overview.
 - Region rendering streams chunk bytes from wings and stays inside the configured
   `limits.region_fetch_max_bytes` guard (8 MiB per request by default).
-- World downloads create a temporary zip archive through wings at the root, stream it, then delete it.
-  Very large worlds are limited by node memory/timeouts rather than hard caps here.
+- World downloads create a temporary zip archive through wings at the server root; the browser
+  downloads it straight from the node with a single-use token and the archive is deleted a few
+  minutes later (right away when the panel's queue driver is `sync`: on the next page visit).
+- Software and modpack installs run as queued jobs and need the panel's queue worker; the
+  Docker image and startup command are only switched within what the egg offers.
 - Panel-side import relies on wings' remote `pull()` — URLs must be publicly reachable from the node.
 - Deleting the plugin leaves previously-assigned custom permission strings in role/subuser rows;
   remove them manually if you ever uninstall permanently.
@@ -203,7 +206,7 @@ Full recovery recipe for this exact incident:
 php artisan queue:restart          # fresh autoloader/opcache for install workers
 php artisan optimize:clear
 docker compose restart panel       # official image ships opcache with validate_timestamps=0
-php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.4
+php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.5
 ```
 
 If it still reads *Errored*, press the row's **Delete** action, then Import from URL again
@@ -231,21 +234,54 @@ the option keys as numeric indexes `0..8` while the form was filled with page sl
 failed the built-in `in:` validation. v1.0.3 keys options by slug again and also tolerates
 index-shaped values submitted by the earlier UI when persisting.
 
-### Pages look unstyled (no spacing, no grid)
+### Pages look unstyled — white badges, huge icons, no spacing (fixed in v1.0.5)
 
 The panel compiles its own Tailwind stylesheet and skips git-ignored folders, which includes
-every plugin. Since v1.0.4 the toolkit ships its own Tailwind entry
-(`resources/css/main.css`) that the panel builds while installing or updating the plugin
-(`yarn install && yarn build` on the panel host). If that build could not run — for example no
-Node/Yarn on the host — run it once by hand from the panel root:
+every plugin. v1.0.4 shipped a Tailwind entry that the panel was supposed to build with
+`yarn build` while installing the plugin — but production panels usually have no Node/Yarn, the
+build failed silently (`Could not install yarn dependencies: yarn: not found` in the panel log)
+and the toolkit pages lost every grid, gap, badge colour and image size.
 
-```bash
-yarn install && yarn build
-```
-
-Until then the pages work, they only fall back to the styles the panel happens to ship.
+Since v1.0.5 the stylesheet ships prebuilt (`resources/dist/toolkit.css`) and is inlined on the
+toolkit pages only, so nothing has to be built on the panel host. After changing a Blade view,
+rebuild it with `./scripts/build-css.sh` (needs Node; uses Tailwind 4.3.0 like the panel).
 
 ## Changelog
+
+### v1.0.5
+
+- **Styles on real panels.** The toolkit pages lost all their styling (white badges, oversized
+  icons, no spacing) on every panel without Node/Yarn: the v1.0.4 stylesheet relied on the panel
+  running `yarn build` on install. It now ships prebuilt and is inlined on the toolkit pages only.
+- **Map page errors.** Every action on the Map page failed with "Error while loading page": a
+  private `hydrateWorlds()` collided with Livewire's `hydrate{Property}` hook for `$worlds`.
+- **Broken buttons.** Worlds Download / Reset / Play passed a raw `@js(...)` to the browser
+  (Blade directives are not compiled inside component attributes) and the MOTD format buttons
+  had an unescaped quote in their handler — both threw in the browser and did nothing.
+- **Minecraft 26.x worlds.** 26.1+ keeps every dimension inside the level folder
+  (`world/dimensions/minecraft/<dim>/region`, `world/players/…`) and writes block palettes as
+  plain ids. Worlds, Map, Performance and world import now understand that layout (and the
+  seed/hardcore fields that moved), next to the classic `world_nether` / `DIM-1` one.
+- **UI polish.** Filament-native search/sort inputs, MOTD format buttons on the MOTD field and
+  the server-list preview at the top, layer switches on the map, cleaner Performance tiles
+  without the companion bridge, no duplicated detection chip or loader list.
+- **Long installs run in the panel's queue.** Software (Versions) and modpack installs are
+  queued jobs now, so a web-server timeout can no longer cut them off halfway. The page shows a
+  live task card (step, progress, notes, cancel while queued) and a panel notification arrives
+  when the job is done. They need the panel's queue worker (`pelican-queue` /
+  `php artisan queue:work`) — the card says so when a job waits for more than two minutes.
+- **Modpacks install their loader.** The Fabric / Quilt / Forge / NeoForge build named by the
+  pack (`modrinth.index.json`) is installed together with the pack, the exact loader version when
+  MCJars has it. The server is re-checked right before files are moved into place.
+- **Changing the software family fixes the Java image and startup.** After a software swap the
+  Docker image is switched to the egg image with the Java version that release needs (MCJars'
+  `java`, else 8 / 16 / 17 / 21 / 25 by Minecraft version), archive builds (Forge, NeoForge,
+  Quilt) leave their launcher under the egg's `SERVER_JARFILE`, a stale `unix_args.txt` of an old
+  Forge install is removed, and a startup command that cannot launch the jar is swapped for one
+  of the egg's that can. Each change needs the same permission as on the Startup page; anything
+  skipped is listed in the task notes.
+- **World download archives** are deleted ~4 minutes after the link is handed out (the node's
+  download token is single-use and now lives 3 minutes) instead of lingering for half an hour.
 
 ### v1.0.4
 

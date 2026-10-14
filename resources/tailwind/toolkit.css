@@ -1,13 +1,16 @@
 /*
- * Minecraft Toolkit — page styles.
+ * Minecraft Toolkit — page styles (Tailwind source).
  *
  * The panel compiles its own stylesheet with Tailwind v4, whose automatic class detection
  * skips git-ignored paths — and the panel's plugins/.gitignore ignores every plugin. So the
- * utility classes these views use (grids, gaps, colours…) only exist when the panel's own
- * sources happen to use them too. This file is a separate Vite entry (the panel's
- * vite.config.js picks up every plugin's resources/css folder and rebuilds on plugin install)
- * that generates exactly the utilities found in this plugin's views; McToolkitPlugin
- * injects it after the panel styles.
+ * utility classes these views use (grids, gaps, colours, badges…) only exist when the panel's
+ * own sources happen to use them too.
+ *
+ * This file is compiled AHEAD of time by scripts/build-css.sh into resources/dist/toolkit.css,
+ * which McToolkitPlugin inlines on the toolkit pages. It deliberately lives outside
+ * resources/css: the panel's vite.config.js builds every plugins/<id>/resources/css entry when
+ * a plugin is installed, but production panels usually have no Node/yarn — that build fails
+ * silently and the pages would lose their styles (the v1.0.4 "white badges" bug).
  *
  * Only theme + utilities are imported: preflight and Filament's component layer already
  * come from the panel stylesheet and must not be emitted twice.

@@ -338,7 +338,9 @@ final class PerformancePage extends Page
         $rows = [];
 
         foreach ($order as $name) {
-            $info = $meta[$name] ?? [];
+            // Bridge names without a folder row (Paper 26.x reports `world_nether` /
+            // `world_the_end` although both live inside `world/`) badge by suffix.
+            $info = $meta[$name] ?? $this->suffixMeta($name);
 
             $rows[] = [
                 'name' => $name,
@@ -434,17 +436,26 @@ final class PerformancePage extends Page
         $meta = [];
 
         foreach ((array) $names as $name) {
-            $name = strval($name);
-            $lower = mb_strtolower($name);
-
-            $meta[$name] = [
-                'default' => false,
-                'linked' => str_ends_with($lower, '_nether') || str_ends_with($lower, '_the_end'),
-                'dimension' => str_ends_with($lower, '_nether') ? 'nether' : (str_ends_with($lower, '_the_end') || str_ends_with($lower, '_end') ? 'end' : ''),
-            ];
+            $meta[strval($name)] = $this->suffixMeta(strval($name));
         }
 
         return $meta;
+    }
+
+    /**
+     * Badge metadata derived from Bukkit-style name suffixes alone (`_nether`, `_the_end`).
+     *
+     * @return array{default: bool, linked: bool, dimension: string}
+     */
+    private function suffixMeta(string $name): array
+    {
+        $lower = mb_strtolower($name);
+
+        return [
+            'default' => false,
+            'linked' => str_ends_with($lower, '_nether') || str_ends_with($lower, '_the_end'),
+            'dimension' => str_ends_with($lower, '_nether') ? 'nether' : (str_ends_with($lower, '_the_end') || str_ends_with($lower, '_end') ? 'end' : ''),
+        ];
     }
 
     private function badgeFor(string $name, array $info): ?string

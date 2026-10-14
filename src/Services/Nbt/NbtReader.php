@@ -17,11 +17,16 @@ namespace McToolkit\Services\Nbt;
  *   DataVersion       -> 4082            (Int)
  *   LevelName         -> "New World"     (String)
  *   GameType          -> 0               (Int; 0 survival / 1 creative / 2 adventure / 3 spectator)
- *   hardcore          -> 1b              (Byte/Boolean)
+ *   hardcore          -> 1b              (Byte/Boolean, up to 1.21.x)
+ *   difficulty_settings.hardcore         (Byte/Boolean, 26.1+)
  *   LastPlayed        -> ms long since epoch
  *   WorldGenSettings.seed                (Long; legacy servers keep it as Data.RandomSeed Long)
  *   SpawnX / SpawnY / SpawnZ             (Int trio at Data level, up to 1.21.8)
  *   spawn.pos                            (IntArray [x, y, z], 1.21.9+)
+ *
+ * Minecraft 26.1+ no longer stores the seed in level.dat at all: `WorldGenSettings` became
+ * the saved-data file `world_gen_settings.dat` (`{DataVersion, data: {seed, …}}`), read by
+ * {@see self::parseWorldGenSeed()}; see {@see \McToolkit\Support\WorldLayout} for where.
  *
  * Walk model: the reader is SELECTIVE. {@see self::KEEP} describes the only branches it
  * materializes; every other tag (player inventories, dragon fight, game rules, custom
@@ -63,6 +68,7 @@ final class NbtReader
             'LevelName' => true,
             'GameType' => true,
             'hardcore' => true,
+            'difficulty_settings' => ['hardcore' => true],
             'LastPlayed' => true,
             'RandomSeed' => true,
             'WorldGenSettings' => ['seed' => true],
@@ -71,6 +77,11 @@ final class NbtReader
             'SpawnZ' => true,
             'spawn' => ['pos' => true, 'dimension' => true],
         ],
+    ];
+
+    /** Branch kept from a 26.1+ `world_gen_settings.dat` (the rest is dimension generators). */
+    private const WORLD_GEN_KEEP = [
+        'data' => ['seed' => true],
     ];
 
     /** Vanilla GameType ints; 3+ reserved values map upstream themselves. */
@@ -89,6 +100,39 @@ final class NbtReader
      * @throws \DomainException on structurally broken data (friendly one-liner message).
      */
     public static function parseLevelDat(string $gzBytes): ?array
+    {
+        $tree = self::materialize($gzBytes, self::KEEP);
+
+        if ($tree === null) {
+            return null;
+        }
+
+        $data = is_array($tree['Data'] ?? null) ? $tree['Data'] : [];
+
+        return self::interestKeys($data);
+    }
+
+    /**
+     * Seed from a 26.1+ `world_gen_settings.dat` saved-data file (`data.seed`), as decimal
+     * text like {@see self::parseLevelDat()} reports it; null when absent.
+     *
+     * @throws \DomainException on structurally broken data.
+     */
+    public static function parseWorldGenSeed(string $gzBytes): ?string
+    {
+        $tree = self::materialize($gzBytes, self::WORLD_GEN_KEEP);
+        $seed = is_array($tree['data'] ?? null) ? self::optionalInt($tree['data']['seed'] ?? null) : null;
+
+        return $seed !== null ? (string) $seed : null;
+    }
+
+    /**
+     * Inflates an NBT file and builds the root compound restricted to `$spec`.
+     *
+     * @param  array<string, mixed>  $spec
+     * @return array<string, mixed>|null null when the payload is empty or not an NBT stream
+     */
+    private static function materialize(string $gzBytes, array $spec): ?array
     {
         if ($gzBytes === '') {
             return null;
@@ -109,11 +153,7 @@ final class NbtReader
         $cursor->advance();
         $cursor->skipString(); // root name, never displayed
 
-        $tree = self::compoundBody($cursor, self::KEEP, 0);
-
-        $data = is_array($tree['Data'] ?? null) ? $tree['Data'] : [];
-
-        return self::interestKeys($data);
+        return self::compoundBody($cursor, $spec, 0);
     }
 
     /**
@@ -398,12 +438,15 @@ final class NbtReader
         $versionName = is_string($versionNode['Name'] ?? null) ? self::modifiedUtf8ToUtf8($versionNode['Name']) : '';
         $levelName = is_string($data['LevelName'] ?? null) ? self::modifiedUtf8ToUtf8($data['LevelName']) : '';
 
+        // 26.1+ moved the flag to `difficulty_settings: {difficulty, hardcore, locked}`.
+        $difficulty = is_array($data['difficulty_settings'] ?? null) ? $data['difficulty_settings'] : [];
+
         return [
             'version' => $versionName !== '' ? $versionName : null,
             'data_version' => self::optionalInt($data['DataVersion'] ?? null),
             'level_name' => $levelName !== '' ? $levelName : null,
             'game_type' => self::optionalInt($data['GameType'] ?? null),
-            'hardcore' => (bool) ($data['hardcore'] ?? false),
+            'hardcore' => (bool) ($data['hardcore'] ?? $difficulty['hardcore'] ?? false),
             'last_played' => self::lastPlayedIso($data['LastPlayed'] ?? null),
             // Always decimal text: JSON-safe across int boundaries and friendlier in UI.
             'seed' => $seed !== null ? (string) $seed : null,

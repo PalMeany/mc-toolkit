@@ -22,6 +22,7 @@ use McToolkit\Services\DetectionService;
 use McToolkit\Services\FileBridge;
 use McToolkit\Services\Maps\MapTileService;
 use McToolkit\Services\Worlds\WorldsService;
+use McToolkit\Support\WorldLayout;
 use UnitEnum;
 
 /**
@@ -33,8 +34,9 @@ use UnitEnum;
  * header Redraw control plus the shared filesystem-detection banner.
  *
  * Map TARGETS: one entry per (world folder, dimension) the world listing can draw —
- * `world` (overworld), `world@nether`, `world@end` for a vanilla layout, or
- * `world`, `world_nether@nether`, `world_the_end@end` for Paper split worlds.
+ * `world` (overworld), `world@nether`, `world@end` for a vanilla layout and for every
+ * Minecraft 26.1+ world (Paper included: one folder, `dimensions/minecraft/*`), or
+ * `world`, `world_nether@nether`, `world_the_end@end` for pre-26 Paper split worlds.
  * The target list and the selection are #[Locked]: clients pick through selectWorld().
  *
  * Backend facts kept server-side here:
@@ -139,7 +141,7 @@ final class MapPage extends Page
             report($exception);
         }
 
-        $this->hydrateWorlds();
+        $this->loadWorlds();
 
         $this->selectedWorld = $this->resolveDefaultWorld();
 
@@ -246,9 +248,26 @@ final class MapPage extends Page
         $this->pins = array_values(array_filter(
             $allPins,
             static fn (array $pin): bool => $pin['dimension'] === $dimension
-                && ($pin['world'] === null || $pin['world'] === $folder),
+                && self::pinBelongsToFolder($pin['world'], $folder, $dimension),
         ));
         $this->gameTimeTicks = $ticks;
+    }
+
+    /**
+     * Whether a bridge pin's `world` belongs to the selected folder: no world, the exact
+     * folder name, or — for the nether/end — the Bukkit level name `<folder>_nether` /
+     * `<folder>_the_end`. Paper 26.x keeps those names for its nether/end although their
+     * files now live inside `<folder>/dimensions/minecraft/`.
+     */
+    private static function pinBelongsToFolder(?string $world, string $folder, string $dimension): bool
+    {
+        if ($world === null || $world === $folder) {
+            return true;
+        }
+
+        $suffix = ['nether' => '_nether', 'end' => '_the_end'][$dimension] ?? null;
+
+        return $suffix !== null && $world === $folder.$suffix;
     }
 
     /**
@@ -493,7 +512,12 @@ final class MapPage extends Page
     /*  Data hydration                                                     */
     /* ------------------------------------------------------------------ */
 
-    private function hydrateWorlds(): void
+    /**
+     * Fills $worlds. Deliberately NOT named hydrateWorlds(): Livewire calls hydrate{Property}()
+     * on every request for each public property, and a private method of that name makes
+     * every update of this page throw (BadMethodCallException from Component::__call).
+     */
+    private function loadWorlds(): void
     {
         $server = $this->server();
         $targets = [];
@@ -538,7 +562,8 @@ final class MapPage extends Page
 
     /**
      * Degraded overworld-only scan used when the world listing failed: root folders
-     * (conventional `world*` names first) that hold a `region` folder.
+     * (conventional `world*` names first) that hold an overworld region folder — 26.1+
+     * `dimensions/minecraft/overworld/region` or classic `region`.
      *
      * @return list<array{key:string, name:string, dimension:string, default:bool, title:?string, spawn_x:?int, spawn_z:?int}>
      */
@@ -564,7 +589,17 @@ final class MapPage extends Page
         $found = [];
 
         foreach (array_slice($rootDirs, 0, 8) as $dir) {
-            if ($bridge->exists($server, $dir.'/region')) {
+            $hasOverworld = false;
+
+            foreach (WorldLayout::REGION_CANDIDATES['overworld'] as $suffix) {
+                if ($bridge->exists($server, $dir.'/'.$suffix)) {
+                    $hasOverworld = true;
+
+                    break;
+                }
+            }
+
+            if ($hasOverworld) {
                 $found[] = [
                     'key' => $dir,
                     'name' => $dir,

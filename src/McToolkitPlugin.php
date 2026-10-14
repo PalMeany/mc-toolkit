@@ -13,7 +13,6 @@ use Filament\Panel;
 use Filament\Schemas\Components\Component;
 use Filament\Schemas\Components\Section;
 use Filament\View\PanelsRenderHook;
-use Illuminate\Foundation\Vite;
 use Illuminate\Support\Arr;
 
 /**
@@ -45,8 +44,26 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
         'performance',
     ];
 
-    /** Vite entry (relative to the panel root) holding the plugin's compiled utilities. */
-    private const STYLESHEET = 'plugins/minecraft-toolkit/resources/css/main.css';
+    /** Prebuilt stylesheet (scripts/build-css.sh) holding every utility class the views use. */
+    private const STYLESHEET = 'resources/dist/toolkit.css';
+
+    /**
+     * Pages that render this plugin's views — the only ones that get the stylesheet.
+     *
+     * @var list<class-string>
+     */
+    private const STYLED_PAGES = [
+        \McToolkit\Filament\Server\Pages\VersionsPage::class,
+        \McToolkit\Filament\Server\Pages\PluginsPage::class,
+        \McToolkit\Filament\Server\Pages\ModsPage::class,
+        \McToolkit\Filament\Server\Pages\ModpacksPage::class,
+        \McToolkit\Filament\Server\Pages\PropertiesPage::class,
+        \McToolkit\Filament\Server\Pages\PlayersPage::class,
+        \McToolkit\Filament\Server\Pages\WorldsPage::class,
+        \McToolkit\Filament\Server\Pages\MapPage::class,
+        \McToolkit\Filament\Server\Pages\PerformancePage::class,
+        \McToolkit\Filament\Admin\Pages\McAdminSettingsPage::class,
+    ];
 
     public function getId(): string
     {
@@ -65,25 +82,31 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
             $panel->discoverPages($pagesDirectory, "McToolkit\\Filament\\{$id}\\Pages");
         }
 
-        $panel->renderHook(PanelsRenderHook::STYLES_AFTER, fn (): string => self::stylesheetTag());
+        $panel->renderHook(PanelsRenderHook::STYLES_AFTER, fn (): string => self::stylesheetTag(), scopes: self::STYLED_PAGES);
     }
 
     /**
-     * <link> for resources/css/main.css, the Tailwind build of this plugin's own utility
-     * classes (see the note at the top of that file for why the panel's stylesheet lacks them).
+     * Inline <style> with the plugin's prebuilt utility classes.
      *
-     * The panel builds plugin assets while installing or updating a plugin; until such a build
-     * ran — or when it failed, which the panel only logs — the Vite manifest has no entry for
-     * this file and Vite throws. The pages then render with whatever the panel's CSS covers
-     * instead of failing outright.
+     * The panel's own stylesheet only holds the Tailwind classes found in the panel's sources
+     * (Tailwind skips git-ignored paths and plugins/ is ignored), so the toolkit views need
+     * their own build. It ships prebuilt instead of going through the panel's Vite: the panel
+     * runs `yarn build` on plugin install, but most production panels have no Node/yarn, the
+     * build then fails silently and the pages lose every grid, gap, colour and badge style.
+     * Inlined (about 40 kB, toolkit pages only) it needs no route, manifest or asset publish.
      */
     private static function stylesheetTag(): string
     {
-        try {
-            return app(Vite::class)([self::STYLESHEET])->toHtml();
-        } catch (\Throwable) {
-            return '';
+        static $css = null;
+
+        if ($css === null) {
+            $path = plugin_path('minecraft-toolkit', self::STYLESHEET);
+            $css = is_file($path) ? (string) file_get_contents($path) : '';
+            // A stylesheet can never legitimately contain this; keep the element closed.
+            $css = str_ireplace('</style', '<\\/style', $css);
         }
+
+        return $css === '' ? '' : '<style id="mc-toolkit-styles">'.$css.'</style>';
     }
 
     public function boot(Panel $panel): void

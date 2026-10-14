@@ -69,26 +69,16 @@
             </div>
 
             <div class="w-full sm:w-64">
-                <input
-                    type="search"
-                    wire:model.live.debounce.300ms="search"
-                    placeholder="{{ __('minecraft-toolkit::common.buttons.search') }}"
-                    aria-label="{{ __('minecraft-toolkit::common.buttons.search') }}"
-                    class="w-full rounded-lg bg-white px-3 py-1.5 text-sm leading-6 text-gray-950 shadow-sm ring-1 ring-gray-950/10 transition duration-75 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-600 dark:bg-white/5 dark:text-white dark:ring-white/20 dark:focus:ring-primary-500"
-                />
+                <x-filament::input.wrapper prefix-icon="tabler-search">
+                    <x-filament::input
+                        type="search"
+                        wire:model.live.debounce.300ms="search"
+                        :placeholder="__('minecraft-toolkit::common.buttons.search')"
+                        :aria-label="__('minecraft-toolkit::common.buttons.search')"
+                    />
+                </x-filament::input.wrapper>
             </div>
         </div>
-
-        {{-- --------------------------------------------------------------}}
-        {{-- THE big form: Sections carry their own group footer actions   --}}
-        {{-- --------------------------------------------------------------}}
-        {{ $this->form }}
-
-        @if ($this->noResults)
-            <p class="py-4 text-center text-sm text-gray-500 dark:text-gray-400">
-                {{ __('minecraft-toolkit::common.buttons.no_results') }}
-            </p>
-        @endif
 
         {{-- ------------------------------------------------------------}}
         {{-- MOTD multiplayer-list preview                              --}}
@@ -128,5 +118,16 @@
                 </div>
             </div>
         </div>
+        {{-- --------------------------------------------------------------}}
+        {{-- THE big form: Sections carry their own group footer actions   --}}
+        {{-- --------------------------------------------------------------}}
+        {{ $this->form }}
+
+        @if ($this->noResults)
+            <p class="py-4 text-center text-sm text-gray-500 dark:text-gray-400">
+                {{ __('minecraft-toolkit::common.buttons.no_results') }}
+            </p>
+        @endif
+
     </div>
 </x-filament-panels::page>
