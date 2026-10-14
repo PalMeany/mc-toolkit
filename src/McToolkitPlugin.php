@@ -24,6 +24,8 @@ use Illuminate\Support\Arr;
  */
 final class McToolkitPlugin implements Plugin, HasPluginSettings
 {
+    use EnvironmentWriterTrait;
+
     /**
      * Canonical page slugs, in navigation order. Mirrors the frozen v1 page list in
      * the build contracts and drives both the "enabled pages" checkbox and the
@@ -108,17 +110,21 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
                 ->description('Pick which toolkit pages show up in the server sidebar.')
                 ->schema([
                     CheckboxList::make('MC_TOOLKIT_ENABLED_PAGES')
+                        // Options MUST be keyed by slug ("versions" => "Versions").
+                        // A list-shaped options array makes Filament render checkbox
+                        // values as 0..n indexes while the form is filled with slugs
+                        // from getSettingsFormData() — the two shapes then fail the
+                        // built-in Rule::in(...) validation on every save attempt
+                        // ("The selected mc_toolkit_enabled_pages is invalid.").
                         ->hiddenLabel()
                         ->bulkToggleable()
                         ->columns(2)
-                        ->options(array_map(
-                            fn (string $slug): string => trans("minecraft-toolkit::pages.{$slug}.title"),
-                            self::PAGES,
-                        ))
-                        ->descriptions(array_map(
-                            fn (string $slug): string => trans("minecraft-toolkit::pages.{$slug}.subheading"),
-                            self::PAGES,
-                        )),
+                        ->options(collect(self::PAGES)->mapWithKeys(
+                            fn (string $slug): array => [$slug => trans("minecraft-toolkit::pages.{$slug}.title")],
+                        )->all())
+                        ->descriptions(collect(self::PAGES)->mapWithKeys(
+                            fn (string $slug): array => [$slug => trans("minecraft-toolkit::pages.{$slug}.subheading")],
+                        )->all()),
                 ]),
         ];
     }
@@ -148,6 +154,20 @@ final class McToolkitPlugin implements Plugin, HasPluginSettings
         // Always write the explicit enabled-list so config('...pages.enabled') has a
         // single unambiguous source once this form has been used at least once.
         $selected = Arr::wrap(Arr::get($data, 'MC_TOOLKIT_ENABLED_PAGES', []));
+
+        // Defense-in-depth: tolerate option indexes (0..n) from any earlier build's
+        // list-shaped options by mapping them back through the canonical page order.
+        $selected = array_map(
+            function (string | int $value): ?string {
+                $value = mb_strtolower(trim((string) $value));
+
+                return ctype_digit($value)
+                    ? self::PAGES[(int) $value] ?? null // index submission from older UIs
+                    : $value;
+            },
+            $selected,
+        );
+
         $ordered = array_values(array_intersect(self::PAGES, $selected));
 
         $values['MC_TOOLKIT_ENABLED_PAGES'] = implode(',', $ordered);

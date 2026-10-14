@@ -23,7 +23,7 @@ the panel's native plugin system and Filament design system.
 Paste this URL into *Admin → Plugins → **Import from URL***:
 
 ```
-https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.2.zip
+https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.3.zip
 ```
 
 The panel verifies the SHA-256 from [update.json](update.json) and drops the plugin into
@@ -223,3 +223,11 @@ Intentionally omitted since v1.0.2. In rc-stage panels (1.0.0-rc.1) version-requ
 run during very early plugin discovery — before Laravel installs its deferred-services map —
 so a declared constraint can crash the whole boot with `Target class [cache] does not exist`.
 Compatibility is documented here instead: this plugin requires Pelican ≥ 1.0.0-rc.1.
+
+### "The selected mc_toolkit_enabled_pages is invalid" when saving plugin settings (fixed in v1.0.3)
+
+v1.0.1/1.0.2 built the *Enabled pages* checkbox list with the labels only, so Filament treated
+the option keys as numeric indexes `0..8` while the form was filled with page slugs
+(`versions`, `plugins`, …). Every save attempt — regardless of which boxes were checked — then
+failed the built-in `in:` validation. v1.0.3 keys options by slug again and also tolerates
+index-shaped values submitted by the earlier UI when persisting.
