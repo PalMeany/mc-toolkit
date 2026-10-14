@@ -18,6 +18,7 @@ use Filament\Pages\Page;
 use Filament\Schemas\Schema;
 use Illuminate\Http\Client\ConnectionException;
 use Livewire\Attributes\On;
+use McToolkit\Filament\Server\Pages\Concerns\ManagesBridge;
 use McToolkit\Services\CommandBus;
 use McToolkit\Services\DetectionService;
 use McToolkit\Services\Servers\PlayerRegistry;
@@ -66,6 +67,7 @@ use Symfony\Component\HttpKernel\Exception\HttpException;
 final class PlayersPage extends Page
 {
     use InteractsWithForms;
+    use ManagesBridge;
 
     /**
      * Form state container backing every per-player Controls / Give input
@@ -185,6 +187,7 @@ final class PlayersPage extends Page
     {
         $this->form->fill($this->controlDefaults());
         $this->whitelistForm->fill();
+        $this->loadBridgeStatus();
     }
 
     /**
@@ -275,7 +278,10 @@ final class PlayersPage extends Page
                 ->label(trans('minecraft-toolkit::common.buttons.refresh'))
                 ->icon(TablerIcon::Refresh)
                 ->color('gray')
-                ->action(fn () => $this->refreshRegistry()),
+                ->action(function (): void {
+                    $this->refreshRegistry();
+                    $this->loadBridgeStatus(true);
+                }),
         ];
     }
 
@@ -423,6 +429,27 @@ final class PlayersPage extends Page
         } catch (\Throwable) {
             // Silent tick failures keep polling alive; the danger toast path stays
             // reserved for explicit user actions like the header Refresh.
+        }
+
+        $this->loadBridgeStatus();
+    }
+
+    /**
+     * Inventory / armor / effects of the selected online player from the bridge, null
+     * without a running bridge (the view then keeps the empty grids with a hint).
+     *
+     * @return array<string, mixed>|null
+     */
+    public function selectedDetail(): ?array
+    {
+        if (! filled($this->selected)) {
+            return null;
+        }
+
+        try {
+            return app(PlayerRegistry::class)->bridgePlayerDetail($this->getRecord(), strval($this->selected));
+        } catch (\Throwable) {
+            return null;
         }
     }
 

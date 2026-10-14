@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace McToolkit\Services\Servers;
 
+use McToolkit\Services\Bridge\BridgeService;
 use App\Models\Server;
 use Illuminate\Support\Arr;
 use McToolkit\Services\FileBridge;
@@ -270,7 +271,8 @@ final class PerformanceSampler
             return null;
         }
 
-        return is_array($payload) ? $payload : null;
+        // A stopped server leaves its last file behind: stale numbers are no numbers.
+        return is_array($payload) && BridgeService::isFresh($payload) ? $payload : null;
     }
 
     /**
@@ -378,6 +380,25 @@ final class PerformanceSampler
                 $explicitTotal = self::firstNumeric($entry, ['entity_count', 'total_entities'], 0, 1.0e12);
                 $entityTotal = $explicitTotal === null ? null : intval($explicitTotal);
             }
+
+            // The bridge lists only the top entity types; its explicit total wins over their sum.
+            $explicit = self::firstNumeric($entry, ['entity_count', 'total_entities'], 0, 1.0e12);
+
+            if ($explicit !== null) {
+                $entityTotal = intval($explicit);
+            }
+
+            // "minecraft:zombified_piglin" -> "Zombified Piglin"; other namespaces keep a prefix.
+            $pretty = [];
+
+            foreach ($byType as $type => $count) {
+                [$namespace, $path] = str_contains($type, ':') ? explode(':', $type, 2) : ['minecraft', $type];
+                $label = ucwords(str_replace(['_', '/'], ' ', $path));
+                $label = $namespace === 'minecraft' ? $label : $namespace.': '.$label;
+                $pretty[$label] = ($pretty[$label] ?? 0) + $count;
+            }
+
+            $byType = $pretty;
 
             arsort($byType);
 

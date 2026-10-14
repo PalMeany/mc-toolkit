@@ -6,6 +6,7 @@ namespace McToolkit\Services\Servers;
 
 use App\Models\Server;
 use Illuminate\Support\Arr;
+use McToolkit\Services\Bridge\BridgeService;
 use McToolkit\Services\FileBridge;
 
 /**
@@ -88,6 +89,9 @@ final class PlayerRegistry
     /** The all-zero uuid Paper & co. hand out for anonymised sample entries. */
     private const NIL_UUID_HEX = '00000000000000000000000000000000';
 
+    /** @var array<string, array<mixed>|null> decoded state.json per server key, for this instance */
+    private array $stateMemo = [];
+
     public function __construct(
         private readonly FileBridge $files,
         private readonly ServerListPing $ping,
@@ -142,20 +146,126 @@ final class PlayerRegistry
         cache()->forget('mctoolkit.players.' . $server->getAttribute('uuid_short'));
     }
 
-    /** Whether the companion bridge published its state file (the "Instant" chip signal). */
+    /**
+     * Whether the companion bridge is running: its state file exists and is current
+     * (BridgeService::isFresh() — a stopped server leaves a stale file behind).
+     */
     public function bridgeActive(Server $server): bool
     {
-        $path = trim(strval(config('minecraft-toolkit.bridge.path', '.toolkit')), "/\\ ");
+        $state = $this->bridgeState($server);
 
-        if ($path === '') {
-            return false;
+        return $state !== null && BridgeService::isFresh($state);
+    }
+
+    /**
+     * Decoded `.toolkit/state.json`, memoised per request (the page reads it twice per render).
+     *
+     * @return array<mixed>|null
+     */
+    private function bridgeState(Server $server): ?array
+    {
+        $key = (string) $server->getKey();
+
+        if (array_key_exists($key, $this->stateMemo)) {
+            return $this->stateMemo[$key];
         }
 
         try {
-            return $this->files->exists($server, '/' . $path . '/state.json');
+            $payload = $this->files->readJson($server, '/'.BridgeService::dir().'/state.json');
         } catch (\Throwable) {
-            return false;
+            $payload = null;
         }
+
+        return $this->stateMemo[$key] = is_array($payload) ? $payload : null;
+    }
+
+    /**
+     * Per-player detail written by the bridge (`.toolkit/players/<uuid>.json`): inventory,
+     * armor, offhand, ender chest, effects. Null when the bridge is not running or the
+     * player has no file (offline).
+     *
+     * @return array{inventory:list<array<string,mixed>>, armor:array<string,?array>, offhand:?array, ender_chest:list<array<string,mixed>>, effects:list<array<string,mixed>>}|null
+     */
+    public function bridgePlayerDetail(Server $server, string $uuid): ?array
+    {
+        $hex = strtolower(str_replace('-', '', $uuid));
+
+        if (preg_match('/^[0-9a-f]{32}$/', $hex) !== 1 || ! $this->bridgeActive($server)) {
+            return null;
+        }
+
+        $dashed = substr($hex, 0, 8).'-'.substr($hex, 8, 4).'-'.substr($hex, 12, 4).'-'.substr($hex, 16, 4).'-'.substr($hex, 20);
+
+        try {
+            $payload = $this->files->readJson($server, '/'.BridgeService::dir().'/players/'.$dashed.'.json');
+        } catch (\Throwable) {
+            return null;
+        }
+
+        if (! is_array($payload)) {
+            return null;
+        }
+
+        $items = static function (mixed $list, int $maxSlot): array {
+            $out = [];
+
+            foreach (is_array($list) ? $list : [] as $item) {
+                $normal = self::bridgeItem($item);
+
+                if ($normal !== null && is_int($item['slot'] ?? null) && $item['slot'] >= 0 && $item['slot'] <= $maxSlot) {
+                    $out[] = $normal + ['slot' => $item['slot']];
+                }
+            }
+
+            return $out;
+        };
+
+        $armor = [];
+
+        foreach (['head', 'chest', 'legs', 'feet'] as $piece) {
+            $armor[$piece] = self::bridgeItem($payload['armor'][$piece] ?? null);
+        }
+
+        $effects = [];
+
+        foreach (is_array($payload['effects'] ?? null) ? $payload['effects'] : [] as $effect) {
+            if (is_array($effect) && is_string($effect['id'] ?? null)) {
+                $effects[] = [
+                    'id' => mb_substr($effect['id'], 0, 80),
+                    'amplifier' => is_int($effect['amplifier'] ?? null) ? $effect['amplifier'] : 0,
+                    'duration' => is_int($effect['duration'] ?? null) ? $effect['duration'] : null,
+                ];
+            }
+        }
+
+        return [
+            'inventory' => $items($payload['inventory'] ?? null, 35),
+            'armor' => $armor,
+            'offhand' => self::bridgeItem($payload['offhand'] ?? null),
+            'ender_chest' => $items($payload['ender_chest'] ?? null, 26),
+            'effects' => $effects,
+        ];
+    }
+
+    /**
+     * One item of the bridge protocol, normalised (id, count, name, enchanted, damage, max_damage).
+     *
+     * @return array{id:string, count:int, name:?string, enchanted:bool, damage:?int, max_damage:?int}|null
+     */
+    private static function bridgeItem(mixed $item): ?array
+    {
+        if (! is_array($item) || ! is_string($item['id'] ?? null) || preg_match('/^[a-z0-9_.-]+:[a-z0-9_.\/-]+$/', $item['id']) !== 1) {
+            return null;
+        }
+
+        return [
+            'id' => $item['id'],
+            'count' => is_int($item['count'] ?? null) ? max(0, min(9999, $item['count'])) : 1,
+            'name' => is_string($item['name'] ?? null) && trim($item['name']) !== '' ? mb_substr(trim($item['name']), 0, 80) : null,
+            'enchanted' => ($item['enchanted'] ?? false) === true,
+            'damage' => is_int($item['damage'] ?? null) ? $item['damage'] : null,
+            'max_damage' => is_int($item['max_damage'] ?? null) ? $item['max_damage'] : null,
+        ];
     }
 
     /**
@@ -171,17 +281,15 @@ final class PlayerRegistry
             return [];
         }
 
-        $path = '/' . trim(strval(config('minecraft-toolkit.bridge.path', '.toolkit')), "/\\ ") . '/state.json';
-
-        try {
-            $payload = $this->files->readJson($server, $path);
-        } catch (\Throwable) {
-            return [];
-        }
+        $payload = $this->bridgeState($server);
 
         if (! is_array($payload) || ! is_array($payload['players'] ?? null)) {
             return [];
         }
+
+        $number = static fn (mixed $raw): ?float => is_int($raw) || is_float($raw) ? (float) $raw : null;
+        $integer = static fn (mixed $raw): ?int => is_int($raw) ? $raw : (is_float($raw) ? (int) round($raw) : null);
+        $text = static fn (mixed $raw): ?string => is_string($raw) && trim($raw) !== '' ? mb_substr(trim($raw), 0, 64) : null;
 
         $mapped = [];
 
@@ -190,21 +298,25 @@ final class PlayerRegistry
                 continue;
             }
 
-            $position = ['x', 'y', 'z'];
-
             $numbers = [];
 
-            foreach ($position as $axis) {
-                $raw = $entry[$axis] ?? $entry['position'][$axis] ?? null;
-                $numbers[$axis] = is_numeric($raw) ? floatval($raw) : null;
+            foreach (['x', 'y', 'z'] as $axis) {
+                $numbers[$axis] = $number($entry[$axis] ?? $entry['position'][$axis] ?? null);
             }
 
             $mapped[strtolower(str_replace('-', '', strval($uuid)))] = [
-                'mode' => is_string($entry['mode'] ?? null) ? strval($entry['mode']) : null,
-                'dimension' => is_string($entry['dimension'] ?? null) ? strval($entry['dimension']) : null,
+                'mode' => $text($entry['mode'] ?? null),
+                'dimension' => $text($entry['dimension'] ?? null),
+                'world' => $text($entry['world'] ?? null),
                 'x' => $numbers['x'],
                 'y' => $numbers['y'],
                 'z' => $numbers['z'],
+                'health' => $number($entry['health'] ?? null),
+                'max_health' => $number($entry['max_health'] ?? null),
+                'food' => $integer($entry['food'] ?? null),
+                'level' => $integer($entry['level'] ?? null),
+                'exp' => $number($entry['exp'] ?? null),
+                'ping' => $integer($entry['ping'] ?? null),
             ];
         }
 
@@ -381,6 +493,44 @@ final class PlayerRegistry
             $output[] = $row;
         }
 
+        // The companion bridge knows every online player (the ping sample shows at most 12):
+        // when it runs, its list decides who is online.
+        $bridgeOnline = 0;
+        $bridgePlayers = $this->bridgeActive($server) ? ($this->bridgeState($server)['players'] ?? []) : [];
+
+        if (is_array($bridgePlayers) && $bridgePlayers !== []) {
+            $pending = [];
+
+            foreach ($bridgePlayers as $uuid => $entry) {
+                $hex = strtolower(str_replace('-', '', strval($uuid)));
+
+                if (preg_match(self::UUID_HEX_PATTERN, $hex) === 1 && $hex !== self::NIL_UUID_HEX) {
+                    $pending[$hex] = is_array($entry) && is_string($entry['name'] ?? null) ? $entry['name'] : null;
+                }
+            }
+
+            $bridgeOnline = count($pending);
+
+            foreach ($output as $index => $row) {
+                $hex = str_replace('-', '', strval($row['uuid']));
+
+                if (array_key_exists($hex, $pending)) {
+                    $output[$index]['online'] = true;
+                    unset($pending[$hex]);
+                }
+            }
+
+            foreach ($pending as $hex => $name) {
+                if ($name !== null && preg_match(self::PLAYER_NAME_PATTERN, $name) === 1) {
+                    $row = $this->freshRow($this->dashOut((string) $hex), $name);
+                    $row['online'] = true;
+                    $output[] = $row;
+                }
+            }
+
+            $matchedCount = count(array_filter($output, fn (array $r): bool => (bool) $r['online']));
+        }
+
         $pingOk = $status !== null;
 
         $max = $pingOk
@@ -388,8 +538,8 @@ final class PlayerRegistry
             : $this->guessMaxFromProperties($server) ?? self::FALLBACK_MAX_PLAYERS;
 
         $online = $pingOk
-            ? max(intval($status['players']['online'] ?? 0), $matchedCount)
-            : $matchedCount;
+            ? max(intval($status['players']['online'] ?? 0), $matchedCount, $bridgeOnline)
+            : max($matchedCount, $bridgeOnline);
 
         return [$output, ['online' => $online, 'max' => $max, 'ping_ok' => $pingOk]];
     }

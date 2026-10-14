@@ -55,6 +55,11 @@ return [
             'refresh' => 'Re-detected the server software from its files',
         ],
 
+        'bridge' => [
+            // properties: version, file
+            'install' => 'Installed the companion bridge <b>:version</b> as <b>:file</b>',
+        ],
+
         'console' => [
             // properties: command — logged for every toolkit-originated game command batch
             'command' => 'Sent "<b>:command</b>" through the toolkit',

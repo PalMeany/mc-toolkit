@@ -1,7 +1,7 @@
 {
     "*": {
-        "version": "1.0.5",
-        "download_url": "https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.5.zip",
-        "sha256": "7437a9d40d14130f7d9412c692825f1fcd30db02d72e25a05a7cbb58a34af4b9"
+        "version": "1.0.6",
+        "download_url": "https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.6.zip",
+        "sha256": "b9bd67c3396775cab9699254743f137f15e10210a12caa32b68bc09a5c9a3562"
     }
 }

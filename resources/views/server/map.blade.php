@@ -6,6 +6,13 @@
         :software="$software"
     />
 
+    <x-minecraft-toolkit::bridge-callout
+        :bridge="$this->bridgeStatus"
+        :can-install="$this->canInstallBridge()"
+        :can-restart="$this->canRestartForBridge()"
+        :context="__('minecraft-toolkit::pages.map.bridge_context')"
+    />
+
     @if (filled($this->selectedLabel()))
         <p class="text-sm leading-6 text-gray-500 dark:text-gray-400">
             {{ __('minecraft-toolkit::pages.map.render_note', ['world' => $this->selectedLabel()]) }}

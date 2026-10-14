@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "mctoolkit_bridge",
+  "version": "${version}",
+  "name": "MC Toolkit Bridge",
+  "description": "Server-side companion of the MC Toolkit panel plugin: writes live players, TPS and world stats into .toolkit/*.json. Opens no port, adds no commands; does nothing on clients.",
+  "authors": ["McToolkit Project"],
+  "contact": {
+    "homepage": "https://github.com/PalMeany/mc-toolkit",
+    "sources": "https://github.com/PalMeany/mc-toolkit"
+  },
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "server": ["io.github.palmeany.mctoolkit.bridge.FabricEntrypoint"]
+  },
+  "depends": {
+    "fabricloader": ">=0.14.0",
+    "minecraft": ">=1.20.1",
+    "java": ">=17"
+  }
+}

@@ -1,0 +1,7 @@
+name: MCToolkitBridgeSelfTest
+version: '${version}'
+main: io.github.palmeany.mctoolkit.bridge.selftest.SelfTestPlugin
+api-version: '1.13'
+folia-supported: true
+depend: [MCToolkitBridge]
+description: Drives MCToolkitBridge with a fake player on a live server without a client. Development only, never ship it.

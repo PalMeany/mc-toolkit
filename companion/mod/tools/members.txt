@@ -1,0 +1,137 @@
+# Minecraft members the bridge touches by reflection, in Mojang (official) names.
+#
+# tools/gen_names.py maps every line to the obfuscated runtime names of the Fabric
+# intermediary and Forge SRG namespaces for every supported release and writes the tables
+# into src/main/resources (section [main]) and src/selftest/resources ([selftest]).
+# Runtimes that use Mojang names (NeoForge >= 1.20.5, Forge >= 1.20.6, Fabric/NeoForge/Forge
+# on the unobfuscated 26.x line) need no table: the names below are the runtime names.
+#
+#   C <class>                          class (owners and parameter types are added automatically)
+#   M <owner> <name>(<param>,<param>)  method, matched by name + parameter types (return ignored)
+#   F <owner> <name>                   field
+#
+# Alternatives for one feature (e.g. isOp(GameProfile) before 1.21.9, isOp(NameAndId) after)
+# are all listed; the bridge picks whichever exists at runtime. Members that only exist on
+# the Mojang-named 26.x line (no intermediary/SRG) are listed for documentation and simply
+# produce no table rows.
+
+[main]
+# server
+M net.minecraft.server.MinecraftServer getPlayerList()
+M net.minecraft.server.MinecraftServer getAllLevels()
+M net.minecraft.server.MinecraftServer getTickCount()
+M net.minecraft.server.MinecraftServer getAverageTickTimeNanos()
+M net.minecraft.server.MinecraftServer getAverageTickTime()
+M net.minecraft.server.MinecraftServer getServerVersion()
+M net.minecraft.server.MinecraftServer isRunning()
+M net.minecraft.server.MinecraftServer isReady()
+M net.minecraft.server.MinecraftServer getRunningThread()
+M net.minecraft.server.MinecraftServer overworld()
+# 1.21.2+: an empty server pauses (no tickCount++) after pause-when-empty-seconds
+F net.minecraft.server.MinecraftServer emptyTicks
+M net.minecraft.server.MinecraftServer pauseWhileEmptySeconds()
+M net.minecraft.server.MinecraftServer pauseWhenEmptySeconds()
+F net.minecraft.server.MinecraftServer storageSource
+M net.minecraft.world.level.storage.LevelStorageSource$LevelStorageAccess getLevelId()
+
+# players
+M net.minecraft.server.players.PlayerList getPlayers()
+M net.minecraft.server.players.PlayerList isOp(com.mojang.authlib.GameProfile)
+M net.minecraft.server.players.PlayerList isOp(net.minecraft.server.players.NameAndId)
+M net.minecraft.world.entity.player.Player getGameProfile()
+M net.minecraft.world.entity.player.Player nameAndId()
+M net.minecraft.world.entity.Entity getScoreboardName()
+M net.minecraft.world.entity.Entity getUUID()
+M net.minecraft.world.entity.Entity getX()
+M net.minecraft.world.entity.Entity getY()
+M net.minecraft.world.entity.Entity getZ()
+M net.minecraft.world.entity.Entity level()
+M net.minecraft.world.entity.Entity getType()
+F net.minecraft.server.level.ServerPlayer gameMode
+M net.minecraft.server.level.ServerPlayerGameMode getGameModeForPlayer()
+M net.minecraft.world.level.GameType getName()
+F net.minecraft.server.level.ServerPlayer connection
+F net.minecraft.server.level.ServerPlayer latency
+M net.minecraft.server.network.ServerCommonPacketListenerImpl latency()
+M net.minecraft.world.entity.LivingEntity getHealth()
+M net.minecraft.world.entity.LivingEntity getMaxHealth()
+M net.minecraft.world.entity.LivingEntity getActiveEffects()
+M net.minecraft.world.entity.player.Player getFoodData()
+M net.minecraft.world.food.FoodData getFoodLevel()
+M net.minecraft.world.food.FoodData getSaturationLevel()
+F net.minecraft.world.entity.player.Player experienceLevel
+F net.minecraft.world.entity.player.Player experienceProgress
+M net.minecraft.world.entity.player.Player getInventory()
+M net.minecraft.world.entity.player.Player getEnderChestInventory()
+
+# items
+M net.minecraft.world.Container getContainerSize()
+M net.minecraft.world.Container getItem(int)
+M net.minecraft.world.item.ItemStack isEmpty()
+M net.minecraft.world.item.ItemStack getCount()
+M net.minecraft.world.item.ItemStack getItem()
+M net.minecraft.world.item.ItemStack isEnchanted()
+M net.minecraft.world.item.ItemStack isDamageableItem()
+M net.minecraft.world.item.ItemStack getDamageValue()
+M net.minecraft.world.item.ItemStack getMaxDamage()
+M net.minecraft.world.item.ItemStack getCustomName()
+M net.minecraft.core.component.DataComponentHolder get(net.minecraft.core.component.DataComponentType)
+F net.minecraft.core.component.DataComponents CUSTOM_NAME
+M net.minecraft.world.item.ItemStack hasCustomHoverName()
+M net.minecraft.world.item.ItemStack getHoverName()
+M net.minecraft.network.chat.Component getString()
+
+# registries, effects, keys
+F net.minecraft.core.registries.BuiltInRegistries ITEM
+F net.minecraft.core.registries.BuiltInRegistries ENTITY_TYPE
+F net.minecraft.core.registries.BuiltInRegistries MOB_EFFECT
+M net.minecraft.core.Registry getKey(java.lang.Object)
+M net.minecraft.world.effect.MobEffectInstance getEffect()
+M net.minecraft.world.effect.MobEffectInstance getAmplifier()
+M net.minecraft.world.effect.MobEffectInstance getDuration()
+C net.minecraft.core.Holder
+M net.minecraft.core.Holder value()
+M net.minecraft.resources.ResourceKey location()
+M net.minecraft.resources.ResourceKey identifier()
+
+# levels
+M net.minecraft.world.level.Level dimension()
+M net.minecraft.world.level.Level getDayTime()
+M net.minecraft.world.level.Level getOverworldClockTime()
+M net.minecraft.server.level.ServerLevel getChunkSource()
+M net.minecraft.server.level.ServerChunkCache getLoadedChunksCount()
+M net.minecraft.server.level.ServerLevel getAllEntities()
+
+[selftest]
+# dev-only: builds a detached ServerPlayer to exercise the player path without a client
+M net.minecraft.server.level.ServerPlayer <init>(net.minecraft.server.MinecraftServer,net.minecraft.server.level.ServerLevel,com.mojang.authlib.GameProfile)
+M net.minecraft.server.level.ServerPlayer <init>(net.minecraft.server.MinecraftServer,net.minecraft.server.level.ServerLevel,com.mojang.authlib.GameProfile,net.minecraft.server.level.ClientInformation)
+M net.minecraft.server.level.ClientInformation createDefault()
+M net.minecraft.world.entity.Entity setPos(double,double,double)
+M net.minecraft.world.Container setItem(int,net.minecraft.world.item.ItemStack)
+M net.minecraft.world.item.ItemStack <init>(net.minecraft.world.level.ItemLike,int)
+M net.minecraft.world.item.ItemStack setDamageValue(int)
+M net.minecraft.world.item.ItemStack setCount(int)
+M net.minecraft.world.item.ItemStack setHoverName(net.minecraft.network.chat.Component)
+M net.minecraft.world.item.ItemStack set(net.minecraft.core.component.DataComponentType,java.lang.Object)
+M net.minecraft.world.item.ItemStack enchant(net.minecraft.world.item.enchantment.Enchantment,int)
+M net.minecraft.world.item.ItemStack enchant(net.minecraft.core.Holder,int)
+M net.minecraft.network.chat.Component literal(java.lang.String)
+M net.minecraft.world.entity.LivingEntity addEffect(net.minecraft.world.effect.MobEffectInstance)
+M net.minecraft.world.entity.LivingEntity setHealth(float)
+# effects go straight into the map: addEffect would notify the (absent) network connection
+F net.minecraft.world.entity.LivingEntity activeEffects
+M net.minecraft.world.effect.MobEffectInstance <init>(net.minecraft.world.effect.MobEffect,int,int)
+M net.minecraft.world.effect.MobEffectInstance <init>(net.minecraft.core.Holder,int,int)
+F net.minecraft.world.effect.MobEffects MOVEMENT_SPEED
+F net.minecraft.world.effect.MobEffects SPEED
+F net.minecraft.world.item.Items DIAMOND_SWORD
+F net.minecraft.world.item.Items DIAMOND
+F net.minecraft.world.item.Items IRON_HELMET
+F net.minecraft.world.item.Items SHIELD
+F net.minecraft.world.item.Items TORCH
+F net.minecraft.world.item.enchantment.Enchantments SHARPNESS
+F net.minecraft.core.registries.Registries ENCHANTMENT
+M net.minecraft.server.MinecraftServer registryAccess()
+M net.minecraft.core.HolderLookup$Provider lookupOrThrow(net.minecraft.resources.ResourceKey)
+M net.minecraft.core.HolderGetter getOrThrow(net.minecraft.resources.ResourceKey)

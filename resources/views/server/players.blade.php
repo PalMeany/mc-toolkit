@@ -85,18 +85,12 @@
          Companion bridge notice (tier 2) — parity with the original's
          PrestonSync capability hints; instant controls remain hidden here.
       ---------------------------------------------------------------- --}}
-    @if (! $bridgeActive)
-        <x-filament::callout color="warning" icon="tabler-bolt">
-            <x-slot name="heading">
-                {{ trans('minecraft-toolkit::pages.players.states.tier2_missing') }}
-            </x-slot>
-            <x-slot name="description">
-                <span class="text-xs font-medium text-warning-700 dark:text-warning-300">
-                    {{ trans('minecraft-toolkit::pages.players.toolbar.instant_tooltip') }}
-                </span>
-            </x-slot>
-        </x-filament::callout>
-    @endif
+    <x-minecraft-toolkit::bridge-callout
+        :bridge="$this->bridgeStatus"
+        :can-install="$this->canInstallBridge()"
+        :can-restart="$this->canRestartForBridge()"
+        :context="trans('minecraft-toolkit::pages.players.states.tier2_missing')"
+    />
 
     {{-- ---------------------------------------------------------------
          Toolbar — counter "x of y online", Instant chip, polling toggle.
@@ -302,7 +296,7 @@
         {{-- -------------------------------------------------------
              Detail panel — selected player identity + info + controls.
           -------------------------------------------------------- --}}
-        <aside class="w-full shrink-0 lg:w-96">
+        <aside class="w-full shrink-0 lg:w-[26rem]">
             @php
                 $placeholder = '—'; // em-dash when tier-2 bridge data is absent
 
@@ -318,6 +312,16 @@
                     : $placeholder;
                 $modeText = filled($bridgeEntry['mode'] ?? null) ? strval($bridgeEntry['mode']) : $placeholder;
                 $dimensionText = filled($bridgeEntry['dimension'] ?? null) ? strval($bridgeEntry['dimension']) : $placeholder;
+                $healthText = isset($bridgeEntry['health'])
+                    ? $formatAxis($bridgeEntry['health']).(isset($bridgeEntry['max_health']) ? ' / '.$formatAxis($bridgeEntry['max_health']) : '')
+                    : $placeholder;
+                $foodText = isset($bridgeEntry['food']) ? $bridgeEntry['food'].' / 20' : $placeholder;
+                $levelText = isset($bridgeEntry['level'])
+                    ? $bridgeEntry['level'].(isset($bridgeEntry['exp']) ? ' ('.intval(round($bridgeEntry['exp'] * 100)).'%)' : '')
+                    : $placeholder;
+                $pingText = isset($bridgeEntry['ping']) ? $bridgeEntry['ping'].' ms' : $placeholder;
+                // The bridge only writes detail files for online players, so no online check here.
+                $detail = $selectedRow !== null ? $this->selectedDetail() : null;
             @endphp
 
             @if ($selectedRow === null)
@@ -366,13 +370,29 @@
                         <dl class="mt-4 grid grid-cols-3 gap-3 border-t border-gray-100 pt-4 dark:border-white/10">
                             <div>
                                 <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">Mode</dt>
-                                <dd class="mt-0.5 truncate text-sm text-gray-950 dark:text-white">{{ $modeText }}</dd>
+                                <dd class="mt-0.5 truncate text-sm tabular-nums text-gray-950 dark:text-white">{{ $modeText }}</dd>
                             </div>
                             <div>
                                 <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">Dimension</dt>
-                                <dd class="mt-0.5 truncate text-sm text-gray-950 dark:text-white">{{ $dimensionText }}</dd>
+                                <dd class="mt-0.5 truncate text-sm tabular-nums text-gray-950 dark:text-white">{{ $dimensionText }}</dd>
                             </div>
                             <div>
+                                <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">{{ trans('minecraft-toolkit::pages.players.info.ping') }}</dt>
+                                <dd class="mt-0.5 truncate text-sm tabular-nums text-gray-950 dark:text-white">{{ $pingText }}</dd>
+                            </div>
+                            <div>
+                                <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">{{ trans('minecraft-toolkit::pages.players.info.health') }}</dt>
+                                <dd class="mt-0.5 truncate text-sm tabular-nums text-gray-950 dark:text-white">{{ $healthText }}</dd>
+                            </div>
+                            <div>
+                                <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">{{ trans('minecraft-toolkit::pages.players.info.food') }}</dt>
+                                <dd class="mt-0.5 truncate text-sm tabular-nums text-gray-950 dark:text-white">{{ $foodText }}</dd>
+                            </div>
+                            <div>
+                                <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">{{ trans('minecraft-toolkit::pages.players.info.level') }}</dt>
+                                <dd class="mt-0.5 truncate text-sm tabular-nums text-gray-950 dark:text-white">{{ $levelText }}</dd>
+                            </div>
+                            <div class="col-span-3">
                                 <dt class="text-xs font-medium text-gray-500 dark:text-gray-400">Position</dt>
                                 <dd class="mt-0.5 truncate text-sm tabular-nums text-gray-950 dark:text-white">{{ $positionText }}</dd>
                             </div>
@@ -384,6 +404,9 @@
                             </p>
                         @endif
                     </div>
+
+                    {{-- INVENTORY card (bridge-fed; empty slots stay visible without it) --}}
+                    @include('minecraft-toolkit::server._player-inventory', ['detail' => $detail, 'bridgeActive' => $bridgeActive, 'cardShell' => $cardShell])
 
                     {{-- CONTROLS card --}}
                     <div class="{{ $cardShell }} flex flex-col gap-5 p-4 sm:p-5">

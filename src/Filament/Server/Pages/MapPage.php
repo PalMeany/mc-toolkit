@@ -48,6 +48,8 @@ use UnitEnum;
  */
 final class MapPage extends Page
 {
+    use Concerns\ManagesBridge;
+
     /* ------------------------------------------------------------------ */
     /*  Navigation / shell                                                 */
     /* ------------------------------------------------------------------ */
@@ -150,6 +152,7 @@ final class MapPage extends Page
 
         // Silent first hydration of bridge pins/time so the canvas paints instantly.
         $this->refreshBridge();
+        $this->loadBridgeStatus();
     }
 
     public static function canAccess(): bool
@@ -745,7 +748,8 @@ final class MapPage extends Page
             return [[], null]; // corrupt half-write: treat as absent, poll retries later.
         }
 
-        if (! is_array($document)) {
+        // Pins of a stopped server would freeze where players logged off.
+        if (! is_array($document) || ! \McToolkit\Services\Bridge\BridgeService::isFresh($document)) {
             return [[], null];
         }
 

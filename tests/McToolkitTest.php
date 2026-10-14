@@ -1525,3 +1525,203 @@ it('does not schedule a delayed archive clean-up on the sync driver', function (
 /* ================================================================== */
 /*  Background installs (queued jobs) — END                            */
 /* ================================================================== */
+
+/* ================================================================== */
+/*  Companion bridge (one-click install + live data) — START           */
+/* ================================================================== */
+
+function mctBridgeBundle(): string
+{
+    $dir = sys_get_temp_dir().'/mct-bridge-'.bin2hex(random_bytes(4));
+    @mkdir($dir);
+    file_put_contents("$dir/MCToolkitBridge.jar", "PK\x03\x04\x00\xffbukkit-jar");
+    file_put_contents("$dir/mctoolkit-bridge.jar", "PK\x03\x04\x00\xffmod-jar");
+    file_put_contents("$dir/manifest.json", json_encode(['version' => '1.2.0', 'files' => [
+        'bukkit' => ['file' => 'MCToolkitBridge.jar', 'sha256' => hash_file('sha256', "$dir/MCToolkitBridge.jar")],
+        'mod' => ['file' => 'mctoolkit-bridge.jar', 'sha256' => hash_file('sha256', "$dir/mctoolkit-bridge.jar")],
+    ]]));
+    config()->set('minecraft-toolkit.bridge.bundle_dir', $dir);
+
+    return $dir;
+}
+
+function mctBridgeMeta(int $age = 0, bool $running = true, string $version = '1.2.0'): array
+{
+    return ['protocol' => 1, 'version' => $version, 'platform' => 'paper', 'software' => 'Paper', 'minecraft' => '1.21.4',
+        'updated_at' => time() - $age, 'interval' => 5, 'running' => $running];
+}
+
+function mctBridgeState(FakeWings $wings, int $age = 0, string $version = '1.2.0'): void
+{
+    $wings->put('.toolkit/state.json', json_encode(['bridge' => mctBridgeMeta($age, true, $version), 'players' => [
+        '0c9a1c4e-5d0a-4b9e-9a51-6b1f3c2a7d10' => [
+            'name' => 'Steve', 'mode' => 'survival', 'world' => 'world', 'dimension' => 'overworld',
+            'x' => 156.5, 'y' => 70.0, 'z' => -307.25, 'health' => 18.5, 'max_health' => 20.0,
+            'food' => 17, 'saturation' => 3.2, 'level' => 30, 'exp' => 0.42, 'ping' => 42, 'op' => false, 'joined_at' => time() - 600,
+        ],
+    ]]));
+    $wings->put('.toolkit/players/0c9a1c4e-5d0a-4b9e-9a51-6b1f3c2a7d10.json', json_encode([
+        'bridge' => mctBridgeMeta($age, true, $version), 'uuid' => '0c9a1c4e-5d0a-4b9e-9a51-6b1f3c2a7d10', 'name' => 'Steve',
+        'inventory' => [
+            ['slot' => 0, 'id' => 'minecraft:diamond_sword', 'count' => 1, 'name' => 'Excalibur', 'enchanted' => true, 'damage' => 12, 'max_damage' => 1561],
+            ['slot' => 9, 'id' => 'minecraft:oak_log', 'count' => 64, 'name' => null, 'enchanted' => false, 'damage' => null, 'max_damage' => null],
+            ['slot' => 99, 'id' => 'minecraft:stone', 'count' => 1],          // out of range: dropped
+            ['slot' => 1, 'id' => '<script>', 'count' => 1],                  // not an id: dropped
+        ],
+        'armor' => ['head' => null, 'chest' => ['id' => 'minecraft:netherite_chestplate', 'count' => 1, 'name' => null, 'enchanted' => false, 'damage' => 0, 'max_damage' => 592], 'legs' => null, 'feet' => null],
+        'offhand' => ['id' => 'minecraft:shield', 'count' => 1, 'name' => null, 'enchanted' => false, 'damage' => 0, 'max_damage' => 336],
+        'ender_chest' => [['slot' => 3, 'id' => 'minecraft:ender_pearl', 'count' => 16, 'name' => null, 'enchanted' => false, 'damage' => null, 'max_damage' => null]],
+        'effects' => [['id' => 'minecraft:speed', 'amplifier' => 1, 'duration' => 600]],
+    ]));
+}
+
+it('treats bridge files as fresh only while the bridge keeps writing', function () {
+    expect(McToolkit\Services\Bridge\BridgeService::isFresh(['bridge' => mctBridgeMeta(0)]))->toBeTrue()
+        ->and(McToolkit\Services\Bridge\BridgeService::isFresh(['bridge' => mctBridgeMeta(120)]))->toBeFalse()
+        ->and(McToolkit\Services\Bridge\BridgeService::isFresh(['bridge' => mctBridgeMeta(0, running: false)]))->toBeFalse()
+        // files without the meta block (hand-written / third-party) keep working as before
+        ->and(McToolkit\Services\Bridge\BridgeService::isFresh(['tps' => 20]))->toBeTrue();
+});
+
+it('installs the bundled bridge into plugins/ on a Paper server and replaces older copies', function () {
+    mctBridgeBundle();
+    $wings = new FakeWings();
+    mctWorld($wings);
+    $wings->put('plugins/MCToolkitBridge-0.9.0.jar', 'old');
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+
+    $service = app(McToolkit\Services\Bridge\BridgeService::class);
+    $before = $service->status($server, true);
+
+    expect($before['supported'])->toBeTrue()->and($before['family'])->toBe('bukkit')->and($before['running'])->toBeFalse();
+
+    $result = $service->install($server, $user);
+
+    expect($result['path'])->toBe('plugins/MCToolkitBridge.jar')
+        ->and($wings->files['plugins/MCToolkitBridge.jar'] ?? null)->toBe("PK\x03\x04\x00\xffbukkit-jar")
+        ->and(isset($wings->files['plugins/MCToolkitBridge-0.9.0.jar']))->toBeFalse()
+        ->and(isset($wings->files['plugins/EssentialsX-2.21.0.jar']))->toBeTrue();
+
+    $after = $service->status($server, true);
+    expect($after['installed'])->toBeTrue()->and($after['running'])->toBeFalse()->and($after['bundled_version'])->toBe('1.2.0');
+
+    $this->assertDatabaseHas('activity_logs', ['event' => 'mc-toolkit:bridge.install']);
+});
+
+it('installs the mod build into mods/ on a Fabric server and refuses proxies', function () {
+    mctBridgeBundle();
+
+    $fabric = new FakeWings();
+    $fabric->put('server.properties', "level-name=world\n");
+    $fabric->put('fabric-server-mc.1.21.1-loader.0.16.10-launcher.1.0.1.jar', str_repeat('x', 1000));
+    $fabric->put('.fabric/server/1.21.1-server.jar', 'x');
+    $fabric->mkdir('mods');
+    [$user, $server] = mctServer($fabric);
+    $this->actingAs($user);
+
+    expect(app(McToolkit\Services\Bridge\BridgeService::class)->install($server, $user)['path'])->toBe('mods/mctoolkit-bridge.jar')
+        ->and($fabric->files['mods/mctoolkit-bridge.jar'] ?? null)->toBe("PK\x03\x04\x00\xffmod-jar");
+
+    $proxy = new FakeWings();
+    $proxy->put('velocity.toml', "bind = \"0.0.0.0:25577\"\n");
+    $proxy->put('velocity-3.4.0-SNAPSHOT-500.jar', str_repeat('x', 1000));
+    [$user2, $server2] = mctServer($proxy);
+    $this->actingAs($user2);
+
+    $service = app(McToolkit\Services\Bridge\BridgeService::class);
+    expect($service->status($server2, true)['supported'])->toBeFalse();
+    expect(fn () => $service->install($server2, $user2))->toThrow(DomainException::class);
+    expect(array_filter(array_keys($proxy->files), fn ($f) => str_contains(strtolower($f), 'bridge')))->toBe([]);
+});
+
+it('refuses to install a bundle whose checksum does not match the manifest', function () {
+    $dir = mctBridgeBundle();
+    file_put_contents("$dir/MCToolkitBridge.jar", 'tampered');
+
+    $wings = new FakeWings();
+    mctWorld($wings);
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+
+    expect(fn () => app(McToolkit\Services\Bridge\BridgeService::class)->install($server, $user))->toThrow(DomainException::class);
+    expect(isset($wings->files['plugins/MCToolkitBridge.jar']))->toBeFalse();
+});
+
+it('reports a running, a stale and an outdated bridge', function () {
+    mctBridgeBundle();
+    $wings = new FakeWings();
+    mctWorld($wings);
+    $wings->put('plugins/MCToolkitBridge.jar', 'jar');
+    [$user, $server] = mctServer($wings);
+    $service = app(McToolkit\Services\Bridge\BridgeService::class);
+
+    mctBridgeState($wings, 0, '1.2.0');
+    $running = $service->status($server, true);
+    expect($running['running'])->toBeTrue()->and($running['version'])->toBe('1.2.0')->and($running['update_available'])->toBeFalse();
+
+    mctBridgeState($wings, 300, '1.2.0');
+    $stale = $service->status($server, true);
+    expect($stale['running'])->toBeFalse()->and($stale['stale'])->toBeTrue()->and($stale['installed'])->toBeTrue();
+
+    mctBridgeState($wings, 0, '1.0.0');
+    expect($service->status($server, true)['update_available'])->toBeTrue();
+});
+
+it('shows live player stats and the inventory from a running bridge', function () {
+    mctBridgeBundle();
+    $wings = new FakeWings();
+    mctWorld($wings);
+    $wings->put('usercache.json', json_encode([['name' => 'Steve', 'uuid' => '0c9a1c4e-5d0a-4b9e-9a51-6b1f3c2a7d10', 'expiresOn' => '2030-01-01 00:00:00 +0000']]));
+    $wings->put('ops.json', '[]');
+    mctBridgeState($wings, 0);
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    $detail = app(McToolkit\Services\Servers\PlayerRegistry::class)->bridgePlayerDetail($server, '0c9a1c4e5d0a4b9e9a516b1f3c2a7d10');
+    expect(array_column($detail['inventory'], 'slot'))->toBe([0, 9])
+        ->and($detail['armor']['chest']['id'])->toBe('minecraft:netherite_chestplate')
+        ->and($detail['offhand']['id'])->toBe('minecraft:shield')
+        ->and($detail['ender_chest'][0]['count'])->toBe(16);
+
+    $component = livewire(PlayersPage::class)->assertOk()->set('selected', '0c9a1c4e-5d0a-4b9e-9a51-6b1f3c2a7d10');
+    $html = $component->html();
+
+    expect($html)->toContain('18.5 / 20')
+        ->and($html)->toContain('17 / 20')
+        ->and($html)->toContain('42 ms')
+        ->and($html)->toContain('Excalibur (Diamond Sword)')
+        ->and($html)->toContain('Live data from the companion bridge 1.2.0');
+});
+
+it('keeps the bridge-fed elements visible with an install button when the bridge is missing or stale', function () {
+    mctBridgeBundle();
+    $wings = new FakeWings();
+    mctWorld($wings);
+    $wings->put('.toolkit/performance.json', json_encode(['bridge' => mctBridgeMeta(600), 'tps' => 19.5, 'mspt' => 20.1, 'worlds' => []]));
+    [$user, $server] = mctServer($wings);
+    $this->actingAs($user);
+    Filament::setTenant($server);
+
+    // stale performance file: no numbers from it, charts still rendered with the hint
+    $page = livewire(PerformancePage::class)->assertOk();
+    expect($page->instance()->isBridged())->toBeFalse();
+    $html = $page->html();
+    expect($html)->toContain('Ticks per second')
+        ->and($html)->toContain('Needs the companion bridge')
+        ->and($html)->toContain('Install bridge');
+
+    // one click installs it
+    $page->call('installBridge')->assertNotified();
+    expect($wings->files['plugins/MCToolkitBridge.jar'] ?? null)->toBe("PK\x03\x04\x00\xffbukkit-jar");
+    expect($page->html())->toContain('restart to activate');
+
+    // the Players page keeps its inventory grid and stat rows, with em-dashes
+    $players = livewire(PlayersPage::class)->assertOk()->html();
+    expect($players)->toContain('Companion bridge installed');
+});
+
+/* ================================================================== */
+/*  Companion bridge — END                                             */
+/* ================================================================== */

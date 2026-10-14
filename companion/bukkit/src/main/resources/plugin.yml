@@ -1,0 +1,9 @@
+name: MCToolkitBridge
+version: '${version}'
+main: io.github.palmeany.mctoolkit.bridge.BridgePlugin
+# 1.13 = modern material names; servers older than 1.13 ignore the key
+api-version: '1.13'
+folia-supported: true
+description: Writes live server data (players, performance, map pins) into .toolkit/ for the MC Toolkit panel.
+authors: [McToolkit Project]
+website: https://github.com/PalMeany/mc-toolkit

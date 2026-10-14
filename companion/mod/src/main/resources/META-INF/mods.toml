@@ -1,0 +1,22 @@
+# Forge (and NeoForge 1.20.1 - 1.20.4). NeoForge 1.20.5+ reads neoforge.mods.toml instead.
+modLoader="javafml"
+loaderVersion="[1,)"
+license="MIT"
+issueTrackerURL="https://github.com/PalMeany/mc-toolkit/issues"
+
+[[mods]]
+modId="mctoolkit_bridge"
+version="${version}"
+displayName="MC Toolkit Bridge"
+authors="McToolkit Project"
+displayURL="https://github.com/PalMeany/mc-toolkit"
+description='''Server-side companion of the MC Toolkit panel plugin: writes live players, TPS and world stats into .toolkit/*.json. Opens no port, adds no commands; does nothing on clients.'''
+# server-only: clients never need it and must not be flagged for missing it
+displayTest="IGNORE_ALL_VERSION"
+
+[[dependencies.mctoolkit_bridge]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,)"
+ordering="NONE"
+side="BOTH"

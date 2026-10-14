@@ -99,7 +99,12 @@ return [
 
     // ---- Companion bridge ------------------------------------------------------
     'bridge' => [
-        // Directory inside each server's files where the future companion mod writes state.
+        // Directory inside each server's files where the companion bridge writes its JSON
+        // (companion/PROTOCOL.md). Must match the bridge's own setting (default .toolkit).
         'path' => '.toolkit',
+
+        // Folder with the bundled bridge jars + manifest.json; null = this plugin's
+        // resources/bridge (only tests point it elsewhere).
+        'bundle_dir' => null,
     ],
 ];

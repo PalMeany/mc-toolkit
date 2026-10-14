@@ -1,0 +1,7 @@
+{
+    "version": "1.0.0",
+    "files": {
+        "bukkit": {"file": "MCToolkitBridge.jar", "sha256": "e50606d1e8ed0333db9c68156d26986f984af20edcb714df2e52cd0c8986a960", "size": 56568},
+        "mod": {"file": "mctoolkit-bridge.jar", "sha256": "a1d7fd9a83f7bb08b31fee2daa9e54c4c262578736af59627429e800da5b8697", "size": 66639}
+    }
+}

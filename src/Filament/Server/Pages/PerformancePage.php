@@ -12,6 +12,7 @@ use Filament\Actions\Action;
 use Filament\Facades\Filament;
 use Filament\Notifications\Notification;
 use Filament\Pages\Page;
+use McToolkit\Filament\Server\Pages\Concerns\ManagesBridge;
 use McToolkit\Services\DetectionService;
 use McToolkit\Services\FileBridge;
 use McToolkit\Services\Servers\PerformanceSampler;
@@ -37,6 +38,8 @@ use Throwable;
  */
 final class PerformancePage extends Page
 {
+    use ManagesBridge;
+
     /** Verified case: app/Enums/TablerIcon.php:2981 = 'tabler-gauge'. */
     protected static string|BackedEnum|null $navigationIcon = TablerIcon::Gauge;
 
@@ -277,6 +280,8 @@ final class PerformancePage extends Page
 
         // Cached detect (~instant): keeps the banner chips in sync after settings changes.
         $this->detected = app(DetectionService::class)->detect($server);
+
+        $this->loadBridgeStatus($force);
 
         $this->snapshot = $force ? $sampler->capture($server) : $sampler->snapshot($server);
         $this->history = $sampler->history($server);

@@ -18,7 +18,7 @@ STAGE="$WORK/minecraft-toolkit"
 
 mkdir -p dist "$STAGE"
 cp -r ./* "$STAGE/"
-rm -rf "$STAGE/dist" "$STAGE/scripts" "$STAGE/tests"
+rm -rf "$STAGE/dist" "$STAGE/scripts" "$STAGE/tests" "$STAGE/companion"
 
 # zip -r updates an existing archive in place (stale entries survive), so start fresh.
 rm -f "dist/$NAME"

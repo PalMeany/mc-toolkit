@@ -23,7 +23,7 @@ the panel's native plugin system and Filament design system.
 Paste this URL into *Admin → Plugins → **Import from URL***:
 
 ```
-https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.5.zip
+https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.6.zip
 ```
 
 The panel verifies the SHA-256 from [update.json](update.json) and drops the plugin into
@@ -100,13 +100,37 @@ after the standard items:
 | 3 | **Mods** | Modrinth-based mod catalog with dependency handling; blocked-state notice pointing to Versions on non-mod loaders. |
 | 4 | **Modpacks** | One-shot install of complete Modrinth `.mrpack` packs: loader, mods and configs placed for you. |
 | 5 | **Properties** | `server.properties` editor grouped General/Players/World/Network & RCON/Advanced, MOTD live preview; panel-owned keys (`server-port`, `server-ip`, `query.port`) stay locked as "Set by the panel". |
-| 6 | **Players** | Online list plus identity data from `usercache.json`; op/deop/kick/ban/whitelist controls through game commands. Live inventory and positions require the companion bridge (see limitations). |
+| 6 | **Players** | Online list plus identity data from `usercache.json`; op/deop/kick/ban/whitelist controls through game commands. With the companion bridge: live position, health, hunger, level, ping, inventory, armor, ender chest and effects. |
 | 7 | **Worlds** | Dimension grouping of the default world set, size + seed + last-played metadata, Download / Reset / Import actions driven by wings. |
 | 8 | **Map** | First-party top-down render drawn from the region files' blocks as colored block tiles, markers per dimension, spawn/world-border layers, player list readout. |
 | 9 | **Performance** | TPS / MSPT tiles with 1m/5m/15m averages, CPU %, JVM memory, plus a bridge-fed per-world entity/chunk breakdown when available. |
 
 A detection banner ("Detected from the files") appears across pages with a manual re-detect button,
 mirroring the original addon's behavior without touching any panel internals it doesn't need.
+
+## Companion bridge
+
+The panel only sees a server from the outside (files, console, CPU and memory). Live game data —
+TPS and MSPT, entities and chunks per world, player positions, health, hunger, ping and
+inventories — comes from the **companion bridge**, a small server-side component that writes it
+into `.toolkit/*.json` every 5 seconds ([protocol](companion/PROTOCOL.md)). It only writes files:
+no port, no commands, no configuration.
+
+| Server software | Bridge | Installed as |
+|---|---|---|
+| Paper, Spigot, Purpur, Pufferfish, Leaves, Folia, Bukkit hybrids — Minecraft 1.8.8 to 26.x | plugin | `plugins/MCToolkitBridge.jar` |
+| Fabric, Quilt, NeoForge, Forge — Minecraft 1.20.1+ | mod (one jar for all four loaders) | `mods/mctoolkit-bridge.jar` |
+| Velocity / BungeeCord / Waterfall, vanilla | not available | — |
+
+**Install:** Performance, Players or Map → *Install bridge* (needs the toolkit `manage`
+permission), then *Restart server*. The jars ship inside this panel plugin
+(`resources/bridge/`, checked against `manifest.json` before they are written), so the node
+downloads nothing. When a newer panel plugin brings a newer bridge, the same place offers
+*Update bridge*. Without the bridge every page keeps working; the live fields stay visible and
+say what they need.
+
+Sources: `companion/bukkit` and `companion/mod`; `./scripts/build-bridge.sh` builds both and
+refreshes `resources/bridge/manifest.json`.
 
 ## Permission matrix
 
@@ -154,8 +178,9 @@ Cache lifetimes, registry toggles and limits are tuned in `config/minecraft-tool
 
 ## Limitations (honest scope of v1)
 
-- **No live inventory / position / health editing, no live TPS via websocket feed, no real-time map
-  player pins** without the future companion bridge plugin. Tier-2 surfaces degrade into clear notices.
+- **Live game data needs the companion bridge** (see above); without it TPS/MSPT, per-world
+  counts, player positions/health/inventories and map pins stay empty with an install button.
+  Inventories are read-only — the bridge never changes the game.
 - **The map renders colored block tiles** computed from `.mca` region chunks — not textured
   renders of actual resource-pack textures; treat it as an exploration overview.
 - Region rendering streams chunk bytes from wings and stays inside the configured
@@ -206,7 +231,7 @@ Full recovery recipe for this exact incident:
 php artisan queue:restart          # fresh autoloader/opcache for install workers
 php artisan optimize:clear
 docker compose restart panel       # official image ships opcache with validate_timestamps=0
-php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.5
+php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.6
 ```
 
 If it still reads *Errored*, press the row's **Delete** action, then Import from URL again
@@ -247,6 +272,20 @@ toolkit pages only, so nothing has to be built on the panel host. After changing
 rebuild it with `./scripts/build-css.sh` (needs Node; uses Tailwind 4.3.0 like the panel).
 
 ## Changelog
+
+### v1.0.6
+
+- **Companion bridge.** The live data the pages always promised now exists: a Bukkit-family
+  plugin (Paper, Spigot, Purpur, Folia, … Minecraft 1.8.8–26.x, one jar) and a mod for Fabric,
+  Quilt, NeoForge and Forge (Minecraft 1.20.1+, one jar for all four) that write TPS/MSPT,
+  per-world entities and chunks, player positions, health, hunger, level, ping, inventories,
+  ender chests and effects into `.toolkit/` every 5 seconds. Both ship inside this plugin and
+  install with one click from Performance, Players or Map (plus a restart button); outdated
+  copies are offered an update. Stale files of a stopped server are ignored.
+- **Players** shows health, hunger, level, ping and the full inventory (armor, off hand, ender
+  chest, effects) of online players; the bridge's player list decides who is online.
+- **Performance** keeps the TPS/MSPT tiles and charts visible without the bridge (with a hint
+  instead of hiding them), uses the bridge's full entity totals and readable entity names.
 
 ### v1.0.5
 

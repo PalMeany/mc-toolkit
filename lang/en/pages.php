@@ -241,6 +241,24 @@ return [
             'tier2_missing' => 'Live inventory, health and positions need a companion bridge on your Minecraft server. Everything else on this page works without one.',
         ],
 
+        'info' => [
+            'health' => 'Health',
+            'food' => 'Hunger',
+            'level' => 'Level',
+            'ping' => 'Ping',
+        ],
+
+        'inventory' => [
+            'title' => 'Inventory',
+            'armor' => 'Armor',
+            'offhand' => 'Off hand',
+            'ender_chest' => 'Ender chest',
+            'effects' => 'Effects',
+            'no_effects' => 'No active effects.',
+            'offline' => 'The inventory is shown while the player is online.',
+            'durability' => 'Durability :left / :max',
+        ],
+
         // Stand-alone whitelist field, usable without selecting a player first.
         'whitelist_add' => [
             'label' => 'Add a player to the whitelist',
@@ -283,6 +301,7 @@ return [
         'render_note' => 'Drawn from the blocks of :world as colored block tiles. Unexplored chunks stay black until players reveal them.',
         'no_regions' => 'No explored region files were found in :world yet. They appear once the server has saved some chunks.',
         'no_world' => 'No world with region files was found on this server yet.',
+        'bridge_context' => 'With the bridge the map shows where every online player is, live.',
 
         'layers' => [
             'markers' => 'Markers',
@@ -330,5 +349,29 @@ return [
             'hint' => 'These figures are read from .toolkit/performance.json, which only the companion bridge writes, and this server has no such file.',
             'needed' => 'Needs the companion bridge',
         ],
+    ],
+
+    'bridge' => [
+        'name' => 'Companion bridge',
+        'what' => 'A small free plugin (Paper, Spigot, Purpur, Folia…) or mod (Fabric, Quilt, NeoForge, Forge) that shares live game data with the panel: TPS and MSPT, entities and chunks per world, player positions, health, hunger, ping and inventories.',
+        'missing_title' => 'Companion bridge not installed',
+        'installed_title' => 'Companion bridge installed — restart to activate',
+        'installed_body' => 'The bridge is in :file and starts with the server. Restart the server once to load it.',
+        'stale_title' => 'Companion bridge is not reporting',
+        'stale_body' => 'Its last update is from :ago. The server is probably offline; the data comes back as soon as it runs again.',
+        'update_title' => 'Companion bridge update available',
+        'update_body' => 'This server runs bridge :current; the panel ships :bundled. Install the update and restart the server.',
+        'running' => 'Live data from the companion bridge :version',
+        'install' => 'Install bridge',
+        'update' => 'Update bridge',
+        'restart' => 'Restart server',
+        'installed_toast' => 'Companion bridge installed',
+        'installed_toast_body' => 'Restart the server to load it.',
+        'restarting_toast' => 'Restarting the server',
+        'unsupported' => ':software servers cannot run the companion bridge: it needs a Paper/Spigot/Folia-family server or a Fabric, Quilt, NeoForge or Forge server (Minecraft 1.20.1+).',
+        'unsupported_title' => 'Live data is not available for this server',
+        'bundle_missing' => 'This panel plugin build does not contain the bridge files — reinstall the Minecraft Toolkit plugin.',
+        'needs_manage' => 'Ask the server owner to install it (needs the toolkit "manage" permission).',
+        'needed' => 'Needs the companion bridge',
     ],
 ];
