@@ -2,7 +2,7 @@
     "id": "minecraft-toolkit",
     "name": "Minecraft Toolkit",
     "author": "McToolkit Project",
-    "version": "1.0.6",
+    "version": "1.0.7",
     "description": "Nine Minecraft pages for your servers - versions, plugins, mods, modpacks, properties, players, worlds, map and performance - with filesystem-based software detection and fully translated UI and activity logs.",
     "category": "plugin",
     "url": "https://github.com/PalMeany/mc-toolkit",

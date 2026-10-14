@@ -75,7 +75,7 @@ final class MapTileController
                 is_int($mtime) ? max(0, $mtime) : 0,
             );
         } catch (\Throwable $exception) {
-            report($exception);
+            \McToolkit\Support\QuietReport::report($exception, 'tile.'.$server->getKey());
 
             return response()->json([
                 'tile' => null,

@@ -23,7 +23,7 @@ the panel's native plugin system and Filament design system.
 Paste this URL into *Admin → Plugins → **Import from URL***:
 
 ```
-https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.6.zip
+https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.7.zip
 ```
 
 The panel verifies the SHA-256 from [update.json](update.json) and drops the plugin into
@@ -231,7 +231,7 @@ Full recovery recipe for this exact incident:
 php artisan queue:restart          # fresh autoloader/opcache for install workers
 php artisan optimize:clear
 docker compose restart panel       # official image ships opcache with validate_timestamps=0
-php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.6
+php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.7
 ```
 
 If it still reads *Errored*, press the row's **Delete** action, then Import from URL again
@@ -272,6 +272,13 @@ toolkit pages only, so nothing has to be built on the panel host. After changing
 rebuild it with `./scripts/build-css.sh` (needs Node; uses Tailwind 4.3.0 like the panel).
 
 ## Changelog
+
+### v1.0.7
+
+- **Quieter logs.** Map tile failures (a node timing out while a region is read) were reported
+  with a full stack trace for every tile — up to 64 per map view — which can bloat
+  `laravel.log` on panels with flaky nodes. Node/network failures are no longer reported, other
+  tile errors at most once per server every 10 minutes.
 
 ### v1.0.6
 

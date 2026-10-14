@@ -310,7 +310,7 @@ final class MapTileService
         try {
             $raster = $this->parser->rasterize($server, $regionDir, $regionX, $regionZ, $coarseValidated, $yRangeTop, $mtime > 0 ? $mtime : null);
         } catch (\Throwable $exception) {
-            report($exception);
+            \McToolkit\Support\QuietReport::report($exception, 'tile.'.$server->getKey());
 
             return null;
         }
