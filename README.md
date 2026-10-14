@@ -23,7 +23,7 @@ the panel's native plugin system and Filament design system.
 Paste this URL into *Admin → Plugins → **Import from URL***:
 
 ```
-https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.0.zip
+https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.1.zip
 ```
 
 The panel verifies the SHA-256 from [update.json](update.json) and drops the plugin into
@@ -52,6 +52,35 @@ in the Plugins table automatically via the same feed.
 
 5. Optional catalog keys can be configured later under Admin → Plugins → Minecraft Toolkit → Settings
    or directly in `.env`.
+
+## Troubleshooting
+
+### `Class "\McToolkit\McToolkitPlugin" not found` (status: Errored)
+
+This happens when the install job runs inside a **queue worker process that was started before
+the plugin files existed** — its in-memory composer autoloader has no `McToolkit\` PSR-4 prefix,
+so `class_exists()` fails during the post-install component-cache rebuild. Fix on the server:
+
+```bash
+php artisan queue:restart          # respawn queue workers with a fresh autoloader
+php artisan optimize:clear         # drop config/route/view caches
+# if you run the official Docker image (opcache caches timestamps=0):
+docker compose restart panel       # or restart php-fpm
+```
+
+Then reinstall from a fresh CLI process:
+
+```bash
+php artisan p:plugin:install minecraft-toolkit
+```
+
+The CLI runs its own bootstrap, so it registers the autoloader correctly. Finally, if the
+Plugins table still shows *Errored*, use the row's Enable action to clear the flag.
+
+### Verifying file placement after import
+
+The manifest must sit at `<panel-root>/plugins/minecraft-toolkit/plugin.json` and the main class
+at `<panel-root>/plugins/minecraft-toolkit/src/McToolkitPlugin.php` (not nested one level deeper).
 
 ## Uninstallation
 
