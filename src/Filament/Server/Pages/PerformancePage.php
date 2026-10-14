@@ -7,6 +7,7 @@ namespace McToolkit\Filament\Server\Pages;
 use App\Enums\TablerIcon;
 use App\Models\Server;
 use BackedEnum;
+use UnitEnum;
 use Filament\Actions\Action;
 use Filament\Facades\Filament;
 use Filament\Notifications\Notification;
@@ -39,7 +40,7 @@ final class PerformancePage extends Page
     /** Verified case: app/Enums/TablerIcon.php:2981 = 'tabler-gauge'. */
     protected static string|BackedEnum|null $navigationIcon = TablerIcon::Gauge;
 
-    protected static ?string $navigationGroup = 'Minecraft';
+    protected static string|UnitEnum|null $navigationGroup = 'Minecraft';
 
     protected static ?int $navigationSort = 28;
 

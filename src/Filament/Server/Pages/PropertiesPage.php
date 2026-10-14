@@ -6,6 +6,7 @@ namespace McToolkit\Filament\Server\Pages;
 
 use App\Models\Server;
 use BackedEnum;
+use UnitEnum;
 use Filament\Actions\Action;
 use Filament\Facades\Filament;
 use Filament\Forms\Components\Select;
@@ -45,7 +46,7 @@ final class PropertiesPage extends Page
 
     protected static string|BackedEnum|null $navigationIcon = \App\Enums\TablerIcon::AdjustmentsHorizontal;
 
-    protected static ?string $navigationGroup = 'Minecraft';
+    protected static string|UnitEnum|null $navigationGroup = 'Minecraft';
 
     protected static ?int $navigationSort = 24;
 

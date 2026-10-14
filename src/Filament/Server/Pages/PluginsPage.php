@@ -6,6 +6,7 @@ namespace McToolkit\Filament\Server\Pages;
 
 use App\Enums\TablerIcon;
 use BackedEnum;
+use UnitEnum;
 use Filament\Actions\Action;
 use Filament\Facades\Filament;
 use Filament\Notifications\Notification;
@@ -31,7 +32,7 @@ final class PluginsPage extends Page
     /** Verified case: app/Enums/TablerIcon.php:4665 = 'tabler-puzzle'. */
     protected static string|BackedEnum|null $navigationIcon = TablerIcon::Puzzle;
 
-    protected static ?string $navigationGroup = 'Minecraft';
+    protected static string|UnitEnum|null $navigationGroup = 'Minecraft';
 
     protected static ?int $navigationSort = 21;
 

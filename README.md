@@ -23,7 +23,7 @@ the panel's native plugin system and Filament design system.
 Paste this URL into *Admin → Plugins → **Import from URL***:
 
 ```
-https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.1.zip
+https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.2.zip
 ```
 
 The panel verifies the SHA-256 from [update.json](update.json) and drops the plugin into
@@ -187,3 +187,39 @@ No. There is no DRM/licensing layer in this build.
 
 **Can I hide a single page (e.g. Performance)?**
 Yes — uncheck it under Admin → Plugins → Settings, or set `MC_TOOLKIT_ENABLED_PAGES` in `.env`.
+
+## Additional troubleshooting
+
+### Status stuck at "Errored" — and why there is no Enable button
+
+While a plugin is marked *Errored*, the Admin → Plugins row intentionally hides the Enable
+action (only Delete is offered). The panel cannot trust half-installed code paths. The loader
+also **self-heals**: the next process that loads plugins successfully (any fresh
+`php artisan p:plugin:list`, a queue-worker respawn, or a php-fpm/Docker restart) promotes
+Errored → Enabled automatically once the plugin classes load without throwing.
+
+Full recovery recipe for this exact incident:
+
+```bash
+php artisan queue:restart          # fresh autoloader/opcache for install workers
+php artisan optimize:clear
+docker compose restart panel       # official image ships opcache with validate_timestamps=0
+php artisan p:plugin:list          # expect: Minecraft Toolkit | enabled | 1.0.2
+```
+
+If it still reads *Errored*, press the row's **Delete** action, then Import from URL again
+with the newest zip link from this page, and finally finish registration from the CLI:
+
+```bash
+php artisan p:plugin:install minecraft-toolkit
+```
+
+CLI runs have a clean bootstrap each invocation, so they are immune to the stale-autoloader
+class-not-found case that long-lived HTTP/queue processes hit.
+
+### Why the manifest has no `"panel_version"` field
+
+Intentionally omitted since v1.0.2. In rc-stage panels (1.0.0-rc.1) version-requirement checks
+run during very early plugin discovery — before Laravel installs its deferred-services map —
+so a declared constraint can crash the whole boot with `Target class [cache] does not exist`.
+Compatibility is documented here instead: this plugin requires Pelican ≥ 1.0.0-rc.1.

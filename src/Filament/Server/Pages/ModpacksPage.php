@@ -6,6 +6,7 @@ namespace McToolkit\Filament\Server\Pages;
 
 use App\Enums\TablerIcon;
 use BackedEnum;
+use UnitEnum;
 use Filament\Actions\Action;
 use Filament\Pages\Page;
 use McToolkit\Filament\Server\Pages\Concerns\InteractsWithContent;
@@ -34,7 +35,7 @@ final class ModpacksPage extends Page
     /** Verified case: app/Enums/TablerIcon.php:4324 = 'tabler-package'. */
     protected static string|BackedEnum|null $navigationIcon = TablerIcon::Package;
 
-    protected static ?string $navigationGroup = 'Minecraft';
+    protected static string|UnitEnum|null $navigationGroup = 'Minecraft';
 
     protected static ?int $navigationSort = 23;
 

@@ -7,6 +7,7 @@ namespace McToolkit\Filament\Server\Pages;
 use App\Enums\TablerIcon;
 use App\Models\Server;
 use BackedEnum;
+use UnitEnum;
 use Filament\Actions\Action;
 use Filament\Facades\Filament;
 use Filament\Forms\Components\TextInput;
@@ -81,7 +82,7 @@ final class PlayersPage extends Page
             'giveCount' => 1,
         ];
     }
-    protected static ?string $navigationGroup = 'Minecraft';
+    protected static string|UnitEnum|null $navigationGroup = 'Minecraft';
 
     protected static ?int $navigationSort = 25;
 

@@ -6,6 +6,7 @@ namespace McToolkit\Filament\Admin\Pages;
 
 use App\Traits\EnvironmentWriterTrait;
 use BackedEnum;
+use UnitEnum;
 use Exception;
 use Filament\Actions\Action;
 use Filament\Forms\Concerns\InteractsWithForms;
@@ -45,7 +46,7 @@ final class McAdminSettingsPage extends Page
 
     protected static string|BackedEnum|null $navigationIcon = \App\Enums\TablerIcon::Adjustments;
 
-    protected static ?string $navigationGroup = 'Minecraft';
+    protected static string|UnitEnum|null $navigationGroup = 'Minecraft';
 
     protected static ?int $navigationSort = 95;
 

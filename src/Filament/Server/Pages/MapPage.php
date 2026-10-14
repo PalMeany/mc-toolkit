@@ -8,6 +8,7 @@ use App\Facades\Activity;
 use App\Enums\TablerIcon;
 use App\Models\Server;
 use BackedEnum;
+use UnitEnum;
 use Exception;
 use Filament\Actions\Action;
 use Filament\Facades\Filament;
@@ -48,7 +49,7 @@ final class MapPage extends Page
 
     protected static ?int $navigationSort = 27;
 
-    protected static ?string $navigationGroup = 'Minecraft';
+    protected static string|UnitEnum|null $navigationGroup = 'Minecraft';
 
     protected string $view = 'minecraft-toolkit::server.map';
 

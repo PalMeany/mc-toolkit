@@ -9,6 +9,7 @@ use App\Models\Server;
 use App\Repositories\Daemon\DaemonFileRepository;
 use App\Repositories\Daemon\DaemonServerRepository;
 use BackedEnum;
+use UnitEnum;
 use Filament\Actions\Action;
 use Filament\Facades\Filament;
 use Filament\Notifications\Notification;
@@ -42,7 +43,7 @@ final class VersionsPage extends Page
 
     protected static ?int $navigationSort = 20;
 
-    protected static ?string $navigationGroup = 'Minecraft';
+    protected static string|UnitEnum|null $navigationGroup = 'Minecraft';
 
     protected string $view = 'minecraft-toolkit::server.versions';
 
