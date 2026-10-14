@@ -1,0 +1,28 @@
+/*
+ * Minecraft Toolkit — shared front-end utilities.
+ *
+ * Deliberately tiny: page styling rides Filament's Tailwind v4 design system
+ * (rounded-xl cards, zinc grays, semantic info/success chips) so we only ship
+ * layout helpers that later views cannot express purely through utilities.
+ */
+
+/* Slot grid used by Players inventory / ender-chest renders (Minecraft rows are 9 wide). */
+.mct-slot-grid {
+    display: grid;
+    grid-template-columns: repeat(9, minmax(0, 1fr));
+    gap: 0.5rem;
+}
+
+.mct-slot-grid--four {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.5rem;
+}
+
+/* Wrapping chip/badge row (detection banner internals, compat filters). */
+.mct-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+}

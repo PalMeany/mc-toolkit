@@ -1,0 +1,7 @@
+{
+    "*": {
+        "version": "1.0.0",
+        "download_url": "https://raw.githubusercontent.com/PalMeany/mc-toolkit/main/dist/minecraft-toolkit-v1.0.0.zip",
+        "sha256": "5331c5df377262ee532e4562dca0acdf31b3731a493879f76947df0d889edd40"
+    }
+}
